@@ -35,13 +35,17 @@ enum {
     IDC_ALBUMS, IDC_SONGS, IDC_STATUS,
     IDC_VOLUME, IDC_SEEK = 110, IDC_TIME_CUR, IDC_TIME_TOTAL,
     IDC_TREE, IDC_NEW_PLAYLIST, IDC_SHUFFLE, IDC_HDR_PLAY, IDC_HDR_SHUFFLE, IDC_ARTISTS,
-    IDC_SEARCH, IDC_SEARCH_LABEL
+    IDC_SEARCH, IDC_SEARCH_LABEL,
+    // Mini player.
+    IDC_MINI_PREV, IDC_MINI_PLAYPAUSE, IDC_MINI_STOP, IDC_MINI_NEXT,
+    IDC_MINI_SEEK, IDC_MINI_VOLUME, IDC_MINI_TIME_CUR, IDC_MINI_TIME_TOTAL
 };
 
 // Menu bar.
 enum {
     IDM_CONNECT = 40001, IDM_EXIT, IDM_PLAY, IDM_PAUSE, IDM_STOP, IDM_SHUFFLE,
-    IDM_ALBUMS, IDM_NEW_PLAYLIST, IDM_ABOUT, IDM_ARTISTS, IDM_SONGS, IDM_FIND
+    IDM_ALBUMS, IDM_NEW_PLAYLIST, IDM_ABOUT, IDM_ARTISTS, IDM_SONGS, IDM_FIND,
+    IDM_MINI, IDM_PREV, IDM_NEXT
 };
 
 // Popup menu commands (TrackPopupMenu with TPM_RETURNCMD).
@@ -127,6 +131,10 @@ struct Shown {                  // what the header describes
 struct App {
     HWND wnd, tree, btnNewPlaylist, albums, artists, songs, status;
     HWND search, searchLabel;
+    // Mini player (a separate top-level window; Ctrl+M swaps it with the main window).
+    HWND mini, miniPrev, miniPlayPause, miniStop, miniNext, miniSeek, miniVolume, miniTimeCur, miniTimeTotal;
+    HWND miniTooltip;
+    RECT miniSpeakerRect;
     HWND btnPlay, btnPause, btnStop, btnShuffle, hdrPlay, hdrShuffle;
     HWND volume, seek, timeCur, timeTotal, tooltip;
     HMENU menu;
@@ -476,6 +484,8 @@ static void UpdateNowPlaying()
         LaunchJob(job);
     }
     InvalidateRect(g_app.wnd, &g_app.npRect, TRUE);
+    if (g_app.mini)
+        InvalidateRect(g_app.mini, NULL, TRUE);   // cover, title, artist
 }
 
 // --- List views -----------------------------------------------------------------------
@@ -871,13 +881,37 @@ static void OnSongsClick(NMITEMACTIVATE* ia)
 
 // --- Position / seek bar ---------------------------------------------------------------
 
+// The main window and the mini player each have a seek bar and time labels; these keep
+// both in step (the mini player's are NULL until it is created).
+static void SetSeekPos(int sec)
+{
+    SendMessageW(g_app.seek, TBM_SETPOS, TRUE, sec);
+    if (g_app.miniSeek)
+        SendMessageW(g_app.miniSeek, TBM_SETPOS, TRUE, sec);
+}
+
+static void SetTimeCur(int sec)
+{
+    std::wstring t = FormatTime(sec);
+    SetWindowTextW(g_app.timeCur, t.c_str());
+    if (g_app.miniTimeCur)
+        SetWindowTextW(g_app.miniTimeCur, t.c_str());
+}
+
 static void ResetSeekBar(int durationSec)
 {
-    SendMessageW(g_app.seek, TBM_SETRANGEMIN, FALSE, 0);
-    SendMessageW(g_app.seek, TBM_SETRANGEMAX, FALSE, durationSec > 0 ? durationSec : 1);
-    SendMessageW(g_app.seek, TBM_SETPOS, TRUE, 0);
-    SetWindowTextW(g_app.timeCur, L"0:00");
+    HWND bars[2] = { g_app.seek, g_app.miniSeek };
+    for (int i = 0; i < 2; ++i) {
+        if (!bars[i])
+            continue;
+        SendMessageW(bars[i], TBM_SETRANGEMIN, FALSE, 0);
+        SendMessageW(bars[i], TBM_SETRANGEMAX, FALSE, durationSec > 0 ? durationSec : 1);
+    }
+    SetSeekPos(0);
+    SetTimeCur(0);
     SetWindowTextW(g_app.timeTotal, FormatTime(durationSec).c_str());
+    if (g_app.miniTimeTotal)
+        SetWindowTextW(g_app.miniTimeTotal, FormatTime(durationSec).c_str());
     g_app.shownSec = 0;
 }
 
@@ -892,8 +926,8 @@ static void UpdatePosition()
     if (sec == g_app.shownSec)
         return;
     g_app.shownSec = sec;
-    SendMessageW(g_app.seek, TBM_SETPOS, TRUE, sec);
-    SetWindowTextW(g_app.timeCur, FormatTime(sec).c_str());
+    SetSeekPos(sec);
+    SetTimeCur(sec);
 }
 
 // --- Playback and shuffle ---------------------------------------------------------------------
@@ -902,6 +936,8 @@ static void RefreshTransport()
 {
     InvalidateRect(g_app.btnPause, NULL, FALSE);
     InvalidateRect(g_app.btnShuffle, NULL, FALSE);
+    if (g_app.miniPlayPause)
+        InvalidateRect(g_app.miniPlayPause, NULL, FALSE);
     CheckMenuItem(g_app.menu, IDM_SHUFFLE, g_app.shuffle ? MF_CHECKED : MF_UNCHECKED);
 }
 
@@ -953,8 +989,8 @@ static void StartQueue(int i, DWORD startMs)
     ResetSeekBar(s.duration);
     if (start) {
         g_app.shownSec = (int)(start / 1000);
-        SendMessageW(g_app.seek, TBM_SETPOS, TRUE, g_app.shownSec);
-        SetWindowTextW(g_app.timeCur, FormatTime(g_app.shownSec).c_str());
+        SetSeekPos(g_app.shownSec);
+        SetTimeCur(g_app.shownSec);
     }
 
     // Highlight it if the list on screen holds it at the same position.
@@ -1038,9 +1074,27 @@ static void DoPlay()
     }
 }
 
+// Previous: restart the track if more than 3 s in (or it's the first), else the one before.
+static void PlayPrevious()
+{
+    if (!QueueValid())
+        return;
+    if (g_app.queueIndex == 0 || (g_app.player.IsActive() && g_app.player.PositionMs() > 3000))
+        StartQueue(g_app.queueIndex, 0);
+    else
+        StartQueue(g_app.queueIndex - 1, 0);
+}
+
+static void PlayNext()
+{
+    if (QueueValid() && g_app.queueIndex + 1 < (int)g_app.queue.size())
+        StartQueue(g_app.queueIndex + 1, 0);
+}
+
 // --- Views and loading -----------------------------------------------------------------------
 
 static void Layout(HWND hwnd);
+static void ToggleMini();
 
 // The search text of the current library section, or NULL on album/artist/playlist pages.
 static std::wstring* CurrentQuery()
@@ -1551,6 +1605,8 @@ static void OnJobDone(Job* job)
         if (g_app.nowCover == job->artId) {
             g_app.nowArt = CachedArt(job->artId);
             InvalidateRect(g_app.wnd, &g_app.npRect, TRUE);
+            if (g_app.mini)
+                InvalidateRect(g_app.mini, NULL, TRUE);
         }
         if (g_app.shown.has && g_app.shown.coverArt == job->artId) {
             g_app.shownArt = CachedArt(job->artId);
@@ -1871,7 +1927,7 @@ static void TreeContextMenu(LPARAM lp)
 
 // --- Drawn icons ------------------------------------------------------------------------
 
-enum Glyph { GLYPH_NONE, GLYPH_PLAY, GLYPH_PAUSE, GLYPH_STOP, GLYPH_SHUFFLE };
+enum Glyph { GLYPH_NONE, GLYPH_PLAY, GLYPH_PAUSE, GLYPH_STOP, GLYPH_SHUFFLE, GLYPH_PREV, GLYPH_NEXT };
 
 static void FillPoly(HDC dc, const POINT* pts, int n, COLORREF c)
 {
@@ -1912,6 +1968,20 @@ static void DrawGlyph(HDC dc, Glyph g, int cx, int cy, int s, COLORREF c)
     case GLYPH_STOP:
         FillBox(dc, cx - h + 1, cy - h + 1, cx + h, cy + h, c);
         break;
+    case GLYPH_PREV: {
+        // |◀ : bar on the left, triangle pointing left.
+        FillBox(dc, cx - h, cy - h, cx - h + 2, cy + h + 1, c);
+        POINT pts[3] = { { cx + h, cy - h }, { cx + h, cy + h }, { cx - h + 2, cy } };
+        FillPoly(dc, pts, 3, c);
+        break;
+    }
+    case GLYPH_NEXT: {
+        // ▶| : triangle pointing right, bar on the right.
+        POINT pts[3] = { { cx - h, cy - h }, { cx - h, cy + h }, { cx + h - 2, cy } };
+        FillPoly(dc, pts, 3, c);
+        FillBox(dc, cx + h - 2, cy - h, cx + h, cy + h + 1, c);
+        break;
+    }
     case GLYPH_SHUFFLE: {
         // Two paths that cross, each ending in an arrowhead on the right (16 x 9 px).
         const int x0 = cx - 8, x1 = cx + 8, y0 = cy - 4, y1 = cy + 4;
@@ -1966,6 +2036,13 @@ static void DrawIconButton(const DRAWITEMSTRUCT* d)
     case IDC_SHUFFLE:     glyph = GLYPH_SHUFFLE; latched = g_app.shuffle; break;
     case IDC_HDR_PLAY:    glyph = GLYPH_PLAY; caption = L"Play"; break;
     case IDC_HDR_SHUFFLE: glyph = GLYPH_SHUFFLE; caption = L"Shuffle"; break;
+    case IDC_MINI_PREV:   glyph = GLYPH_PREV; break;
+    case IDC_MINI_STOP:   glyph = GLYPH_STOP; break;
+    case IDC_MINI_NEXT:   glyph = GLYPH_NEXT; break;
+    case IDC_MINI_PLAYPAUSE:
+        // One button: shows Pause while playing, Play when paused or stopped.
+        glyph = (g_app.player.IsActive() && !g_app.player.IsPaused()) ? GLYPH_PAUSE : GLYPH_PLAY;
+        break;
     }
     HDC dc = d->hDC;
     RECT r = d->rcItem;
@@ -2298,11 +2375,14 @@ static HMENU BuildMenuBar()
     AppendMenuW(view, MF_STRING, IDM_SONGS, L"&Songs");
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     AppendMenuW(view, MF_STRING, IDM_FIND, L"&Find\tCtrl+F");
+    AppendMenuW(view, MF_STRING, IDM_MINI, L"&Mini Player\tCtrl+M");
 
     HMENU playback = CreatePopupMenu();
     AppendMenuW(playback, MF_STRING, IDM_PLAY, L"&Play");
     AppendMenuW(playback, MF_STRING, IDM_PAUSE, L"P&ause / Resume");
     AppendMenuW(playback, MF_STRING, IDM_STOP, L"&Stop");
+    AppendMenuW(playback, MF_STRING, IDM_PREV, L"Pre&vious");
+    AppendMenuW(playback, MF_STRING, IDM_NEXT, L"&Next");
     AppendMenuW(playback, MF_SEPARATOR, 0, NULL);
     AppendMenuW(playback, MF_STRING, IDM_SHUFFLE, L"S&huffle");
 
@@ -2421,21 +2501,25 @@ static void OnCreate(HWND hwnd)
     SetTimer(hwnd, TIMER_POSITION, 250, NULL);
 }
 
+// Seek and volume sliders of both the main window and the mini player.
 static void OnHScroll(HWND bar, int code)
 {
     int pos = (int)SendMessageW(bar, TBM_GETPOS, 0, 0);
-    if (bar == g_app.volume) {
+    if (bar == g_app.volume || bar == g_app.miniVolume) {
         g_app.player.SetVolume(pos);
+        HWND other = (bar == g_app.volume) ? g_app.miniVolume : g_app.volume;
+        if (other)
+            SendMessageW(other, TBM_SETPOS, TRUE, pos);
         if (code == TB_ENDTRACK)
             WritePrivateProfileStringW(L"Player", L"Volume", Fmt(L"%d", pos).c_str(), g_app.iniPath.c_str());
-    } else if (bar == g_app.seek) {
+    } else if (bar == g_app.seek || bar == g_app.miniSeek) {
         if (code == TB_ENDTRACK) {
             // End of a drag, click on the channel, or arrow key: one seek per gesture.
             g_app.seekDragging = false;
             SeekTo(pos);
         } else {
             g_app.seekDragging = true;
-            SetWindowTextW(g_app.timeCur, FormatTime(pos).c_str());
+            SetTimeCur(pos);
         }
     }
 }
@@ -2547,6 +2631,15 @@ static void OnCommand(int id)
     case IDM_FIND:
         FocusSearch();
         break;
+    case IDM_MINI:
+        ToggleMini();
+        break;
+    case IDM_PREV:
+        PlayPrevious();
+        break;
+    case IDM_NEXT:
+        PlayNext();
+        break;
     case IDC_NEW_PLAYLIST:
     case IDM_NEW_PLAYLIST:
         NewPlaylist(std::vector<std::string>(), std::string(), L"New playlist");
@@ -2559,6 +2652,251 @@ static void OnCommand(int id)
         break;
     }
     }
+}
+
+// --- Mini player ------------------------------------------------------------------------
+// A small top-level window: cover, title, artist, seek bar, prev / play-pause / stop / next
+// and volume. Ctrl+M (View > Mini Player) swaps it with the main window; closing it, or
+// double-clicking the cover, swaps back. Its controls mirror the main window's.
+
+static const int kMiniArt = 112, kMiniW = 420, kMiniH = 128, kMiniPad = 8;
+
+static RECT MiniArtRect()
+{
+    RECT r = { kMiniPad, kMiniPad, kMiniPad + kMiniArt, kMiniPad + kMiniArt };
+    return r;
+}
+
+static void PaintMini(HDC dc)
+{
+    RECT art = MiniArtRect();
+    if (g_app.nowArt) {
+        // The cached cover is up to 160 px; scale it down keeping its shape. HALFTONE gives a
+        // smooth result on Windows 2000/XP.
+        BITMAP bm;
+        GetObjectW(g_app.nowArt, sizeof(bm), &bm);
+        int w = kMiniArt, h = kMiniArt;
+        if (bm.bmWidth > bm.bmHeight)
+            h = bm.bmHeight * kMiniArt / bm.bmWidth;
+        else if (bm.bmHeight > bm.bmWidth)
+            w = bm.bmWidth * kMiniArt / bm.bmHeight;
+        HDC mem = CreateCompatibleDC(dc);
+        HGDIOBJ old = SelectObject(mem, g_app.nowArt);
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, NULL);
+        StretchBlt(dc, art.left + (kMiniArt - w) / 2, art.top + (kMiniArt - h) / 2, w, h,
+                   mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteDC(mem);
+    } else {
+        DrawCover(dc, art, NULL, QueueValid() ? L"No cover" : L"Nothing playing");
+    }
+
+    if (QueueValid()) {
+        const SubsonicSong& s = g_app.queue[g_app.queueIndex];
+        RECT client;
+        GetClientRect(g_app.mini, &client);
+        SetBkMode(dc, TRANSPARENT);
+        TEXTMETRICW tm;
+        SelectObject(dc, g_app.fontBold);
+        GetTextMetricsW(dc, &tm);
+        RECT t = { art.right + 12, kMiniPad + 2, client.right - kMiniPad, kMiniPad + 2 + tm.tmHeight };
+        SetTextColor(dc, GetSysColor(COLOR_BTNTEXT));
+        DrawTextW(dc, s.title.c_str(), -1, &t, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, g_app.font);
+        t.top = t.bottom + 3;
+        t.bottom = t.top + tm.tmHeight;
+        SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+        DrawTextW(dc, s.artist.c_str(), -1, &t, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    DrawSpeaker(dc, g_app.miniSpeakerRect);
+}
+
+static LRESULT CALLBACK MiniWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        PaintMini(dc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_DRAWITEM:
+        DrawIconButton((const DRAWITEMSTRUCT*)lp);
+        return TRUE;
+
+    case WM_HSCROLL:
+        OnHScroll((HWND)lp, LOWORD(wp));
+        return 0;
+
+    case WM_LBUTTONDBLCLK: {
+        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+        RECT art = MiniArtRect();
+        if (PtInRect(&art, pt))
+            ToggleMini();
+        return 0;
+    }
+
+    case WM_COMMAND: {
+        const int id = LOWORD(wp), code = HIWORD(wp);
+        if (code != BN_CLICKED && code != BN_DOUBLECLICKED && code != 1 /* accelerator */)
+            return 0;
+        switch (id) {
+        case IDC_MINI_PREV:
+            PlayPrevious();
+            break;
+        case IDC_MINI_NEXT:
+            PlayNext();
+            break;
+        case IDC_MINI_STOP:
+            StopPlayback();
+            break;
+        case IDC_MINI_PLAYPAUSE:
+            if (g_app.player.IsActive())
+                DoPause();
+            else
+                DoPlay();
+            break;
+        case IDM_MINI:
+            ToggleMini();
+            break;
+        default:
+            // Other shortcuts (F5, Ctrl+F) belong to the main window.
+            ToggleMini();
+            OnCommand(id);
+            break;
+        }
+        RefreshTransport();
+        return 0;
+    }
+
+    case WM_CLOSE:
+        ToggleMini();   // closing the mini player goes back to the full window
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void CreateMini(HINSTANCE inst, HICON icon, HICON iconSmall)
+{
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_DBLCLKS;
+    wc.lpfnWndProc = MiniWndProc;
+    wc.hInstance = inst;
+    wc.hIcon = icon;
+    wc.hIconSm = iconSmall;
+    wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"Navi2KPlayerMini";
+    if (!RegisterClassExW(&wc))
+        return;
+
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+    RECT r = { 0, 0, kMiniW, kMiniH };
+    AdjustWindowRect(&r, style, FALSE);
+    HWND w = CreateWindowExW(0, wc.lpszClassName, APP_TITLE, style, CW_USEDEFAULT, CW_USEDEFAULT,
+                             r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
+    if (!w)
+        return;
+    g_app.mini = w;
+
+    // Right of the cover: title/artist (painted), then the seek row, then the button row.
+    const int x = kMiniPad + kMiniArt + 12, right = kMiniW - kMiniPad, timeW = 40;
+    g_app.miniTimeCur = MakeChild(w, L"STATIC", L"0:00", SS_LEFT, IDC_MINI_TIME_CUR);
+    g_app.miniSeek = MakeChild(w, TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_BOTH, IDC_MINI_SEEK);
+    g_app.miniTimeTotal = MakeChild(w, L"STATIC", L"0:00", SS_RIGHT, IDC_MINI_TIME_TOTAL);
+    MoveWindow(g_app.miniTimeCur, x, 52, timeW, 16, FALSE);
+    MoveWindow(g_app.miniSeek, x + timeW, 47, right - timeW - (x + timeW), 24, FALSE);
+    MoveWindow(g_app.miniTimeTotal, right - timeW, 52, timeW, 16, FALSE);
+    SendMessageW(g_app.miniSeek, TBM_SETPAGESIZE, 0, 10);
+    SendMessageW(g_app.miniSeek, TBM_SETLINESIZE, 0, 5);
+
+    const int by = 86, bw = 34, bh = 28;
+    g_app.miniPrev = MakeChild(w, L"BUTTON", L"Previous", WS_TABSTOP | BS_OWNERDRAW, IDC_MINI_PREV);
+    g_app.miniPlayPause = MakeChild(w, L"BUTTON", L"Play/Pause", WS_TABSTOP | BS_OWNERDRAW, IDC_MINI_PLAYPAUSE);
+    g_app.miniStop = MakeChild(w, L"BUTTON", L"Stop", WS_TABSTOP | BS_OWNERDRAW, IDC_MINI_STOP);
+    g_app.miniNext = MakeChild(w, L"BUTTON", L"Next", WS_TABSTOP | BS_OWNERDRAW, IDC_MINI_NEXT);
+    MoveWindow(g_app.miniPrev, x, by, bw, bh, FALSE);
+    MoveWindow(g_app.miniPlayPause, x + (bw + 2), by, bw, bh, FALSE);
+    MoveWindow(g_app.miniStop, x + 2 * (bw + 2), by, bw, bh, FALSE);
+    MoveWindow(g_app.miniNext, x + 3 * (bw + 2), by, bw, bh, FALSE);
+
+    const int volW = 100;
+    g_app.miniVolume = MakeChild(w, TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_BOTH, IDC_MINI_VOLUME);
+    MoveWindow(g_app.miniVolume, right - volW, by + 2, volW, bh - 4, FALSE);
+    SendMessageW(g_app.miniVolume, TBM_SETRANGE, FALSE, MAKELPARAM(0, 100));
+    SendMessageW(g_app.miniVolume, TBM_SETPAGESIZE, 0, 10);
+    SendMessageW(g_app.miniVolume, TBM_SETPOS, TRUE, g_app.player.Volume());
+    SetRect(&g_app.miniSpeakerRect, right - volW - 22, by, right - volW - 4, by + bh);
+
+    // Start in step with the main window's seek bar.
+    LRESULT maxSec = SendMessageW(g_app.seek, TBM_GETRANGEMAX, 0, 0);
+    SendMessageW(g_app.miniSeek, TBM_SETRANGEMIN, FALSE, 0);
+    SendMessageW(g_app.miniSeek, TBM_SETRANGEMAX, FALSE, maxSec);
+    SendMessageW(g_app.miniSeek, TBM_SETPOS, TRUE, SendMessageW(g_app.seek, TBM_GETPOS, 0, 0));
+
+    g_app.miniTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP,
+                                        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                        w, NULL, inst, NULL);
+    const struct { HWND ctl; const wchar_t* text; } tips[] = {
+        { g_app.miniPrev, L"Previous" }, { g_app.miniPlayPause, L"Play / Pause" },
+        { g_app.miniStop, L"Stop" }, { g_app.miniNext, L"Next" }, { g_app.miniVolume, L"Volume" },
+    };
+    for (size_t i = 0; i < sizeof(tips) / sizeof(tips[0]); ++i) {
+        TOOLINFOW ti;
+        ZeroMemory(&ti, sizeof(ti));
+        ti.cbSize = sizeof(ti);
+        ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        ti.hwnd = w;
+        ti.uId = (UINT_PTR)tips[i].ctl;
+        ti.lpszText = (LPWSTR)tips[i].text;
+        SendMessageW(g_app.miniTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    }
+}
+
+static int IniInt(const wchar_t* key, int def)
+{
+    // GetPrivateProfileInt can't return negative numbers (windows left of the main monitor).
+    wchar_t buf[32];
+    GetPrivateProfileStringW(L"Player", key, L"", buf, 32, g_app.iniPath.c_str());
+    return buf[0] ? _wtoi(buf) : def;
+}
+
+static void ToggleMini()
+{
+    if (!g_app.mini)
+        return;
+    if (IsWindowVisible(g_app.mini)) {
+        RECT r;
+        GetWindowRect(g_app.mini, &r);
+        WritePrivateProfileStringW(L"Player", L"MiniX", Fmt(L"%ld", r.left).c_str(), g_app.iniPath.c_str());
+        WritePrivateProfileStringW(L"Player", L"MiniY", Fmt(L"%ld", r.top).c_str(), g_app.iniPath.c_str());
+        ShowWindow(g_app.wnd, SW_SHOW);
+        ShowWindow(g_app.mini, SW_HIDE);
+        SetForegroundWindow(g_app.wnd);
+        return;
+    }
+    // Where it was last time, else near the main window's corner; always fully on screen.
+    RECT work, mr, main;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    GetWindowRect(g_app.mini, &mr);
+    GetWindowRect(g_app.wnd, &main);
+    const int w = mr.right - mr.left, h = mr.bottom - mr.top;
+    int x = IniInt(L"MiniX", main.left + 40), y = IniInt(L"MiniY", main.top + 40);
+    if (x > work.right - w) x = work.right - w;
+    if (y > work.bottom - h) y = work.bottom - h;
+    if (x < work.left) x = work.left;
+    if (y < work.top) y = work.top;
+    SetWindowPos(g_app.mini, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    InvalidateRect(g_app.mini, NULL, TRUE);
+    ShowWindow(g_app.mini, SW_SHOW);
+    ShowWindow(g_app.wnd, SW_HIDE);
+    SetForegroundWindow(g_app.mini);
+    SetFocus(g_app.miniPlayPause);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -2703,6 +3041,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show)
                                 CW_USEDEFAULT, CW_USEDEFAULT, 1000, 680, NULL, NULL, inst, NULL);
     if (!hwnd)
         return 1;
+    CreateMini(inst, wc.hIcon, wc.hIconSm);   // hidden until Ctrl+M
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
     // Connect straight away; on first run this explains how to fill in the ini.
@@ -2711,12 +3050,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show)
     ACCEL accel[] = {
         { FVIRTKEY, VK_F5, IDM_CONNECT },
         { FVIRTKEY | FCONTROL, 'F', IDM_FIND },
+        { FVIRTKEY | FCONTROL, 'M', IDM_MINI },
     };
     HACCEL accelTable = CreateAcceleratorTableW(accel, sizeof(accel) / sizeof(accel[0]));
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-        if (TranslateAcceleratorW(hwnd, accelTable, &msg))
+        // Shortcuts go to whichever of the two windows is showing.
+        HWND target = (g_app.mini && IsWindowVisible(g_app.mini)) ? g_app.mini : hwnd;
+        if (TranslateAcceleratorW(target, accelTable, &msg))
             continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
