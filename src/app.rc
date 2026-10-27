@@ -1,0 +1,43 @@
+#include <windows.h>
+#include "resource.h"
+
+// RT_MANIFEST (24), id 1 = process manifest. Windows 2000 ignores it; XP uses it for themed controls.
+1 24 "app.manifest"
+
+// 48/32/16 px, 32-bit BMP images with AND masks (no PNG entries: Win2000 can't read those).
+// Regenerate from icon/navi2k.png if the artwork changes.
+IDI_APPICON ICON "navi2k.ico"
+
+// Playlist name prompt (new / rename). Caption is set at runtime.
+IDD_NAME DIALOGEX 0, 0, 230, 58
+STYLE DS_MODALFRAME | DS_CENTER | DS_SHELLFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Playlist"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "&Name:", -1, 7, 10, 26, 8
+    EDITTEXT        IDC_NAME_EDIT, 36, 8, 187, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "OK", IDOK, 119, 37, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 173, 37, 50, 14
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     0,1,0,0
+PRODUCTVERSION  0,1,0,0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Navi2K Player - Navidrome client\0"
+            VALUE "FileVersion", "0.1.0\0"
+            VALUE "ProductName", "Navi2K Player\0"
+            VALUE "ProductVersion", "0.1.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
