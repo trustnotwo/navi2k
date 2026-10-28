@@ -1,9 +1,6 @@
 # Navi2K Player
 
-A native music player for [Navidrome](https://www.navidrome.org/) on **Windows 2000 SP4** and **Windows XP SP3**.
-
-It runs on CPUs without SSE2, back to the Pentium II, Celeron, and Athlon. It needs no runtimes, no .NET, and no DirectX.
-
+A native music player for [Navidrome](https://www.navidrome.org/) on Windows 2000 S XP SP3. It runs on CPUs without SSE2 and needs no extra runtimes.
 ## Features
 
 - Browse by album, artist, or song, and search within each view
@@ -14,7 +11,6 @@ It runs on CPUs without SSE2, back to the Pentium II, Celeron, and Athlon. It ne
 
 ## Requirements
 
-- Windows 2000 SP4 or Windows XP SP3
 - An i686-class CPU (Pentium Pro or newer)
 - A Navidrome server with ffmpeg available. Navidrome converts every track to MP3 for the player; this is enabled by default.
 
