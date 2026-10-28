@@ -1,6 +1,6 @@
 # Navi2K Player
 
-A native music player for [Navidrome](https://www.navidrome.org/) on Windows 2000 S XP SP3. It runs on CPUs without SSE2 and needs no extra runtimes.
+A native music player for [Navidrome](https://www.navidrome.org/) on Windows 2000 S XP SP3. It runs on CPUs without SSE2 and requirews no extra runtimes.
 ## Features
 
 - Browse by album, artist, or song, and search within each view
