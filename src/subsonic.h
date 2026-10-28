@@ -32,6 +32,7 @@ struct SubsonicSong {
     std::wstring title, artist, album, suffix;
     int track, disc, duration, bitRate;   // duration in s, bitRate in kbps (0 = unknown)
     int userRating;                 // 0 = unrated, 1..5
+    bool starred;                   // in Favorites
 };
 
 struct SubsonicArtist {
@@ -56,6 +57,8 @@ bool SubsonicMakeToken(const std::string& passwordUtf8, std::string& token, std:
 class SubsonicClient {
 public:
     void Configure(const SubsonicConfig& cfg);
+    // Streaming quality for the next StreamUrl, without reconnecting.
+    void SetMaxBitRate(int kbps) { m_cfg.maxBitRate = kbps; }
 
     // Pings the primary URL; on a TLS failure, falls back to lanUrl if allowed.
     // On success 'notice' may describe the fallback that was taken.
@@ -86,6 +89,15 @@ public:
     // --- Ratings ---
     bool GetSong(const std::string& songId, SubsonicSong& out, std::wstring& err);
     bool SetRating(const std::string& songId, int rating, std::wstring& err);   // 0 clears
+
+    // --- Favorites (starred songs) ---
+    bool SetStarred(const std::string& songId, bool starred, std::wstring& err);
+    bool GetStarredSongs(std::vector<SubsonicSong>& out, std::wstring& err);
+
+    // --- Scrobbling ---
+    // submission=false: "now playing"; true: a completed play (play count, Last.fm if linked).
+    bool Scrobble(const std::string& songId, bool submission, std::wstring& err);
+    bool GetNowPlayingIds(std::vector<std::string>& ids, std::wstring& err);
 
     // --- Playlists ---
     bool GetPlaylists(std::vector<SubsonicPlaylist>& out, std::wstring& err);

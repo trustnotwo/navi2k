@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <mmsystem.h>
 #include <shellapi.h>
 #include <process.h>
 #include <stdlib.h>
@@ -45,25 +46,27 @@ enum {
 enum {
     IDM_CONNECT = 40001, IDM_EXIT, IDM_PLAY, IDM_PAUSE, IDM_STOP, IDM_SHUFFLE,
     IDM_ALBUMS, IDM_NEW_PLAYLIST, IDM_ABOUT, IDM_ARTISTS, IDM_SONGS, IDM_FIND,
-    IDM_MINI, IDM_PREV, IDM_NEXT
+    IDM_MINI, IDM_PREV, IDM_NEXT, IDM_SETTINGS, IDM_FAVORITES
 };
 
 // Popup menu commands (TrackPopupMenu with TPM_RETURNCMD).
 enum {
     CMD_PLAY = 1001, CMD_MOVE_UP, CMD_MOVE_DOWN, CMD_REMOVE,
-    CMD_PL_PLAY, CMD_PL_NEW, CMD_PL_RENAME, CMD_PL_DELETE,
+    CMD_PL_PLAY, CMD_PL_NEW, CMD_PL_RENAME, CMD_PL_DELETE, CMD_FAV,
     CMD_ADD_NEW = 1050,
     CMD_RATE_BASE = 1100,       // + 0..5
     CMD_ADD_BASE = 2000         // + playlist index
 };
 
 enum { TIMER_POSITION = 1, TIMER_SEARCH = 2 };
-enum { COL_NUM = 0, COL_TITLE, COL_ARTIST, COL_RATING, COL_LENGTH, COL_ALBUM };
+enum { COL_NUM = 0, COL_TITLE, COL_ARTIST, COL_FAV, COL_RATING, COL_LENGTH, COL_ALBUM };
 
 // Sidebar tree item data (playlists use their index, >= 0).
-enum { TREE_LIBRARY = -1, TREE_ALBUMS = -2, TREE_PLAYLISTS = -3, TREE_ARTISTS = -4, TREE_SONGS = -5 };
+enum { TREE_LIBRARY = -1, TREE_ALBUMS = -2, TREE_PLAYLISTS = -3, TREE_ARTISTS = -4, TREE_SONGS = -5,
+       TREE_FAVORITES = -6 };
 
 #define WM_APP_JOB_DONE (WM_APP + 10)
+#define WM_APP_TEST_DONE (WM_APP + 11)   // Settings > Test Connection finished (to the page)
 
 static const int kArtSize = 160;        // requested from the server and drawn 1:1
 static const size_t kArtCacheMax = 48;  // ~5 MB of 160x160 DIBs
@@ -75,12 +78,14 @@ static const int kSidebarW = kArtSize + 12;
 // now-playing cover fetches run alongside them; playlist edits are serialised because
 // removal is by index.
 
-enum JobKind { JOB_CONNECT, JOB_ALBUM, JOB_PLAYLIST, JOB_RATE, JOB_PLEDIT, JOB_ART, JOB_ARTIST, JOB_SONGS };
+enum JobKind { JOB_CONNECT, JOB_ALBUM, JOB_PLAYLIST, JOB_RATE, JOB_PLEDIT, JOB_ART, JOB_ARTIST, JOB_SONGS,
+               JOB_FAVORITES, JOB_STAR, JOB_SCROBBLE };
 enum PlEdit { PL_CREATE, PL_RENAME, PL_ADD, PL_REMOVE, PL_SETSONGS, PL_DELETE };
 
 static bool IsLoadJob(JobKind k)
 {
-    return k == JOB_CONNECT || k == JOB_ALBUM || k == JOB_PLAYLIST || k == JOB_ARTIST || k == JOB_SONGS;
+    return k == JOB_CONNECT || k == JOB_ALBUM || k == JOB_PLAYLIST || k == JOB_ARTIST || k == JOB_SONGS ||
+           k == JOB_FAVORITES;
 }
 
 struct Job {
@@ -103,6 +108,7 @@ struct Job {
     // rating
     std::string songId;
     int rating, oldRating;
+    bool flag, oldFlag;         // star: new/old state; scrobble: submission
 
     // playlist edit
     PlEdit edit;
@@ -116,11 +122,12 @@ struct Job {
     int selectAfter;
 };
 
-enum SongSource { SRC_NONE, SRC_ALBUM, SRC_PLAYLIST, SRC_LIBRARY };
+enum SongSource { SRC_NONE, SRC_ALBUM, SRC_PLAYLIST, SRC_LIBRARY, SRC_FAVORITES };
 // VIEW_ALBUMS: all albums. VIEW_ARTISTS: all artists. VIEW_ARTIST: one artist's albums
 // (same list control as VIEW_ALBUMS). VIEW_TRACKS: an album's or playlist's tracks.
-// VIEW_SONGS: every song in the library (same list control as VIEW_TRACKS).
-enum MainView { VIEW_ALBUMS, VIEW_TRACKS, VIEW_ARTISTS, VIEW_ARTIST, VIEW_SONGS };
+// VIEW_SONGS: every song in the library; VIEW_FAVORITES: starred songs (both use the same
+// list control as VIEW_TRACKS).
+enum MainView { VIEW_ALBUMS, VIEW_TRACKS, VIEW_ARTISTS, VIEW_ARTIST, VIEW_SONGS, VIEW_FAVORITES };
 
 struct Shown {                  // what the header describes
     bool has;
@@ -157,6 +164,16 @@ struct App {
     std::vector<SubsonicSong> allSongs;      // the whole library, loaded on first visit to Songs
     bool allSongsLoaded;
     bool pendingSongs;
+    HTREEITEM treeFavorites;
+    bool favoritesLoaded;
+    bool pendingFavorites;
+
+    // Scrobbling: listening time of the current play, counted from position changes so
+    // that seeking doesn't count as listening.
+    bool scrobbleEnabled;
+    std::string scrobbleId;
+    DWORD listenedMs, lastPosMs;
+    bool nowPlayingSent, scrobbled;
 
     // Search (Albums, Artists, Songs). Each source list has a parallel lower-cased key list,
     // built once when the data arrives; the lists on screen are filtered copies.
@@ -176,6 +193,7 @@ struct App {
     std::vector<int> queueSrcIdx;
     int queueIndex;
     bool shuffle;
+    bool showFavorites, showRatings;   // File > Settings > Display
 
     Shown shown;
     HBITMAP shownArt;
@@ -289,6 +307,15 @@ static unsigned __stdcall JobThread(void* p)
     case JOB_SONGS:
         job->ok = c.GetAllSongs(job->songs, job->message);
         break;
+    case JOB_FAVORITES:
+        job->ok = c.GetStarredSongs(job->songs, job->message);
+        break;
+    case JOB_STAR:
+        job->ok = c.SetStarred(job->songId, job->flag, job->message);
+        break;
+    case JOB_SCROBBLE:
+        job->ok = c.Scrobble(job->songId, job->flag, job->message);
+        break;
     case JOB_ARTIST:
         job->ok = c.GetArtist(job->artist.id, job->albums, job->message);
         // Navidrome sends a WebP placeholder when it has no artist photo, which we can't
@@ -341,6 +368,7 @@ static Job* NewJob(JobKind kind)
     job->needArt = job->artTried = false;
     job->art = NULL;
     job->rating = job->oldRating = 0;
+    job->flag = job->oldFlag = false;
     job->edit = PL_CREATE;
     job->index = -1;
     job->reloaded = false;
@@ -471,9 +499,16 @@ static bool QueueValid()
     return g_app.queueIndex >= 0 && g_app.queueIndex < (int)g_app.queue.size();
 }
 
-// Shows the playing track's cover in the sidebar, fetching it if needed.
+// Shows the playing track's cover in the sidebar, fetching it if needed, and names the
+// track in the title bar (and so the taskbar button).
 static void UpdateNowPlaying()
 {
+    if (QueueValid()) {
+        const SubsonicSong& s = g_app.queue[g_app.queueIndex];
+        SetWindowTextW(g_app.wnd, (L"Navi2K - " + s.title + (s.artist.empty() ? L"" : L" - " + s.artist)).c_str());
+    } else {
+        SetWindowTextW(g_app.wnd, APP_TITLE);
+    }
     g_app.nowCover = QueueValid() ? g_app.queue[g_app.queueIndex].coverArt : std::string();
     g_app.nowArt = CachedArt(g_app.nowCover);
     if (NeedArt(g_app.nowCover) && g_app.nowCoverPending != g_app.nowCover) {
@@ -671,7 +706,7 @@ static void OnSongsDispInfo(NMLVDISPINFOW* di)
     switch (di->item.iSubItem) {
     case COL_NUM: {
         // Playlists number by position; albums and the library by track number.
-        int n = g_app.songSource == SRC_PLAYLIST ? i + 1 : s.track;
+        int n = (g_app.songSource == SRC_PLAYLIST || g_app.songSource == SRC_FAVORITES) ? i + 1 : s.track;
         if (n)
             text = Fmt(L"%d", n);
         break;
@@ -686,12 +721,13 @@ static void OnSongsDispInfo(NMLVDISPINFOW* di)
 
 // --- Sidebar tree ----------------------------------------------------------------------
 
-static HTREEITEM TreeAdd(HTREEITEM parent, const std::wstring& text, LPARAM data, bool bold)
+static HTREEITEM TreeAdd(HTREEITEM parent, const std::wstring& text, LPARAM data, bool bold,
+                         HTREEITEM after = TVI_LAST)
 {
     TVINSERTSTRUCTW ins;
     ZeroMemory(&ins, sizeof(ins));
     ins.hParent = parent;
-    ins.hInsertAfter = TVI_LAST;
+    ins.hInsertAfter = after;
     ins.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_STATE;
     ins.item.pszText = (LPWSTR)text.c_str();
     ins.item.lParam = data;
@@ -741,6 +777,8 @@ static void RebuildPlaylistTree()
         TreeView_SelectItem(g_app.tree, g_app.treeArtists);
     else if (g_app.mainView == VIEW_SONGS)
         TreeView_SelectItem(g_app.tree, g_app.treeSongs);
+    else if (g_app.mainView == VIEW_FAVORITES)
+        TreeView_SelectItem(g_app.tree, g_app.treeFavorites);
     g_app.treeUpdating = false;
 }
 
@@ -777,23 +815,52 @@ static void DrawStar(HDC dc, int cx, int cy, int r, bool filled, COLORREF line)
         DeleteObject(brush);
 }
 
-static void DrawRating(HDC dc, int item)
+// Heart outline, 11 x 10 px around (cx, cy). The UI font on Windows 2000 has no ♥ glyph.
+static void DrawHeart(HDC dc, int cx, int cy, bool filled, COLORREF line)
+{
+    static const int kHeart[14][2] = {
+        {0, 4}, {-5, -1}, {-5, -3}, {-4, -4}, {-3, -5}, {-2, -5}, {-1, -4},
+        {0, -3}, {1, -4}, {2, -5}, {3, -5}, {4, -4}, {5, -3}, {5, -1}
+    };
+    POINT pts[14];
+    for (int i = 0; i < 14; ++i) {
+        pts[i].x = cx + kHeart[i][0];
+        pts[i].y = cy + kHeart[i][1];
+    }
+    const COLORREF red = RGB(214, 40, 57);
+    HPEN pen = CreatePen(PS_SOLID, 1, filled ? red : line);
+    HBRUSH brush = filled ? CreateSolidBrush(red) : NULL;
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, brush ? (HGDIOBJ)brush : GetStockObject(NULL_BRUSH));
+    Polygon(dc, pts, 14);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+    if (brush)
+        DeleteObject(brush);
+}
+
+// Draws the heart and star columns of one row (custom-draw post-paint).
+static void DrawRowExtras(HDC dc, int item)
 {
     if (item < 0 || item >= (int)g_app.songData.size())
         return;
-    RECT cell;
-    if (!ListView_GetSubItemRect(g_app.songs, item, COL_RATING, LVIR_BOUNDS, &cell))
-        return;
-    const int rating = g_app.songData[item].userRating;
+    const SubsonicSong& song = g_app.songData[item];
     const bool highlighted = (ListView_GetItemState(g_app.songs, item, LVIS_SELECTED) & LVIS_SELECTED) &&
                              GetFocus() == g_app.songs;
     const COLORREF empty = GetSysColor(highlighted ? COLOR_HIGHLIGHTTEXT : COLOR_GRAYTEXT);
-    const int s = StarSize(cell), r = s / 2, cy = (cell.top + cell.bottom) / 2 + 1;
 
+    RECT cell;
+    if (g_app.showFavorites && ListView_GetSubItemRect(g_app.songs, item, COL_FAV, LVIR_BOUNDS, &cell))
+        DrawHeart(dc, (cell.left + cell.right) / 2, (cell.top + cell.bottom) / 2, song.starred, empty);
+
+    if (!g_app.showRatings || !ListView_GetSubItemRect(g_app.songs, item, COL_RATING, LVIR_BOUNDS, &cell))
+        return;
+    const int s = StarSize(cell), r = s / 2, cy = (cell.top + cell.bottom) / 2 + 1;
     HRGN clip = CreateRectRgnIndirect(&cell);
     SelectClipRgn(dc, clip);
     for (int i = 0; i < 5; ++i)
-        DrawStar(dc, cell.left + 4 + r + i * (s + 2), cy, r, i < rating, empty);
+        DrawStar(dc, cell.left + 4 + r + i * (s + 2), cy, r, i < song.userRating, empty);
     SelectClipRgn(dc, NULL);
     DeleteObject(clip);
 }
@@ -814,7 +881,7 @@ static LRESULT OnSongsCustomDraw(NMLVCUSTOMDRAW* cd)
         return CDRF_NOTIFYPOSTPAINT;
     }
     case CDDS_ITEMPOSTPAINT:
-        DrawRating(cd->nmcd.hdc, (int)cd->nmcd.dwItemSpec);
+        DrawRowExtras(cd->nmcd.hdc, (int)cd->nmcd.dwItemSpec);
         return CDRF_DODEFAULT;
     }
     return CDRF_DODEFAULT;
@@ -859,13 +926,55 @@ static void SetSongRating(int i, int rating)
     LaunchJob(job);
 }
 
-// Click on the stars: star N sets N; clicking the current rating clears it.
+// Updates the favorite flag everywhere the track appears and repaints its rows.
+static void ApplyFavoriteLocal(const std::string& songId, bool starred)
+{
+    for (size_t i = 0; i < g_app.songData.size(); ++i)
+        if (g_app.songData[i].id == songId) {
+            g_app.songData[i].starred = starred;
+            ListView_RedrawItems(g_app.songs, (int)i, (int)i);
+        }
+    for (size_t i = 0; i < g_app.queue.size(); ++i)
+        if (g_app.queue[i].id == songId)
+            g_app.queue[i].starred = starred;
+    for (size_t i = 0; i < g_app.queueSource.size(); ++i)
+        if (g_app.queueSource[i].id == songId)
+            g_app.queueSource[i].starred = starred;
+    for (size_t i = 0; i < g_app.allSongs.size(); ++i)
+        if (g_app.allSongs[i].id == songId) {
+            g_app.allSongs[i].starred = starred;
+            break;
+        }
+}
+
+static void ToggleFavorite(int i)
+{
+    if (i < 0 || i >= (int)g_app.songData.size())
+        return;
+    const SubsonicSong& s = g_app.songData[i];
+    Job* job = NewJob(JOB_STAR);
+    job->songId = s.id;
+    job->flag = !s.starred;
+    job->oldFlag = s.starred;
+    // Optimistic: show it now, revert if the server refuses.
+    ApplyFavoriteLocal(s.id, job->flag);
+    SetStatus((job->flag ? L"Added to Favorites: \"" : L"Removed from Favorites: \"") + s.title + L"\"");
+    LaunchJob(job);
+}
+
+// Click on the heart toggles Favorites; on the stars, star N sets N (the current one clears).
 static void OnSongsClick(NMITEMACTIVATE* ia)
 {
     LVHITTESTINFO hti;
     ZeroMemory(&hti, sizeof(hti));
     hti.pt = ia->ptAction;
-    if (ListView_SubItemHitTest(g_app.songs, &hti) < 0 || hti.iSubItem != COL_RATING)
+    if (ListView_SubItemHitTest(g_app.songs, &hti) < 0)
+        return;
+    if (hti.iSubItem == COL_FAV && g_app.showFavorites) {
+        ToggleFavorite(hti.iItem);
+        return;
+    }
+    if (hti.iSubItem != COL_RATING || !g_app.showRatings)
         return;
     RECT cell;
     if (!ListView_GetSubItemRect(g_app.songs, hti.iItem, COL_RATING, LVIR_BOUNDS, &cell))
@@ -915,11 +1024,69 @@ static void ResetSeekBar(int durationSec)
     g_app.shownSec = 0;
 }
 
+// --- Scrobbling -------------------------------------------------------------------------
+// "Now playing" when a track starts; a play is submitted once half the track (or 4 minutes)
+// has actually been listened to, as Last.fm counts it. Tracks under 30 s are never submitted.
+
+static void SendScrobble(const std::string& songId, bool submission)
+{
+    Job* job = NewJob(JOB_SCROBBLE);
+    job->songId = songId;
+    job->flag = submission;
+    LaunchJob(job);
+}
+
+// A new play of a track resets the count; a seek within it doesn't.
+static void ScrobbleTrackStarted(const std::string& songId, DWORD startMs)
+{
+    if (startMs == 0 || songId != g_app.scrobbleId) {
+        g_app.scrobbleId = songId;
+        g_app.listenedMs = 0;
+        g_app.nowPlayingSent = false;
+        g_app.scrobbled = false;
+    }
+    g_app.lastPosMs = startMs;
+}
+
+static DWORD ScrobbleThresholdMs(const SubsonicSong& s)
+{
+    DWORD half = (DWORD)s.duration * 500;
+    return (s.duration > 0 && half < 240000) ? half : 240000;
+}
+
+static void ScrobbleCheck(bool trackFinished)
+{
+    if (!g_app.scrobbleEnabled || g_app.scrobbled || !QueueValid())
+        return;
+    const SubsonicSong& s = g_app.queue[g_app.queueIndex];
+    if (s.id != g_app.scrobbleId || (s.duration > 0 && s.duration < 30))
+        return;
+    // At the end of a track the last timer tick may have just missed the threshold.
+    DWORD slack = trackFinished ? 1000 : 0;
+    if (g_app.listenedMs + slack >= ScrobbleThresholdMs(s)) {
+        g_app.scrobbled = true;
+        SendScrobble(s.id, true);
+        LogF(L"Scrobbled \"%ls\" after %lu s of listening", s.title.c_str(), g_app.listenedMs / 1000);
+    }
+}
+
+// Called with each position update: forward movement in small steps counts as listening;
+// jumps (seeks) and pauses don't.
+static void ScrobbleTrackPosition(DWORD posMs)
+{
+    if (posMs > g_app.lastPosMs && posMs - g_app.lastPosMs < 2000)
+        g_app.listenedMs += posMs - g_app.lastPosMs;
+    g_app.lastPosMs = posMs;
+    ScrobbleCheck(false);
+}
+
 static void UpdatePosition()
 {
     if (g_app.seekDragging || !g_app.player.IsActive() || !QueueValid())
         return;
-    int sec = (int)(g_app.player.PositionMs() / 1000);
+    const DWORD posMs = g_app.player.PositionMs();
+    ScrobbleTrackPosition(posMs);
+    int sec = (int)(posMs / 1000);
     int dur = g_app.queue[g_app.queueIndex].duration;
     if (dur > 0 && sec > dur)
         sec = dur;
@@ -999,6 +1166,7 @@ static void StartQueue(int i, DWORD startMs)
         SelectRow(g_app.songs, row);
     InvalidateRect(g_app.songs, NULL, FALSE);   // bold "now playing" row
     SetStatus(L"Buffering: " + s.title);
+    ScrobbleTrackStarted(s.id, startMs);
     g_app.player.Play(url, g_app.client.Options(), start, skip);
     UpdateNowPlaying();
     RefreshTransport();
@@ -1066,7 +1234,8 @@ static void DoPlay()
         DoPause();
         return;
     }
-    if ((g_app.mainView == VIEW_TRACKS || g_app.mainView == VIEW_SONGS) && !g_app.songData.empty()) {
+    if ((g_app.mainView == VIEW_TRACKS || g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_FAVORITES) &&
+        !g_app.songData.empty()) {
         int sel = SelectedIndex(g_app.songs);
         PlayFromSongList(sel >= 0 ? sel : (g_app.shuffle ? RandomBelow((int)g_app.songData.size()) : 0));
     } else if (QueueValid()) {
@@ -1112,7 +1281,8 @@ static HWND CurrentList()
     switch (g_app.mainView) {
     case VIEW_ARTISTS: return g_app.artists;
     case VIEW_TRACKS:
-    case VIEW_SONGS:   return g_app.songs;
+    case VIEW_SONGS:
+    case VIEW_FAVORITES: return g_app.songs;
     default:           return g_app.albums;
     }
 }
@@ -1121,7 +1291,7 @@ static void SetView(MainView v)
 {
     g_app.mainView = v;
     const bool albumList = v == VIEW_ALBUMS || v == VIEW_ARTIST;
-    const bool trackList = v == VIEW_TRACKS || v == VIEW_SONGS;
+    const bool trackList = v == VIEW_TRACKS || v == VIEW_SONGS || v == VIEW_FAVORITES;
     ShowWindow(g_app.albums, albumList ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.artists, v == VIEW_ARTISTS ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.songs, trackList ? SW_SHOW : SW_HIDE);
@@ -1183,6 +1353,31 @@ static void ShowSongsView()
     TreeSelectQuietly(g_app.treeSongs);
     SelectRow(g_app.songs, 0);
     SetFocus(g_app.songs);
+}
+
+static void LoadFavorites()
+{
+    if (!TryBeginLoad()) {
+        g_app.pendingFavorites = true;   // retried when the running load finishes
+        return;
+    }
+    SetStatus(L"Loading Favorites...");
+    LaunchJob(NewJob(JOB_FAVORITES));
+}
+
+// Library > Favorites: starred songs, re-read from the server each visit so it's current.
+static void ShowFavoritesView()
+{
+    if (!g_app.showFavorites)
+        return;
+    g_app.songSource = SRC_FAVORITES;
+    g_app.songData.clear();
+    g_app.favoritesLoaded = false;
+    FillSongs();
+    SetView(VIEW_FAVORITES);
+    TreeSelectQuietly(g_app.treeFavorites);
+    SetFocus(g_app.songs);
+    LoadFavorites();
 }
 
 static void ShowArtistsView()
@@ -1309,10 +1504,10 @@ static void DoConnect()
     SubsonicConfig cfg;
     std::wstring err;
     if (!ConfigLoad(g_app.iniPath, cfg, err)) {
+        // Not set up yet (first run): open Settings rather than sending people to the ini.
         InterlockedExchange(&g_app.loadBusy, 0);
-        if (MessageBoxW(g_app.wnd, (err + L"\r\n\r\nOpen it in Notepad now?").c_str(), APP_TITLE,
-                        MB_ICONINFORMATION | MB_YESNO) == IDYES)
-            ShellExecuteW(g_app.wnd, L"open", L"notepad.exe", g_app.iniPath.c_str(), NULL, SW_SHOWNORMAL);
+        SetStatus(L"Not connected. " + err);
+        PostMessageW(g_app.wnd, WM_COMMAND, MAKEWPARAM(IDM_SETTINGS, 0), 0);
         return;
     }
 
@@ -1325,6 +1520,8 @@ static void DoConnect()
     g_app.allSongs.clear();
     g_app.allSongsLoaded = false;
     g_app.pendingSongs = false;
+    g_app.favoritesLoaded = false;
+    g_app.pendingFavorites = false;
     g_app.albumKeys.clear();
     g_app.artistKeys.clear();
     g_app.songKeys.clear();
@@ -1664,6 +1861,36 @@ static void OnJobDone(Job* job)
         }
         break;
 
+    case JOB_FAVORITES:
+        if (job->ok) {
+            if (g_app.mainView == VIEW_FAVORITES) {
+                g_app.songData.swap(job->songs);
+                g_app.favoritesLoaded = true;
+                FillSongs();
+                SelectRow(g_app.songs, 0);
+                InvalidateHeader();
+            }
+            SetStatus(L"Favorites loaded.");
+        } else {
+            SetStatus(L"Could not load Favorites.");
+            MessageBoxW(g_app.wnd, job->message.c_str(), APP_TITLE, MB_ICONERROR);
+        }
+        break;
+
+    case JOB_STAR:
+        if (!job->ok) {
+            ApplyFavoriteLocal(job->songId, job->oldFlag);
+            SetStatus(L"The favorite was not saved.");
+            MessageBoxW(g_app.wnd, job->message.c_str(), APP_TITLE, MB_ICONERROR);
+        }
+        break;
+
+    case JOB_SCROBBLE:
+        // Best effort: a failed scrobble is logged, not worth interrupting playback for.
+        if (!job->ok)
+            LogF(L"Scrobble (%ls) failed: %ls", job->flag ? L"play" : L"now playing", job->message.c_str());
+        break;
+
     case JOB_RATE:
         if (!job->ok) {
             ApplyRatingLocal(job->songId, job->oldRating);
@@ -1722,6 +1949,9 @@ static void OnJobDone(Job* job)
             OpenPlaylist(g_app.pendingPlaylist);
         else
             OpenSelectedAlbum();
+    } else if (g_app.pendingFavorites && g_app.mainView == VIEW_FAVORITES) {
+        g_app.pendingFavorites = false;
+        LoadFavorites();
     } else if (g_app.pendingSongs && !g_app.allSongsLoaded) {
         g_app.pendingSongs = false;
         LoadAllSongs();
@@ -1740,8 +1970,13 @@ static void OnPlayerState(WPARAM wp, LPARAM lp)
             break;
         case PS_PLAYING:
             SetStatus(L"Playing: " + title + L"  -  " + g_app.queue[g_app.queueIndex].artist);
+            if (g_app.scrobbleEnabled && !g_app.nowPlayingSent) {
+                g_app.nowPlayingSent = true;
+                SendScrobble(g_app.queue[g_app.queueIndex].id, false);
+            }
             break;
         case PS_FINISHED:
+            ScrobbleCheck(true);
             if (g_app.queueIndex + 1 < (int)g_app.queue.size()) {
                 StartQueue(g_app.queueIndex + 1, 0);
             } else {
@@ -1819,7 +2054,12 @@ static void SongsContextMenu(LPARAM lp)
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, CMD_PLAY, L"&Play");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)rate, L"&Rate");
+    if (g_app.showRatings)
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)rate, L"&Rate");
+    else
+        DestroyMenu(rate);
+    if (g_app.showFavorites)
+        AppendMenuW(m, MF_STRING, CMD_FAV, s.starred ? L"Remove from &Favorites" : L"Add to &Favorites");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)BuildAddToMenu(), L"&Add to playlist");
     if (g_app.songSource == SRC_PLAYLIST) {
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -1836,6 +2076,8 @@ static void SongsContextMenu(LPARAM lp)
     std::vector<std::string> one(1, s.id);
     if (cmd == CMD_PLAY)
         PlayFromSongList(i);
+    else if (cmd == CMD_FAV)
+        ToggleFavorite(i);
     else if (cmd >= CMD_RATE_BASE && cmd <= CMD_RATE_BASE + 5)
         SetSongRating(i, cmd - CMD_RATE_BASE);
     else if (cmd == CMD_ADD_NEW)
@@ -2145,6 +2387,15 @@ static void PaintHeader(HDC dc)
         else
             line2 = Fmt(L"%u songs  \x00B7  %ls", (unsigned)g_app.allSongs.size(),
                         FormatTime(TotalDuration(g_app.allSongs)).c_str());
+    } else if (g_app.mainView == VIEW_FAVORITES) {
+        title = L"Favorites";
+        if (!g_app.favoritesLoaded)
+            line2 = L"Loading...";
+        else if (g_app.songData.empty())
+            line2 = L"No favorites yet: click a track's heart to add it.";
+        else
+            line2 = Fmt(L"%u song%ls  \x00B7  %ls", (unsigned)g_app.songData.size(),
+                        g_app.songData.size() == 1 ? L"" : L"s", FormatTime(TotalDuration(g_app.songData)).c_str());
     } else if (g_app.shown.has) {
         DrawCover(dc, g_app.artRect, g_app.shownArt, L"No cover");
         textX = g_app.artRect.right + 14;
@@ -2155,7 +2406,7 @@ static void PaintHeader(HDC dc)
 
     // Section headers (Albums/Artists/Songs) are compact: title at the top, count right under it.
     const bool compact = !g_app.shown.has || g_app.mainView == VIEW_ALBUMS || g_app.mainView == VIEW_ARTISTS ||
-                         g_app.mainView == VIEW_SONGS;
+                         g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_FAVORITES;
     RECT t = { textX, h.top + (compact ? 0 : 6), h.right, h.top + (compact ? 32 : 40) };
     SetTextColor(dc, text);
     SelectObject(dc, g_app.fontTitle);
@@ -2217,8 +2468,8 @@ struct ColSpec {
 
 static const ColSpec kAlbumCols[]  = { { 0, 5, 120 }, { 0, 4, 100 }, { 50, 0, 0 }, { 55, 0, 0 } };
 static const ColSpec kArtistCols[] = { { 0, 1, 150 }, { 60, 0, 0 } };
-static const ColSpec kSongCols[]   = { { 32, 0, 0 }, { 0, 5, 120 }, { 0, 3, 90 }, { 80, 0, 0 }, { 48, 0, 0 },
-                                       { 0, 4, 90 } };
+static const ColSpec kSongCols[]   = { { 32, 0, 0 }, { 0, 5, 120 }, { 0, 3, 90 }, { 24, 0, 0 }, { 80, 0, 0 },
+                                       { 48, 0, 0 }, { 0, 4, 90 } };
 
 static void FitColumns(HWND lv, const ColSpec* cols, int n)
 {
@@ -2330,7 +2581,14 @@ static void Layout(HWND hwnd)
     MoveWindow(g_app.songs, mx, listTop, mw, listH > 0 ? listH : 0, TRUE);
     FitColumns(g_app.albums, kAlbumCols, sizeof(kAlbumCols) / sizeof(kAlbumCols[0]));
     FitColumns(g_app.artists, kArtistCols, sizeof(kArtistCols) / sizeof(kArtistCols[0]));
-    FitColumns(g_app.songs, kSongCols, sizeof(kSongCols) / sizeof(kSongCols[0]));
+    ColSpec songCols[sizeof(kSongCols) / sizeof(kSongCols[0])];
+    memcpy(songCols, kSongCols, sizeof(songCols));
+    const ColSpec hidden = { 0, 0, 0 };   // flexible with no share: width 0
+    if (!g_app.showFavorites)
+        songCols[COL_FAV] = hidden;
+    if (!g_app.showRatings)
+        songCols[COL_RATING] = hidden;
+    FitColumns(g_app.songs, songCols, sizeof(songCols) / sizeof(songCols[0]));
     InvalidateRect(hwnd, NULL, TRUE);
 }
 
@@ -2366,6 +2624,7 @@ static HMENU BuildMenuBar()
 {
     HMENU file = CreatePopupMenu();
     AppendMenuW(file, MF_STRING, IDM_CONNECT, L"&Connect\tF5");
+    AppendMenuW(file, MF_STRING, IDM_SETTINGS, L"&Settings...");
     AppendMenuW(file, MF_SEPARATOR, 0, NULL);
     AppendMenuW(file, MF_STRING, IDM_EXIT, L"E&xit");
 
@@ -2373,6 +2632,7 @@ static HMENU BuildMenuBar()
     AppendMenuW(view, MF_STRING, IDM_ALBUMS, L"&Albums");
     AppendMenuW(view, MF_STRING, IDM_ARTISTS, L"A&rtists");
     AppendMenuW(view, MF_STRING, IDM_SONGS, L"&Songs");
+    AppendMenuW(view, MF_STRING, IDM_FAVORITES, L"Fa&vorites");
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     AppendMenuW(view, MF_STRING, IDM_FIND, L"&Find\tCtrl+F");
     AppendMenuW(view, MF_STRING, IDM_MINI, L"&Mini Player\tCtrl+M");
@@ -2399,6 +2659,393 @@ static HMENU BuildMenuBar()
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)playlist, L"P&laylist");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)help, L"&Help");
     return bar;
+}
+
+// --- Settings (File > Settings) -----------------------------------------------------------
+// A two-page property sheet. Pages are created when first shown, so only the pages the user
+// visited get PSN_APPLY; each saves its own settings.
+
+struct SettingsState {
+    SubsonicConfig cfg;      // as saved
+    PlaybackSettings pb;
+    bool showFavorites, showRatings;
+    bool serverChanged;      // reconnect afterwards
+    bool playbackChanged;    // apply to the player afterwards
+    bool displayChanged;
+};
+static SettingsState* g_settings;
+
+static const int kQualities[] = { 96, 128, 160, 192, 256, 320 };
+static const struct { int buffers; const wchar_t* label; } kBufferChoices[] = {
+    { 8,  L"Short (0.4 s): quickest volume and seeking" },
+    { 12, L"Normal (0.6 s)" },
+    { 24, L"Long (1.1 s): for a slow network" },
+    { 32, L"Extra long (1.5 s)" },
+};
+
+static UINT ResolveDevice(const std::wstring& name)
+{
+    if (name.empty())
+        return WAVE_MAPPER;
+    UINT n = waveOutGetNumDevs();
+    for (UINT i = 0; i < n; ++i) {
+        WAVEOUTCAPSW caps;
+        if (waveOutGetDevCapsW(i, &caps, sizeof(caps)) == MMSYSERR_NOERROR && name == caps.szPname)
+            return i;
+    }
+    return WAVE_MAPPER;   // device gone: use the default
+}
+
+static void ApplyPlayback(const PlaybackSettings& pb)
+{
+    g_app.player.SetOutput(ResolveDevice(pb.device), pb.bufferCount);
+    g_app.scrobbleEnabled = pb.scrobble;
+}
+
+static std::wstring DlgText(HWND dlg, int id)
+{
+    wchar_t buf[512];
+    GetDlgItemTextW(dlg, id, buf, 512);
+    std::wstring s = buf;
+    size_t a = s.find_first_not_of(L" \t"), b = s.find_last_not_of(L" \t");
+    return a == std::wstring::npos ? std::wstring() : s.substr(a, b - a + 1);
+}
+
+static bool IsHttpUrl(const std::wstring& url)
+{
+    return _wcsnicmp(url.c_str(), L"http://", 7) == 0 || _wcsnicmp(url.c_str(), L"https://", 8) == 0;
+}
+
+static void SetPasswordHint(HWND dlg)
+{
+    SetDlgItemTextW(dlg, IDC_SET_PWHINT, g_settings->cfg.token.empty()
+                                             ? L"Required."
+                                             : L"A password is saved. Leave blank to keep it.");
+}
+
+// Reads the Server page into cfg/password; false (with a message) if something's missing.
+static bool ReadServerPage(HWND dlg, SubsonicConfig& cfg, std::wstring& password, bool requireLogin)
+{
+    cfg = g_settings->cfg;
+    cfg.url = DlgText(dlg, IDC_SET_URL);
+    cfg.user = WideToUtf8(DlgText(dlg, IDC_SET_USER));
+    cfg.lanUrl = DlgText(dlg, IDC_SET_LANURL);
+    cfg.allowHttpFallback = IsDlgButtonChecked(dlg, IDC_SET_FALLBACK) == BST_CHECKED;
+    cfg.allowUntrustedCert = IsDlgButtonChecked(dlg, IDC_SET_UNTRUSTED) == BST_CHECKED;
+    wchar_t pw[256];
+    GetDlgItemTextW(dlg, IDC_SET_PASSWORD, pw, 256);   // not trimmed: spaces may be part of it
+    password = pw;
+    SecureZeroMemory(pw, sizeof(pw));
+
+    const wchar_t* problem = NULL;
+    int field = 0;
+    if (!IsHttpUrl(cfg.url)) {
+        problem = L"Enter the server address, starting with http:// (or https://).";
+        field = IDC_SET_URL;
+    } else if (cfg.user.empty()) {
+        problem = L"Enter your user name.";
+        field = IDC_SET_USER;
+    } else if (requireLogin && password.empty() && cfg.token.empty()) {
+        problem = L"Enter your password.";
+        field = IDC_SET_PASSWORD;
+    } else if (cfg.allowHttpFallback && !IsHttpUrl(cfg.lanUrl)) {
+        problem = L"Enter the LAN address (starting with http://), or untick the fallback.";
+        field = IDC_SET_LANURL;
+    }
+    if (problem) {
+        MessageBoxW(dlg, problem, L"Settings", MB_ICONEXCLAMATION);
+        SetFocus(GetDlgItem(dlg, field));
+        return false;
+    }
+    return true;
+}
+
+struct TestRequest {
+    HWND page;
+    SubsonicConfig cfg;
+    std::wstring password;
+};
+
+// Test Connection runs off the UI thread with its own client; the result is posted back.
+static unsigned __stdcall TestConnectionThread(void* p)
+{
+    TestRequest* t = (TestRequest*)p;
+    bool ok = false;
+    std::wstring msg;
+    if (!t->password.empty() && !SubsonicMakeToken(WideToUtf8(t->password), t->cfg.token, t->cfg.salt)) {
+        msg = L"Could not hash the password.";
+    } else {
+        SubsonicClient client;
+        client.Configure(t->cfg);
+        std::wstring notice;
+        ok = client.Connect(notice);
+        msg = ok ? (notice.empty() ? std::wstring(L"Connected: the address and login work.") : L"Connected. " + notice)
+                 : notice;
+    }
+    wchar_t* copy = _wcsdup(msg.c_str());
+    if (!PostMessageW(t->page, WM_APP_TEST_DONE, ok, (LPARAM)copy))
+        free(copy);   // the dialog was closed meanwhile
+    delete t;
+    InterlockedDecrement(&g_app.jobsRunning);
+    return 0;
+}
+
+static INT_PTR CALLBACK ServerPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_INITDIALOG: {
+        const SubsonicConfig& c = g_settings->cfg;
+        SendDlgItemMessageW(dlg, IDC_SET_URL, EM_LIMITTEXT, 300, 0);
+        SendDlgItemMessageW(dlg, IDC_SET_USER, EM_LIMITTEXT, 100, 0);
+        SendDlgItemMessageW(dlg, IDC_SET_PASSWORD, EM_LIMITTEXT, 200, 0);
+        SendDlgItemMessageW(dlg, IDC_SET_LANURL, EM_LIMITTEXT, 300, 0);
+        SetDlgItemTextW(dlg, IDC_SET_URL, c.url.c_str());
+        SetDlgItemTextW(dlg, IDC_SET_USER, Utf8ToWide(c.user).c_str());
+        SetDlgItemTextW(dlg, IDC_SET_LANURL, c.lanUrl.c_str());
+        CheckDlgButton(dlg, IDC_SET_FALLBACK, c.allowHttpFallback ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(dlg, IDC_SET_UNTRUSTED, c.allowUntrustedCert ? BST_CHECKED : BST_UNCHECKED);
+        EnableWindow(GetDlgItem(dlg, IDC_SET_LANURL), c.allowHttpFallback);
+        SetPasswordHint(dlg);
+        return TRUE;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_SET_FALLBACK && HIWORD(wp) == BN_CLICKED) {
+            EnableWindow(GetDlgItem(dlg, IDC_SET_LANURL), IsDlgButtonChecked(dlg, IDC_SET_FALLBACK) == BST_CHECKED);
+        } else if (LOWORD(wp) == IDC_SET_TEST && HIWORD(wp) == BN_CLICKED) {
+            TestRequest* t = new TestRequest;
+            if (!ReadServerPage(dlg, t->cfg, t->password, true)) {
+                delete t;
+                return TRUE;
+            }
+            t->page = dlg;
+            EnableWindow(GetDlgItem(dlg, IDC_SET_TEST), FALSE);
+            SetDlgItemTextW(dlg, IDC_SET_TESTRESULT, L"Connecting...");
+            InterlockedIncrement(&g_app.jobsRunning);
+            HANDLE th = (HANDLE)_beginthreadex(NULL, 0, TestConnectionThread, t, 0, NULL);
+            if (th) {
+                CloseHandle(th);
+            } else {
+                InterlockedDecrement(&g_app.jobsRunning);
+                delete t;
+                EnableWindow(GetDlgItem(dlg, IDC_SET_TEST), TRUE);
+                SetDlgItemTextW(dlg, IDC_SET_TESTRESULT, L"Could not start the test.");
+            }
+        }
+        return TRUE;
+
+    case WM_APP_TEST_DONE: {
+        wchar_t* text = (wchar_t*)lp;
+        EnableWindow(GetDlgItem(dlg, IDC_SET_TEST), TRUE);
+        if (wp) {
+            SetDlgItemTextW(dlg, IDC_SET_TESTRESULT, text);
+        } else {
+            // Failures (TLS, login, ...) come with several lines of advice.
+            SetDlgItemTextW(dlg, IDC_SET_TESTRESULT, L"The test failed (details shown).");
+            MessageBoxW(dlg, text, L"Test Connection", MB_ICONERROR);
+        }
+        free(text);
+        return TRUE;
+    }
+
+    case WM_NOTIFY:
+        if (((NMHDR*)lp)->code == PSN_APPLY) {
+            SubsonicConfig cfg;
+            std::wstring password, err;
+            if (!ReadServerPage(dlg, cfg, password, true)) {
+                SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_INVALID);
+                return TRUE;
+            }
+            const SubsonicConfig& old = g_settings->cfg;
+            bool changed = !password.empty() || cfg.url != old.url || cfg.user != old.user ||
+                           cfg.lanUrl != old.lanUrl || cfg.allowHttpFallback != old.allowHttpFallback ||
+                           cfg.allowUntrustedCert != old.allowUntrustedCert;
+            if (!ConfigSaveServer(g_app.iniPath, cfg, password, err)) {
+                MessageBoxW(dlg, err.c_str(), L"Settings", MB_ICONERROR);
+                SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_INVALID);
+                return TRUE;
+            }
+            SecureZeroMemory(&password[0], password.size() * sizeof(wchar_t));
+            g_settings->serverChanged = changed;
+            SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_NOERROR);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+static INT_PTR CALLBACK PlaybackPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_INITDIALOG: {
+        HWND q = GetDlgItem(dlg, IDC_SET_QUALITY);
+        int sel = 3;
+        for (int i = 0; i < (int)(sizeof(kQualities) / sizeof(kQualities[0])); ++i) {
+            SendMessageW(q, CB_ADDSTRING, 0, (LPARAM)Fmt(L"%d kbps%ls", kQualities[i],
+                                                         kQualities[i] == 320 ? L" (best)" : L"").c_str());
+            if (kQualities[i] <= g_settings->cfg.maxBitRate)
+                sel = i;
+        }
+        SendMessageW(q, CB_SETCURSEL, sel, 0);
+
+        HWND d = GetDlgItem(dlg, IDC_SET_DEVICE);
+        SendMessageW(d, CB_ADDSTRING, 0, (LPARAM)L"Default sound device");
+        int dsel = 0;
+        UINT n = waveOutGetNumDevs();
+        for (UINT i = 0; i < n; ++i) {
+            WAVEOUTCAPSW caps;
+            if (waveOutGetDevCapsW(i, &caps, sizeof(caps)) != MMSYSERR_NOERROR)
+                continue;
+            int idx = (int)SendMessageW(d, CB_ADDSTRING, 0, (LPARAM)caps.szPname);
+            if (g_settings->pb.device == caps.szPname)
+                dsel = idx;
+        }
+        SendMessageW(d, CB_SETCURSEL, dsel, 0);
+
+        HWND b = GetDlgItem(dlg, IDC_SET_BUFFER);
+        int bsel = 1;
+        for (int i = 0; i < (int)(sizeof(kBufferChoices) / sizeof(kBufferChoices[0])); ++i) {
+            SendMessageW(b, CB_ADDSTRING, 0, (LPARAM)kBufferChoices[i].label);
+            if (kBufferChoices[i].buffers <= g_settings->pb.bufferCount)
+                bsel = i;
+        }
+        SendMessageW(b, CB_SETCURSEL, bsel, 0);
+
+        CheckDlgButton(dlg, IDC_SET_SCROBBLE, g_settings->pb.scrobble ? BST_CHECKED : BST_UNCHECKED);
+        return TRUE;
+    }
+
+    case WM_NOTIFY:
+        if (((NMHDR*)lp)->code == PSN_APPLY) {
+            int q = (int)SendDlgItemMessageW(dlg, IDC_SET_QUALITY, CB_GETCURSEL, 0, 0);
+            int b = (int)SendDlgItemMessageW(dlg, IDC_SET_BUFFER, CB_GETCURSEL, 0, 0);
+            int d = (int)SendDlgItemMessageW(dlg, IDC_SET_DEVICE, CB_GETCURSEL, 0, 0);
+            PlaybackSettings pb;
+            pb.bufferCount = kBufferChoices[b >= 0 ? b : 1].buffers;
+            pb.scrobble = IsDlgButtonChecked(dlg, IDC_SET_SCROBBLE) == BST_CHECKED;
+            if (d > 0) {
+                wchar_t name[MAXPNAMELEN + 1] = L"";
+                SendDlgItemMessageW(dlg, IDC_SET_DEVICE, CB_GETLBTEXT, d, (LPARAM)name);
+                pb.device = name;
+            }
+            g_settings->cfg.maxBitRate = kQualities[q >= 0 ? q : 3];
+            WritePrivateProfileStringW(L"Server", L"MaxBitRate", Fmt(L"%d", g_settings->cfg.maxBitRate).c_str(),
+                                       g_app.iniPath.c_str());
+            PlaybackSave(g_app.iniPath, pb);
+            g_settings->pb = pb;
+            g_settings->playbackChanged = true;
+            SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_NOERROR);
+            return TRUE;
+        }
+        break;
+    }
+    (void)wp;
+    return FALSE;
+}
+
+static INT_PTR CALLBACK DisplayPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_INITDIALOG:
+        CheckDlgButton(dlg, IDC_SET_SHOWFAV, g_settings->showFavorites ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(dlg, IDC_SET_SHOWRATING, g_settings->showRatings ? BST_CHECKED : BST_UNCHECKED);
+        return TRUE;
+
+    case WM_NOTIFY:
+        if (((NMHDR*)lp)->code == PSN_APPLY) {
+            g_settings->showFavorites = IsDlgButtonChecked(dlg, IDC_SET_SHOWFAV) == BST_CHECKED;
+            g_settings->showRatings = IsDlgButtonChecked(dlg, IDC_SET_SHOWRATING) == BST_CHECKED;
+            g_settings->displayChanged = true;
+            SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_NOERROR);
+            return TRUE;
+        }
+        break;
+    }
+    (void)wp;
+    return FALSE;
+}
+
+// Shows or hides favorites and ratings: the track-list columns, and Favorites in the sidebar
+// and View menu. Clicks, keys and right-click items check the flags themselves.
+static void ApplyDisplay()
+{
+    // Sidebar: Library > Favorites sits after Songs.
+    g_app.treeUpdating = true;
+    if (!g_app.showFavorites && g_app.treeFavorites) {
+        TreeView_DeleteItem(g_app.tree, g_app.treeFavorites);
+        g_app.treeFavorites = NULL;
+    } else if (g_app.showFavorites && !g_app.treeFavorites) {
+        g_app.treeFavorites = TreeAdd(g_app.treeLibrary, L"Favorites", TREE_FAVORITES, false, g_app.treeSongs);
+    }
+    g_app.treeUpdating = false;
+
+    // View menu: Fa&vorites follows &Songs.
+    HMENU view = GetSubMenu(g_app.menu, 1);
+    DeleteMenu(view, IDM_FAVORITES, MF_BYCOMMAND);
+    if (g_app.showFavorites) {
+        int n = GetMenuItemCount(view);
+        for (int i = 0; i < n; ++i)
+            if (GetMenuItemID(view, i) == IDM_SONGS) {
+                InsertMenuW(view, i + 1, MF_BYPOSITION | MF_STRING, IDM_FAVORITES, L"Fa&vorites");
+                break;
+            }
+    }
+
+    if (!g_app.showFavorites && g_app.mainView == VIEW_FAVORITES)
+        ShowAlbumsView();
+    Layout(g_app.wnd);   // refits the song columns
+    InvalidateRect(g_app.songs, NULL, TRUE);
+}
+
+static void ShowSettings()
+{
+    SettingsState st;
+    ConfigRead(g_app.iniPath, st.cfg);
+    PlaybackLoad(g_app.iniPath, st.pb);
+    st.showFavorites = g_app.showFavorites;
+    st.showRatings = g_app.showRatings;
+    st.serverChanged = st.playbackChanged = st.displayChanged = false;
+    g_settings = &st;
+
+    PROPSHEETPAGEW pages[3];
+    ZeroMemory(pages, sizeof(pages));
+    const int ids[3] = { IDD_SET_SERVER, IDD_SET_PLAYBACK, IDD_SET_DISPLAY };
+    DLGPROC procs[3] = { ServerPageProc, PlaybackPageProc, DisplayPageProc };
+    for (int i = 0; i < 3; ++i) {
+        pages[i].dwSize = sizeof(PROPSHEETPAGEW);
+        pages[i].dwFlags = PSP_DEFAULT;
+        pages[i].hInstance = GetModuleHandleW(NULL);
+        pages[i].pszTemplate = MAKEINTRESOURCEW(ids[i]);
+        pages[i].pfnDlgProc = procs[i];
+    }
+    PROPSHEETHEADERW sheet;
+    ZeroMemory(&sheet, sizeof(sheet));
+    sheet.dwSize = sizeof(sheet);
+    sheet.dwFlags = PSH_PROPSHEETPAGE | PSH_NOAPPLYNOW | PSH_NOCONTEXTHELP;
+    sheet.hwndParent = g_app.wnd;
+    sheet.hInstance = GetModuleHandleW(NULL);
+    sheet.pszCaption = L"Settings";
+    sheet.nPages = 3;
+    sheet.ppsp = pages;
+    PropertySheetW(&sheet);
+    g_settings = NULL;
+
+    if (st.playbackChanged) {
+        ApplyPlayback(st.pb);
+        g_app.client.SetMaxBitRate(st.cfg.maxBitRate);
+        SetStatus(L"Playback settings saved; they apply from the next track or seek.");
+    }
+    if (st.displayChanged && (st.showFavorites != g_app.showFavorites || st.showRatings != g_app.showRatings)) {
+        g_app.showFavorites = st.showFavorites;
+        g_app.showRatings = st.showRatings;
+        const wchar_t* ini = g_app.iniPath.c_str();
+        WritePrivateProfileStringW(L"View", L"ShowFavorites", g_app.showFavorites ? L"1" : L"0", ini);
+        WritePrivateProfileStringW(L"View", L"ShowRatings", g_app.showRatings ? L"1" : L"0", ini);
+        ApplyDisplay();
+    }
+    if (st.serverChanged)
+        DoConnect();
 }
 
 static void OnCreate(HWND hwnd)
@@ -2434,6 +3081,7 @@ static void OnCreate(HWND hwnd)
     g_app.treeAlbums = TreeAdd(g_app.treeLibrary, L"Albums", TREE_ALBUMS, false);
     g_app.treeArtists = TreeAdd(g_app.treeLibrary, L"Artists", TREE_ARTISTS, false);
     g_app.treeSongs = TreeAdd(g_app.treeLibrary, L"Songs", TREE_SONGS, false);
+    g_app.treeFavorites = TreeAdd(g_app.treeLibrary, L"Favorites", TREE_FAVORITES, false);
     g_app.treePlaylists = TreeAdd(TVI_ROOT, L"PLAYLISTS", TREE_PLAYLISTS, true);
     TreeView_Expand(g_app.tree, g_app.treeLibrary, TVE_EXPAND);
     g_app.treeUpdating = false;
@@ -2461,6 +3109,7 @@ static void OnCreate(HWND hwnd)
     AddColumn(g_app.songs, COL_NUM, L"#", 32, LVCFMT_RIGHT);
     AddColumn(g_app.songs, COL_TITLE, L"Track", 220, LVCFMT_LEFT);
     AddColumn(g_app.songs, COL_ARTIST, L"Artist", 140, LVCFMT_LEFT);
+    AddColumn(g_app.songs, COL_FAV, L"", 24, LVCFMT_LEFT);   // heart, drawn
     AddColumn(g_app.songs, COL_RATING, L"Rating", 80, LVCFMT_LEFT);
     AddColumn(g_app.songs, COL_LENGTH, L"Time", 48, LVCFMT_RIGHT);
     AddColumn(g_app.songs, COL_ALBUM, L"Album", 170, LVCFMT_LEFT);
@@ -2481,6 +3130,12 @@ static void OnCreate(HWND hwnd)
     g_app.player.SetVolume((int)GetPrivateProfileIntW(L"Player", L"Volume", 100, g_app.iniPath.c_str()));
     SendMessageW(g_app.volume, TBM_SETPOS, TRUE, g_app.player.Volume());
     g_app.shuffle = GetPrivateProfileIntW(L"Player", L"Shuffle", 0, g_app.iniPath.c_str()) != 0;
+    PlaybackSettings pb;
+    PlaybackLoad(g_app.iniPath, pb);
+    ApplyPlayback(pb);
+    g_app.showFavorites = GetPrivateProfileIntW(L"View", L"ShowFavorites", 1, g_app.iniPath.c_str()) != 0;
+    g_app.showRatings = GetPrivateProfileIntW(L"View", L"ShowRatings", 1, g_app.iniPath.c_str()) != 0;
+    ApplyDisplay();
 
     g_app.status = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
                                    0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_STATUS, GetModuleHandleW(NULL), NULL);
@@ -2526,6 +3181,13 @@ static void OnHScroll(HWND bar, int code)
 
 static LRESULT OnNotify(NMHDR* nm)
 {
+    if (nm->hwndFrom == ListView_GetHeader(g_app.songs) &&
+        (nm->code == HDN_BEGINTRACKW || nm->code == HDN_BEGINTRACKA ||
+         nm->code == HDN_DIVIDERDBLCLICKW || nm->code == HDN_DIVIDERDBLCLICKA)) {
+        int col = ((NMHEADERW*)nm)->iItem;
+        if ((col == COL_FAV && !g_app.showFavorites) || (col == COL_RATING && !g_app.showRatings))
+            return TRUE;   // hidden column: keep it at width 0
+    }
     switch (nm->idFrom) {
     case IDC_SONGS:
         if (nm->code == NM_CUSTOMDRAW)
@@ -2543,9 +3205,9 @@ static LRESULT OnNotify(NMHDR* nm)
         else if (nm->code == LVN_KEYDOWN) {
             WORD vk = ((NMLVKEYDOWN*)nm)->wVKey;
             int i = SelectedIndex(g_app.songs);
-            if (vk >= '0' && vk <= '5')
+            if (g_app.showRatings && vk >= '0' && vk <= '5')
                 SetSongRating(i, vk - '0');
-            else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD5)
+            else if (g_app.showRatings && vk >= VK_NUMPAD0 && vk <= VK_NUMPAD5)
                 SetSongRating(i, vk - VK_NUMPAD0);
             else if (vk == VK_DELETE)
                 RemoveFromPlaylist(i);
@@ -2576,6 +3238,8 @@ static LRESULT OnNotify(NMHDR* nm)
                 ShowArtistsView();
             else if (data == TREE_SONGS)
                 ShowSongsView();
+            else if (data == TREE_FAVORITES)
+                ShowFavoritesView();
             else if (data >= 0)
                 OpenPlaylist((int)data);
         } else if (nm->code == TVN_ITEMEXPANDINGW) {
@@ -2589,6 +3253,9 @@ static LRESULT OnNotify(NMHDR* nm)
 static void OnCommand(int id)
 {
     switch (id) {
+    case IDM_SETTINGS:
+        ShowSettings();
+        break;
     case IDM_CONNECT:
         DoConnect();
         break;
@@ -2627,6 +3294,9 @@ static void OnCommand(int id)
         break;
     case IDM_SONGS:
         ShowSongsView();
+        break;
+    case IDM_FAVORITES:
+        ShowFavoritesView();
         break;
     case IDM_FIND:
         FocusSearch();

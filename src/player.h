@@ -27,6 +27,10 @@ public:
 
     void SetNotifyWindow(HWND hwnd) { m_notify = hwnd; }
 
+    // Output device (waveOut id or WAVE_MAPPER) and buffers queued ahead; used from the next
+    // Play() (a new track or a seek).
+    void SetOutput(UINT device, int bufferCount) { m_device = device; m_bufferCount = bufferCount; }
+
     // startMs: where in the track this stream begins (for PositionMs).
     // clientSkipMs: audio to discard before playing, for streams the server can't offset.
     bool Play(const std::wstring& url, const HttpOptions& opts, DWORD startMs = 0, DWORD clientSkipMs = 0);
@@ -68,6 +72,8 @@ private:
     DWORD m_startMs;
     DWORD m_clientSkipMs;
     DWORD m_playedMs;           // final device position of the last finished/stopped stream
+    UINT m_device;
+    int m_bufferCount;
     int m_volume;
     volatile LONG m_gain;       // Q15, 32768 = unity
     volatile LONG m_peakIn;

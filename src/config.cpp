@@ -56,7 +56,21 @@ static void MigrateOldIni(const std::wstring& ini)
         LogF(L"Migrated settings from LegacyPlayer.ini");
 }
 
-bool ConfigLoad(const std::wstring& ini, SubsonicConfig& cfg, std::wstring& err)
+// Replaces the saved login with a token/salt for 'password'; the password is never stored.
+static bool StorePassword(const std::wstring& ini, const std::wstring& password, std::wstring& err)
+{
+    std::string token, salt;
+    if (!SubsonicMakeToken(WideToUtf8(password), token, salt)) {
+        err = Fmt(L"Could not hash the password with CryptoAPI (error %lu).", GetLastError());
+        return false;
+    }
+    WritePrivateProfileStringW(L"Server", L"Token", Utf8ToWide(token).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Server", L"Salt", Utf8ToWide(salt).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Server", L"Password", NULL, ini.c_str());   // removes the key
+    return true;
+}
+
+void ConfigRead(const std::wstring& ini, SubsonicConfig& cfg)
 {
     MigrateOldIni(ini);
     WriteIniTemplate(ini);
@@ -68,28 +82,59 @@ bool ConfigLoad(const std::wstring& ini, SubsonicConfig& cfg, std::wstring& err)
     cfg.maxBitRate = IniGetInt(ini, L"MaxBitRate", 192);
     if (cfg.maxBitRate < 32 || cfg.maxBitRate > 320)
         cfg.maxBitRate = 192;
-
-    if (cfg.url.empty() || cfg.user.empty()) {
-        err = L"Set Url, User and Password in\r\n" + ini;
-        return false;
-    }
-
-    std::wstring password = IniGet(ini, L"Password");
-    if (!password.empty()) {
-        std::string token, salt;
-        if (!SubsonicMakeToken(WideToUtf8(password), token, salt)) {
-            err = Fmt(L"Could not hash the password with CryptoAPI (error %lu).", GetLastError());
-            return false;
-        }
-        WritePrivateProfileStringW(L"Server", L"Token", Utf8ToWide(token).c_str(), ini.c_str());
-        WritePrivateProfileStringW(L"Server", L"Salt", Utf8ToWide(salt).c_str(), ini.c_str());
-        WritePrivateProfileStringW(L"Server", L"Password", NULL, ini.c_str());   // removes the key
-    }
     cfg.token = WideToUtf8(IniGet(ini, L"Token"));
     cfg.salt = WideToUtf8(IniGet(ini, L"Salt"));
+}
+
+bool ConfigLoad(const std::wstring& ini, SubsonicConfig& cfg, std::wstring& err)
+{
+    ConfigRead(ini, cfg);
+    if (cfg.url.empty() || cfg.user.empty()) {
+        err = L"Enter the server address and your user name in File > Settings.";
+        return false;
+    }
+    // A password typed into the ini by hand still works: it's swapped for a token here.
+    std::wstring password = IniGet(ini, L"Password");
+    if (!password.empty()) {
+        if (!StorePassword(ini, password, err))
+            return false;
+        cfg.token = WideToUtf8(IniGet(ini, L"Token"));
+        cfg.salt = WideToUtf8(IniGet(ini, L"Salt"));
+    }
     if (cfg.token.empty() || cfg.salt.empty()) {
-        err = L"Enter your Password in\r\n" + ini;
+        err = L"Enter your password in File > Settings.";
         return false;
     }
     return true;
+}
+
+bool ConfigSaveServer(const std::wstring& ini, const SubsonicConfig& cfg, const std::wstring& newPassword,
+                      std::wstring& err)
+{
+    const wchar_t* f = ini.c_str();
+    WritePrivateProfileStringW(L"Server", L"Url", cfg.url.c_str(), f);
+    WritePrivateProfileStringW(L"Server", L"LanUrl", cfg.lanUrl.c_str(), f);
+    WritePrivateProfileStringW(L"Server", L"AllowHttpFallback", cfg.allowHttpFallback ? L"1" : L"0", f);
+    WritePrivateProfileStringW(L"Server", L"AllowUntrustedCert", cfg.allowUntrustedCert ? L"1" : L"0", f);
+    WritePrivateProfileStringW(L"Server", L"User", Utf8ToWide(cfg.user).c_str(), f);
+    WritePrivateProfileStringW(L"Server", L"MaxBitRate", Fmt(L"%d", cfg.maxBitRate).c_str(), f);
+    if (!newPassword.empty())
+        return StorePassword(ini, newPassword, err);
+    return true;
+}
+
+void PlaybackLoad(const std::wstring& ini, PlaybackSettings& s)
+{
+    wchar_t buf[256];
+    GetPrivateProfileStringW(L"Player", L"OutputDevice", L"", buf, 256, ini.c_str());
+    s.device = buf;
+    s.bufferCount = (int)GetPrivateProfileIntW(L"Player", L"Buffers", 12, ini.c_str());
+    s.scrobble = GetPrivateProfileIntW(L"Player", L"Scrobble", 1, ini.c_str()) != 0;
+}
+
+void PlaybackSave(const std::wstring& ini, const PlaybackSettings& s)
+{
+    WritePrivateProfileStringW(L"Player", L"OutputDevice", s.device.c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Player", L"Buffers", Fmt(L"%d", s.bufferCount).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Player", L"Scrobble", s.scrobble ? L"1" : L"0", ini.c_str());
 }

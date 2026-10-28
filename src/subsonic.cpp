@@ -99,6 +99,7 @@ static SubsonicSong ParseSong(cJSON* s)
     song.duration = JInt(s, "duration");
     song.bitRate = JInt(s, "bitRate");
     song.userRating = JInt(s, "userRating");
+    song.starred = JGet(s, "starred") != NULL;   // present (a timestamp) only when starred
     return song;
 }
 
@@ -399,6 +400,47 @@ bool SubsonicClient::SetRating(const std::string& songId, int rating, std::wstri
     _snprintf(r, sizeof(r) - 1, "&rating=%d", rating);
     r[sizeof(r) - 1] = 0;
     return CallNoResult("setRating", "&id=" + UrlEncode(songId) + r, err);
+}
+
+// --- Favorites ----------------------------------------------------------------------
+
+bool SubsonicClient::SetStarred(const std::string& songId, bool starred, std::wstring& err)
+{
+    return CallNoResult(starred ? "star" : "unstar", "&id=" + UrlEncode(songId), err);
+}
+
+bool SubsonicClient::GetStarredSongs(std::vector<SubsonicSong>& out, std::wstring& err)
+{
+    out.clear();
+    cJSON *root, *sr;
+    if (!Call("getStarred2", "", &root, &sr, NULL, err))
+        return false;
+    cJSON* s;
+    cJSON_ArrayForEach(s, JGet(JGet(sr, "starred2"), "song"))
+        out.push_back(ParseSong(s));
+    cJSON_Delete(root);
+    return true;
+}
+
+// --- Scrobbling ---------------------------------------------------------------------
+
+bool SubsonicClient::Scrobble(const std::string& songId, bool submission, std::wstring& err)
+{
+    return CallNoResult("scrobble",
+                        "&id=" + UrlEncode(songId) + (submission ? "&submission=true" : "&submission=false"), err);
+}
+
+bool SubsonicClient::GetNowPlayingIds(std::vector<std::string>& ids, std::wstring& err)
+{
+    ids.clear();
+    cJSON *root, *sr;
+    if (!Call("getNowPlaying", "", &root, &sr, NULL, err))
+        return false;
+    cJSON* e;
+    cJSON_ArrayForEach(e, JGet(JGet(sr, "nowPlaying"), "entry"))
+        ids.push_back(JId(e, "id"));
+    cJSON_Delete(root);
+    return true;
 }
 
 // --- Playlists ----------------------------------------------------------------------

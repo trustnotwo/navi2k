@@ -13,7 +13,14 @@ public:
     WaveOut();
     ~WaveOut();
 
-    bool Open(unsigned rate, unsigned channels, std::wstring& err);
+    // Number of 8 KB buffers queued ahead (4..MAX_BUFFERS); call while closed.
+    // 12 = ~0.56 s at 44.1 kHz stereo. This is also the volume/seek latency, since volume
+    // is applied before queueing.
+    void SetBufferCount(int count);
+
+    // device: a waveOut device id, or WAVE_MAPPER for the system default. Falls back to the
+    // default if the chosen device can't be opened (e.g. unplugged).
+    bool Open(unsigned rate, unsigned channels, UINT device, std::wstring& err);
     void Close();
     bool IsOpenFor(unsigned rate, unsigned channels) const;
 
@@ -30,9 +37,10 @@ public:
     DWORD PlayedMs();
 
 private:
-    // 12 x 8 KB = ~0.56 s at 44.1 kHz stereo, playback starts after ~0.19 s. Kept short
-    // because volume is applied before queueing: this is the volume/seek latency.
-    enum { NUM_BUFFERS = 12, BUFFER_BYTES = 8192, PREBUFFER = 4 };
+public:
+    enum { MAX_BUFFERS = 32, BUFFER_BYTES = 8192 };
+
+private:
 
     WaveOut(const WaveOut&);
     WaveOut& operator=(const WaveOut&);
@@ -43,8 +51,10 @@ private:
     CRITICAL_SECTION m_lock;
     HWAVEOUT m_wo;
     HANDLE m_doneEvent;
-    WAVEHDR m_hdr[NUM_BUFFERS];
-    bool m_queued[NUM_BUFFERS];
+    WAVEHDR m_hdr[MAX_BUFFERS];
+    bool m_queued[MAX_BUFFERS];
+    int m_numBuffers;
+    int m_prebuffer;            // playback starts once this many are queued
     char* m_mem;
     int m_cur;
     DWORD m_fill;

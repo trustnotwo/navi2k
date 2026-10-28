@@ -4,15 +4,27 @@
 #include <string.h>
 
 WaveOut::WaveOut()
-    : m_wo(NULL), m_cur(0), m_fill(0), m_rate(0), m_channels(0),
+    : m_wo(NULL), m_numBuffers(12), m_prebuffer(4), m_cur(0), m_fill(0), m_rate(0), m_channels(0),
       m_submitted(0), m_started(false), m_paused(false), m_closedMs(0)
 {
     InitializeCriticalSection(&m_lock);
     m_doneEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    m_mem = new char[NUM_BUFFERS * BUFFER_BYTES];
+    m_mem = new char[MAX_BUFFERS * BUFFER_BYTES];
     ZeroMemory(m_hdr, sizeof(m_hdr));
-    for (int i = 0; i < NUM_BUFFERS; ++i)
+    for (int i = 0; i < MAX_BUFFERS; ++i)
         m_queued[i] = false;
+}
+
+void WaveOut::SetBufferCount(int count)
+{
+    if (m_wo)
+        return;
+    if (count < 4)
+        count = 4;
+    if (count > MAX_BUFFERS)
+        count = MAX_BUFFERS;
+    m_numBuffers = count;
+    m_prebuffer = count / 3 > 2 ? count / 3 : 2;
 }
 
 WaveOut::~WaveOut()
@@ -23,7 +35,7 @@ WaveOut::~WaveOut()
     DeleteCriticalSection(&m_lock);
 }
 
-bool WaveOut::Open(unsigned rate, unsigned channels, std::wstring& err)
+bool WaveOut::Open(unsigned rate, unsigned channels, UINT device, std::wstring& err)
 {
     Close();
 
@@ -37,7 +49,11 @@ bool WaveOut::Open(unsigned rate, unsigned channels, std::wstring& err)
     wf.nAvgBytesPerSec = rate * wf.nBlockAlign;
 
     EnterCriticalSection(&m_lock);
-    MMRESULT mr = waveOutOpen(&m_wo, WAVE_MAPPER, &wf, (DWORD_PTR)m_doneEvent, 0, CALLBACK_EVENT);
+    MMRESULT mr = waveOutOpen(&m_wo, device, &wf, (DWORD_PTR)m_doneEvent, 0, CALLBACK_EVENT);
+    if (mr != MMSYSERR_NOERROR && device != WAVE_MAPPER) {
+        LogF(L"waveOutOpen on device %u failed (%u); using the default device", device, mr);
+        mr = waveOutOpen(&m_wo, WAVE_MAPPER, &wf, (DWORD_PTR)m_doneEvent, 0, CALLBACK_EVENT);
+    }
     if (mr != MMSYSERR_NOERROR) {
         m_wo = NULL;
         LeaveCriticalSection(&m_lock);
@@ -46,7 +62,7 @@ bool WaveOut::Open(unsigned rate, unsigned channels, std::wstring& err)
         err = Fmt(L"Could not open the sound device for %u Hz, %u channel(s): %ls", rate, channels, text);
         return false;
     }
-    // Hold output until PREBUFFER buffers are queued, so a slow network start doesn't stutter.
+    // Hold output until m_prebuffer buffers are queued, so a slow network start doesn't stutter.
     waveOutPause(m_wo);
     m_rate = rate;
     m_channels = channels;
@@ -64,7 +80,7 @@ void WaveOut::Close()
     if (m_wo) {
         m_closedMs += DevicePositionMs();
         waveOutReset(m_wo);   // marks every queued buffer done
-        for (int i = 0; i < NUM_BUFFERS; ++i) {
+        for (int i = 0; i < MAX_BUFFERS; ++i) {
             if (m_queued[i]) {
                 waveOutUnprepareHeader(m_wo, &m_hdr[i], sizeof(WAVEHDR));
                 m_queued[i] = false;
@@ -121,7 +137,7 @@ bool WaveOut::Submit()
     }
     if (mr == MMSYSERR_NOERROR) {
         m_queued[m_cur] = true;
-        if (!m_started && ++m_submitted >= PREBUFFER) {
+        if (!m_started && ++m_submitted >= m_prebuffer) {
             m_started = true;
             if (!m_paused)
                 waveOutRestart(m_wo);
@@ -129,7 +145,7 @@ bool WaveOut::Submit()
     }
     LeaveCriticalSection(&m_lock);
 
-    m_cur = (m_cur + 1) % NUM_BUFFERS;
+    m_cur = (m_cur + 1) % m_numBuffers;
     m_fill = 0;
     if (mr != MMSYSERR_NOERROR)
         LogF(L"waveOutWrite failed: %u", mr);
@@ -173,7 +189,7 @@ void WaveOut::Drain(HANDLE cancel)
     }
     LeaveCriticalSection(&m_lock);
 
-    for (int i = 0; i < NUM_BUFFERS; ++i)
+    for (int i = 0; i < m_numBuffers; ++i)
         if (!WaitForBuffer(i, cancel))
             return;
 }

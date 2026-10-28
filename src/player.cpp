@@ -12,8 +12,8 @@ static const LONG kUnityGain = 32768;
 
 Player::Player()
     : m_notify(NULL), m_thread(NULL), m_req(NULL), m_out(NULL), m_paused(false), m_generation(0),
-      m_startMs(0), m_clientSkipMs(0), m_playedMs(0), m_volume(100), m_gain(kUnityGain),
-      m_peakIn(0), m_peakOut(0)
+      m_startMs(0), m_clientSkipMs(0), m_playedMs(0), m_device(WAVE_MAPPER), m_bufferCount(12),
+      m_volume(100), m_gain(kUnityGain), m_peakIn(0), m_peakOut(0)
 {
     InitializeCriticalSection(&m_lock);
     m_cancel = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -148,6 +148,7 @@ void Player::Run()
     HttpRequest req;
     WaveOut out;
     MadDecoder dec;
+    out.SetBufferCount(m_bufferCount);
     if (m_clientSkipMs)
         dec.SkipMs(m_clientSkipMs);
 
@@ -202,7 +203,7 @@ void Player::Run()
             if (!out.IsOpenFor(rate, channels)) {
                 out.Drain(m_cancel);
                 std::wstring err;
-                if (!out.Open(rate, channels, err)) {
+                if (!out.Open(rate, channels, m_device, err)) {
                     failure = err;
                     break;
                 }

@@ -340,6 +340,33 @@ static int RunPlaylistTest(SubsonicClient& client, const std::vector<SubsonicSon
     return (ok && deleted) ? 0 : 1;
 }
 
+// star/unstar, then confirm via getSong and getStarred2.
+static bool StarAndVerify(SubsonicClient& client, const std::string& id, bool starred)
+{
+    std::wstring err;
+    if (!client.SetStarred(id, starred, err)) {
+        Out(Fmt(L"%ls FAILED: ", starred ? L"star" : L"unstar") + err);
+        return false;
+    }
+    SubsonicSong s;
+    if (!client.GetSong(id, s, err)) {
+        Out(L"getSong FAILED: " + err);
+        return false;
+    }
+    std::vector<SubsonicSong> fav;
+    if (!client.GetStarredSongs(fav, err)) {
+        Out(L"getStarred2 FAILED: " + err);
+        return false;
+    }
+    bool listed = false;
+    for (size_t i = 0; i < fav.size(); ++i)
+        listed = listed || fav[i].id == id;
+    bool ok = s.starred == starred && listed == starred;
+    Out(Fmt(L"%ls -> getSong starred=%d, in getStarred2=%d (%u favorites) %ls", starred ? L"star" : L"unstar",
+            s.starred, listed, (unsigned)fav.size(), ok ? L"ok" : L"MISMATCH"));
+    return ok;
+}
+
 static int ArgInt(int argc, wchar_t** argv, int i, int def)
 {
     return (i < argc) ? _wtoi(argv[i]) : def;
@@ -359,12 +386,12 @@ int main()
         g_seconds = ArgInt(argc, argv, a++, 15);
     else if (mode == L"seek" || mode == L"seek-client")
         seekSec = ArgInt(argc, argv, a++, 60);
-    else if (mode == L"setrating")
-        seekSec = ArgInt(argc, argv, a++, -1);   // reused as the rating value
+    else if (mode == L"setrating" || mode == L"setfav")
+        seekSec = ArgInt(argc, argv, a++, -1);   // reused as the rating / starred value
     else if (mode != L"art" && mode != L"rate" && mode != L"playlist" && mode != L"info" && mode != L"artists" &&
-             mode != L"songs") {
+             mode != L"songs" && mode != L"favorite" && mode != L"nowplaying") {
         Out(L"usage: navi2k_probe [play [sec] | seek <offsetSec> | seek-client <offsetSec> | art | rate | playlist |"
-            L" info | artists | songs]"
+            L" info | artists | songs | favorite | setfav <0|1> | nowplaying]"
             L" [album] [track]");
         return 2;
     }
@@ -548,6 +575,57 @@ int main()
         bool ok = RateAndVerify(client, song.id, seekSec);
         Out(ok ? L"RESULT: PASS" : L"RESULT: FAIL");
         return ok ? 0 : 1;
+    }
+
+    if (mode == L"setfav") {   // navi2k_probe setfav <0|1> [album] [track]
+        if (seekSec != 0 && seekSec != 1) {
+            Out(L"Use setfav 0 or setfav 1.");
+            return 2;
+        }
+        bool ok = StarAndVerify(client, song.id, seekSec == 1);
+        Out(ok ? L"RESULT: PASS" : L"RESULT: FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (mode == L"favorite") {   // flip the star, check both APIs see it, then put it back
+        SubsonicSong current;
+        if (!client.GetSong(song.id, current, err)) {
+            Out(L"getSong FAILED: " + err);
+            return 1;
+        }
+        const bool original = current.starred;
+        std::vector<SubsonicSong> before;
+        client.GetStarredSongs(before, err);
+        Out(Fmt(L"Track \"%ls\": starred=%d, %u favorites (will be restored)", song.title.c_str(), original,
+                (unsigned)before.size()));
+        bool ok = StarAndVerify(client, song.id, !original);
+        bool restored = StarAndVerify(client, song.id, original);
+        std::vector<SubsonicSong> after;
+        client.GetStarredSongs(after, err);
+        Out(restored ? Fmt(L"restored starred=%d; favorites back to %u", original, (unsigned)after.size())
+                     : Fmt(L"!! COULD NOT RESTORE starred=%d on \"%ls\"", original, song.title.c_str()));
+        ok = ok && restored && after.size() == before.size();
+        Out(ok ? L"RESULT: PASS" : L"RESULT: FAIL");
+        return ok ? 0 : 1;
+    }
+
+    if (mode == L"nowplaying") {   // submission=false only: never adds to play counts
+        if (!client.Scrobble(song.id, false, err)) {
+            Out(L"scrobble (now playing) FAILED: " + err);
+            return 1;
+        }
+        std::vector<std::string> ids;
+        if (!client.GetNowPlayingIds(ids, err)) {
+            Out(L"getNowPlaying FAILED: " + err);
+            return 1;
+        }
+        bool found = false;
+        for (size_t i = 0; i < ids.size(); ++i)
+            found = found || ids[i] == song.id;
+        Out(Fmt(L"now playing \"%ls\": %u entries on the server, ours %ls", song.title.c_str(),
+                (unsigned)ids.size(), found ? L"listed" : L"MISSING"));
+        Out(found ? L"RESULT: PASS" : L"RESULT: FAIL");
+        return found ? 0 : 1;
     }
 
     if (mode == L"rate") {
