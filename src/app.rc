@@ -20,6 +20,20 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 173, 37, 50, 14
 END
 
+// Playlist > Edit details: name and description (the Subsonic playlist comment).
+IDD_PLAYLIST DIALOGEX 0, 0, 250, 132
+STYLE DS_MODALFRAME | DS_CENTER | DS_SHELLFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Edit Playlist"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "&Name:", -1, 7, 10, 42, 8
+    EDITTEXT        IDC_NAME_EDIT, 52, 8, 191, 14, ES_AUTOHSCROLL
+    LTEXT           "&Description:", -1, 7, 30, 42, 8
+    EDITTEXT        IDC_PL_COMMENT, 52, 28, 191, 74, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL
+    DEFPUSHBUTTON   "OK", IDOK, 139, 111, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 193, 111, 50, 14
+END
+
 // File > Settings: two property-sheet pages.
 IDD_SET_SERVER DIALOGEX 0, 0, 262, 212
 STYLE DS_SHELLFONT | WS_CHILD | WS_CAPTION
@@ -43,27 +57,30 @@ BEGIN
     LTEXT           "", IDC_SET_TESTRESULT, 80, 178, 175, 30
 END
 
-IDD_SET_PLAYBACK DIALOGEX 0, 0, 262, 212
+IDD_SET_PLAYBACK DIALOGEX 0, 0, 262, 258
 STYLE DS_SHELLFONT | WS_CHILD | WS_CAPTION
 CAPTION "Playback"
 FONT 8, "MS Shell Dlg"
 BEGIN
-    GROUPBOX        "Streaming", -1, 7, 7, 248, 46
+    GROUPBOX        "Streaming", -1, 7, 7, 248, 54
     LTEXT           "&Quality:", -1, 14, 22, 52, 8
-    COMBOBOX        IDC_SET_QUALITY, 70, 20, 110, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Navidrome converts each track to MP3 at this bitrate.", -1, 14, 38, 236, 8
-    GROUPBOX        "Audio output", -1, 7, 59, 248, 74
-    LTEXT           "&Device:", -1, 14, 74, 52, 8
-    COMBOBOX        IDC_SET_DEVICE, 70, 72, 178, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "&Buffer:", -1, 14, 92, 52, 8
-    COMBOBOX        IDC_SET_BUFFER, 70, 90, 178, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "A longer buffer copes better with a slow network; a shorter one makes volume and seeking respond faster.", -1, 14, 108, 236, 20
-    GROUPBOX        "Scrobbling", -1, 7, 139, 248, 46
-    AUTOCHECKBOX    "&Report plays to Navidrome", IDC_SET_SCROBBLE, 14, 152, 236, 10
-    LTEXT           "Updates play counts, and Last.fm if it's linked in Navidrome. A play counts after half the track or 4 minutes.", -1, 26, 164, 224, 18
+    COMBOBOX        IDC_SET_QUALITY, 70, 20, 140, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Navidrome converts each track to MP3 at this bitrate. Lossless plays FLAC files untouched (about 1 Mbps; other formats as 320 kbps MP3).", -1, 14, 38, 236, 18
+    GROUPBOX        "Audio output", -1, 7, 65, 248, 74
+    LTEXT           "&Device:", -1, 14, 80, 52, 8
+    COMBOBOX        IDC_SET_DEVICE, 70, 78, 178, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "&Buffer:", -1, 14, 98, 52, 8
+    COMBOBOX        IDC_SET_BUFFER, 70, 96, 178, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "A longer buffer copes better with a slow network; a shorter one makes volume and seeking respond faster.", -1, 14, 114, 236, 20
+    GROUPBOX        "Scrobbling", -1, 7, 145, 248, 46
+    AUTOCHECKBOX    "&Report plays to Navidrome", IDC_SET_SCROBBLE, 14, 158, 236, 10
+    LTEXT           "Updates play counts, and Last.fm if it's linked in Navidrome. A play counts after half the track or 4 minutes.", -1, 26, 170, 224, 18
+    GROUPBOX        "Between tracks", -1, 7, 197, 248, 46
+    AUTOCHECKBOX    "&Gapless: play the next track with no pause", IDC_SET_GAPLESS, 14, 210, 236, 10
+    LTEXT           "The next track starts loading a few seconds early. MP3s can keep a few milliseconds of silence from the encoder.", -1, 26, 222, 224, 18
 END
 
-IDD_SET_DISPLAY DIALOGEX 0, 0, 262, 212
+IDD_SET_DISPLAY DIALOGEX 0, 0, 262, 258
 STYLE DS_SHELLFONT | WS_CHILD | WS_CAPTION
 CAPTION "Display"
 FONT 8, "MS Shell Dlg"
@@ -72,11 +89,21 @@ BEGIN
     AUTOCHECKBOX    "Show &favorites (the heart column and Library > Favorites)", IDC_SET_SHOWFAV, 14, 21, 236, 10
     AUTOCHECKBOX    "Show &ratings (the star column)", IDC_SET_SHOWRATING, 14, 36, 236, 10
     LTEXT           "Hiding these changes nothing on the server: your favorites and ratings are kept, and show again when you turn them back on.", -1, 14, 54, 236, 20
+    GROUPBOX        "Notification area", -1, 7, 87, 248, 60
+    AUTOCHECKBOX    "Show an &icon in the notification area", IDC_SET_TRAYICON, 14, 101, 236, 10
+    AUTOCHECKBOX    "&Minimize to the notification area", IDC_SET_TRAYMIN, 26, 116, 224, 10
+    LTEXT           "Click the icon to bring the player back; right-click it for playback controls.", -1, 26, 129, 224, 16
+    GROUPBOX        "Keyboard", -1, 7, 153, 248, 50
+    AUTOCHECKBOX    "Media &keys control the player even when it's in the background", IDC_SET_MEDIAKEYS, 14, 167, 236, 10
+    LTEXT           "Turn this off if another program should get the media keys. Ctrl+P, Ctrl+B, Ctrl+N work in the player.", -1, 26, 180, 224, 18
+    GROUPBOX        "Album and artist pages", -1, 7, 209, 248, 44
+    AUTOCHECKBOX    "Show &descriptions from Last.fm", IDC_SET_LASTFM, 14, 222, 236, 10
+    LTEXT           "Navidrome gets these from Last.fm, so Last.fm must be turned on in Navidrome. Click a long description to read all of it.", -1, 26, 235, 224, 16
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,1,0,0
-PRODUCTVERSION  0,1,0,0
+FILEVERSION     1,1,0,0
+PRODUCTVERSION  1,1,0,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -85,9 +112,9 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription", "Navi2K Player - Navidrome client\0"
-            VALUE "FileVersion", "0.1.0\0"
+            VALUE "FileVersion", "1.1.0\0"
             VALUE "ProductName", "Navi2K Player\0"
-            VALUE "ProductVersion", "0.1.0\0"
+            VALUE "ProductVersion", "1.1.0\0"
         END
     END
     BLOCK "VarFileInfo"

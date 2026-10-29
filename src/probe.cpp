@@ -26,6 +26,7 @@
 #include "art.h"
 #include "config.h"
 #include "cpu.h"
+#include "flac_decoder.h"
 #include "http.h"
 #include "mad_decoder.h"
 #include "pcm.h"
@@ -104,6 +105,9 @@ static LRESULT CALLBACK ProbeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_reachedPlaying = true;
             Out(Fmt(L"[%5.2fs] PLAYING (prebuffer filled, audio handed to waveOut)", Elapsed()));
             break;
+        case PS_NEXT_TRACK:
+            Out(Fmt(L"[%5.2fs] next track (gapless)", Elapsed()));
+            break;
         case PS_FINISHED:
             Out(Fmt(L"[%5.2fs] track finished", Elapsed()));
             PostQuitMessage(0);
@@ -129,7 +133,8 @@ static LRESULT CALLBACK ProbeWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static bool RunPlayback(const std::wstring& url, const HttpOptions& opts, DWORD startMs, DWORD skipMs)
+static bool RunPlayback(const std::wstring& url, const HttpOptions& opts, DWORD startMs, DWORD skipMs,
+                        StreamCodec codec = CODEC_MP3)
 {
     WNDCLASSW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -141,16 +146,21 @@ static bool RunPlayback(const std::wstring& url, const HttpOptions& opts, DWORD 
 
     g_player.SetNotifyWindow(hwnd);
     g_player.SetVolume(100);
+    g_tick = 0;
+    g_reachedPlaying = false;
     g_expectStartMs = startMs;
     g_startTick = GetTickCount();
     SetTimer(hwnd, TIMER_LIMIT, g_seconds * 1000 + 300, NULL);
     SetTimer(hwnd, TIMER_TICK, 1000, NULL);
-    g_player.Play(url, opts, startMs, skipMs);
+    g_player.Play(url, opts, startMs, skipMs, codec);
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0)
         DispatchMessageW(&msg);
     g_player.Stop();
+    KillTimer(hwnd, TIMER_LIMIT);
+    KillTimer(hwnd, TIMER_TICK);
+    DestroyWindow(hwnd);
     return g_reachedPlaying && !g_failed && g_positionOk && g_volumeOk;
 }
 
@@ -388,10 +398,12 @@ int main()
         seekSec = ArgInt(argc, argv, a++, 60);
     else if (mode == L"setrating" || mode == L"setfav")
         seekSec = ArgInt(argc, argv, a++, -1);   // reused as the rating / starred value
+    else if (mode == L"flac" || mode == L"flac-norange")
+        seekSec = ArgInt(argc, argv, a++, 60);   // where to seek to
     else if (mode != L"art" && mode != L"rate" && mode != L"playlist" && mode != L"info" && mode != L"artists" &&
              mode != L"songs" && mode != L"favorite" && mode != L"nowplaying") {
         Out(L"usage: navi2k_probe [play [sec] | seek <offsetSec> | seek-client <offsetSec> | art | rate | playlist |"
-            L" info | artists | songs | favorite | setfav <0|1> | nowplaying]"
+            L" info | artists | songs | favorite | setfav <0|1> | nowplaying | flac [seekSec] | flac-norange [seekSec]]"
             L" [album] [track]");
         return 2;
     }
@@ -416,7 +428,7 @@ int main()
         Out(L"CONFIG: " + err);
         return 2;
     }
-    if (!HttpInit(L"Navi2KPlayer/0.1 (probe)")) {
+    if (!HttpInit(L"Navi2KPlayer/1.1 (probe)")) {
         Out(L"WinINet init failed");
         return 2;
     }
@@ -459,6 +471,102 @@ int main()
                     all[i].track, all[i].title.c_str()));
         bool ok = !all.empty() && (int)all.size() == expected;
         Out(ok ? L"RESULT: PASS" : L"RESULT: FAIL (count mismatch)");
+        return ok ? 0 : 1;
+    }
+
+    // --- flac (read-only): lossless streaming of the first FLAC file in the library ---
+    // flac-norange: the same, reading from the start instead of using Range requests.
+    if (mode == L"flac" || mode == L"flac-norange") {
+        const bool noRanges = mode == L"flac-norange";
+        std::vector<SubsonicSong> all;
+        if (!client.GetAllSongs(all, err)) {
+            Out(L"search3 FAILED: " + err);
+            return 1;
+        }
+        client.SetLossless(true);
+        int flacs = 0, playable = 0;
+        const SubsonicSong* pick = NULL;
+        for (size_t i = 0; i < all.size(); ++i) {
+            if (_wcsicmp(all[i].suffix.c_str(), L"flac") != 0)
+                continue;
+            ++flacs;
+            if (client.StreamsLossless(all[i])) {
+                ++playable;
+                if (!pick && all[i].duration > seekSec + 15)
+                    pick = &all[i];
+            }
+        }
+        Out(Fmt(L"%u songs, %d FLAC, %d playable losslessly (rest fall back to MP3)", (unsigned)all.size(), flacs,
+                playable));
+        if (!pick) {
+            Out(L"No suitable FLAC track found.");
+            return 1;
+        }
+        const SubsonicSong& s = *pick;
+        Out(Fmt(L"Track \"%ls - %ls\" %d:%02d, server says %d Hz / %d bit / %d ch / %d kbps", s.artist.c_str(),
+                s.title.c_str(), s.duration / 60, s.duration % 60, s.samplingRate, s.bitDepth, s.channelCount,
+                s.bitRate));
+        const std::wstring url = client.OriginalUrl(s.id);
+        bool ok = true;
+
+        // 1. Header + 2 s of audio from the start.
+        {
+            HttpRequest req;
+            FlacDecoder dec(req, url, client.Options());
+            if (noRanges)
+                dec.DisableRanges();
+            DWORD t0 = GetTickCount();
+            if (!dec.Open(err)) {
+                Out(L"open FAILED: " + err);
+                return 1;
+            }
+            std::vector<short> pcm;
+            unsigned frames = 0;
+            while (frames < dec.Rate() * 2) {
+                unsigned n = dec.Read(pcm, 4096);
+                if (!n)
+                    break;
+                frames += n;
+            }
+            double secs = (double)dec.TotalFrames() / dec.Rate();
+            bool hdr = dec.Rate() == (unsigned)(s.samplingRate ? s.samplingRate : dec.Rate()) && dec.Channels() >= 1 &&
+                       labs((long)secs - s.duration) <= 2;
+            Out(Fmt(L"header: %u Hz, %u ch, %u bit, %.1f s %ls; decoded %u frames, %I64u bytes, %u reconnects, %lu ms",
+                    dec.Rate(), dec.Channels(), dec.BitsPerSample(), secs, hdr ? L"(matches)" : L"(MISMATCH)", frames,
+                    dec.BytesFetched(), dec.Reconnects(), GetTickCount() - t0));
+            ok = ok && hdr && frames >= dec.Rate() * 2;
+        }
+        // 2. Seek by Range request: a fresh decoder jumps to seekSec without downloading the start.
+        {
+            HttpRequest req;
+            FlacDecoder dec(req, url, client.Options());
+            if (noRanges)
+                dec.DisableRanges();
+            DWORD t0 = GetTickCount();
+            bool opened = dec.Open(err);
+            bool sought = opened && dec.SeekMs((unsigned long)seekSec * 1000);
+            std::vector<short> pcm;
+            unsigned n = sought ? dec.Read(pcm, 4096) : 0;
+            unsigned long long expectBytes = (unsigned long long)s.bitRate * 125 * seekSec;   // kbps -> bytes
+            bool cheap = dec.BytesFetched() < expectBytes / 2;
+            Out(Fmt(L"seek to %d s: %ls, %u frames after it; fetched %I64u bytes (straight read would be ~%I64u), "
+                    L"%u reconnects, %lu ms %ls",
+                    seekSec, sought ? L"ok" : L"FAILED", n, dec.BytesFetched(), expectBytes, dec.Reconnects(),
+                    GetTickCount() - t0, cheap ? L"(used Range)" : L"(read through)"));
+            ok = ok && sought && n > 0 && (cheap || noRanges);
+            if (noRanges) {   // the player itself always tries ranges first
+                Out(ok ? L"RESULT: PASS" : L"RESULT: FAIL");
+                return ok ? 0 : 1;
+            }
+        }
+        // 3. Real playback through the player, from the start and from the seek point.
+        g_seconds = 6;
+        Out(L"playing 6 s from the start...");
+        ok = RunPlayback(url, client.Options(), 0, 0, CODEC_FLAC) && ok;
+        Out(Fmt(L"playing 6 s from %d s...", seekSec));
+        ok = RunPlayback(url, client.Options(), (DWORD)seekSec * 1000, (DWORD)seekSec * 1000, CODEC_FLAC) && ok;
+        HttpShutdown();
+        Out(ok ? L"RESULT: PASS" : L"RESULT: FAIL");
         return ok ? 0 : 1;
     }
 

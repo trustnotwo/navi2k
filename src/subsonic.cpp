@@ -93,11 +93,16 @@ static SubsonicSong ParseSong(cJSON* s)
     song.title = JStr(s, "title");
     song.artist = JStr(s, "artist");
     song.album = JStr(s, "album");
+    song.albumId = JId(s, "albumId");
+    song.artistId = JId(s, "artistId");
     song.suffix = JStr(s, "suffix");
     song.track = JInt(s, "track");
     song.disc = JInt(s, "discNumber");
     song.duration = JInt(s, "duration");
     song.bitRate = JInt(s, "bitRate");
+    song.bitDepth = JInt(s, "bitDepth");             // OpenSubsonic fields (Navidrome 0.53+)
+    song.samplingRate = JInt(s, "samplingRate");
+    song.channelCount = JInt(s, "channelCount");
     song.userRating = JInt(s, "userRating");
     song.starred = JGet(s, "starred") != NULL;   // present (a timestamp) only when starred
     return song;
@@ -492,6 +497,83 @@ static bool JBool(cJSON* obj, const char* key)
     return cJSON_IsTrue(JGet(obj, key));
 }
 
+// Last.fm summaries are HTML: tags (the "Read more on Last.fm" link) and entities. Keeps line
+// breaks, turns <br> into one, and folds runs of spaces.
+static std::wstring HtmlToText(const std::wstring& html)
+{
+    std::wstring out;
+    for (size_t i = 0; i < html.size(); ++i) {
+        wchar_t c = html[i];
+        if (c == L'<') {
+            size_t end = html.find(L'>', i);
+            if (end == std::wstring::npos)
+                break;
+            std::wstring tag = html.substr(i + 1, end - i - 1);
+            if (tag.size() >= 2 && (tag[0] == L'b' || tag[0] == L'B') && (tag[1] == L'r' || tag[1] == L'R'))
+                out += L'\n';
+            i = end;
+            continue;
+        }
+        if (c == L'&') {
+            size_t semi = html.find(L';', i);
+            if (semi != std::wstring::npos && semi - i <= 10) {
+                std::wstring ent = html.substr(i + 1, semi - i - 1);
+                wchar_t ch = 0;
+                if (ent == L"amp") ch = L'&';
+                else if (ent == L"lt") ch = L'<';
+                else if (ent == L"gt") ch = L'>';
+                else if (ent == L"quot") ch = L'"';
+                else if (ent == L"apos") ch = L'\'';
+                else if (ent == L"nbsp") ch = L' ';
+                else if (ent.size() > 1 && ent[0] == L'#')
+                    ch = (wchar_t)((ent[1] == L'x' || ent[1] == L'X') ? wcstoul(ent.c_str() + 2, NULL, 16)
+                                                                       : wcstoul(ent.c_str() + 1, NULL, 10));
+                if (ch) {
+                    c = ch;
+                    i = semi;
+                }
+            }
+        }
+        if (c == L'\r')
+            continue;
+        if ((c == L' ' || c == L'\t') && (out.empty() || out[out.size() - 1] == L' ' || out[out.size() - 1] == L'\n'))
+            continue;
+        if (c == L'\t')
+            c = L' ';
+        out += c;
+    }
+    const wchar_t* more = L"Read more on Last.fm";
+    size_t at = out.rfind(more);
+    if (at != std::wstring::npos && out.find_first_not_of(L" .\n", at + wcslen(more)) == std::wstring::npos)
+        out.erase(at);
+    size_t last = out.find_last_not_of(L" \n");
+    out.erase(last == std::wstring::npos ? 0 : last + 1);
+    size_t first = out.find_first_not_of(L" \n");
+    return first == std::wstring::npos ? std::wstring() : out.substr(first);
+}
+
+bool SubsonicClient::GetAlbumNotes(const std::string& albumId, std::wstring& notes, std::wstring& err)
+{
+    notes.clear();
+    cJSON *root, *sr;
+    if (!Call("getAlbumInfo2", "&id=" + UrlEncode(albumId), &root, &sr, NULL, err))
+        return false;
+    notes = HtmlToText(JStr(JGet(sr, "albumInfo"), "notes"));
+    cJSON_Delete(root);
+    return true;
+}
+
+bool SubsonicClient::GetArtistBio(const std::string& artistId, std::wstring& bio, std::wstring& err)
+{
+    bio.clear();
+    cJSON *root, *sr;
+    if (!Call("getArtistInfo2", "&id=" + UrlEncode(artistId), &root, &sr, NULL, err))
+        return false;
+    bio = HtmlToText(JStr(JGet(sr, "artistInfo2"), "biography"));
+    cJSON_Delete(root);
+    return true;
+}
+
 bool SubsonicClient::GetPlaylists(std::vector<SubsonicPlaylist>& out, std::wstring& err)
 {
     out.clear();
@@ -505,6 +587,7 @@ bool SubsonicClient::GetPlaylists(std::vector<SubsonicPlaylist>& out, std::wstri
         pl.coverArt = JId(p, "coverArt");
         pl.name = JStr(p, "name");
         pl.owner = JStr(p, "owner");
+        pl.comment = JStr(p, "comment");
         pl.songCount = JInt(p, "songCount");
         pl.duration = JInt(p, "duration");
         pl.readOnly = JBool(p, "readonly");   // OpenSubsonic field; Navidrome sets it for smart playlists
@@ -579,6 +662,13 @@ bool SubsonicClient::RenamePlaylist(const std::string& playlistId, const std::ws
                         "&playlistId=" + UrlEncode(playlistId) + "&name=" + UrlEncode(WideToUtf8(name)), err);
 }
 
+bool SubsonicClient::SetPlaylistDetails(const std::string& playlistId, const std::wstring& name,
+                                        const std::wstring& comment, std::wstring& err)
+{
+    return CallNoResult("updatePlaylist", "&playlistId=" + UrlEncode(playlistId) + "&name=" +
+                        UrlEncode(WideToUtf8(name)) + "&comment=" + UrlEncode(WideToUtf8(comment)), err);
+}
+
 bool SubsonicClient::AddToPlaylist(const std::string& playlistId, const std::vector<std::string>& songIds,
                                    std::wstring& err)
 {
@@ -621,6 +711,19 @@ std::wstring SubsonicClient::StreamUrl(const std::string& songId, int timeOffset
         q += extra;
     }
     return BuildUrl("stream", q);
+}
+
+bool SubsonicClient::StreamsLossless(const SubsonicSong& song) const
+{
+    // Hi-res and multichannel files would need resampling or downmixing, which old sound
+    // cards and CPUs can't take; Navidrome's MP3 transcode handles those instead.
+    return m_cfg.lossless && _wcsicmp(song.suffix.c_str(), L"flac") == 0 && song.samplingRate <= 48000 &&
+           song.channelCount <= 2 && song.bitDepth <= 24;
+}
+
+std::wstring SubsonicClient::OriginalUrl(const std::string& songId) const
+{
+    return BuildUrl("stream", "&id=" + UrlEncode(songId) + "&format=raw");
 }
 
 bool SubsonicClient::ServerTranscodes(const SubsonicSong& song) const

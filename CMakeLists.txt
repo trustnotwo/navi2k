@@ -109,11 +109,13 @@ add_library(lpcore OBJECT
     src/player.cpp
     src/art.cpp
     src/stb_image_impl.c
+    src/flac_decoder.cpp
+    src/flac_impl.c
     src/compat_win2000.cpp)
 target_link_libraries(lpcore PUBLIC mad cjson)
-target_include_directories(lpcore PUBLIC ${CMAKE_SOURCE_DIR}/third_party/stb)
-# Third-party single-file decoder: optimise, keep its warnings out of the log.
-set_source_files_properties(src/stb_image_impl.c PROPERTIES COMPILE_OPTIONS "-O2;-w")
+target_include_directories(lpcore PUBLIC ${CMAKE_SOURCE_DIR}/third_party/stb ${CMAKE_SOURCE_DIR}/third_party/dr_libs)
+# Third-party single-file decoders: optimise, keep their warnings out of the log.
+set_source_files_properties(src/stb_image_impl.c src/flac_impl.c PROPERTIES COMPILE_OPTIONS "-O2;-w")
 
 find_program(LEGACY_OBJDUMP NAMES ${CMAKE_OBJDUMP} i686-w64-mingw32-objdump objdump)
 if(NOT LEGACY_OBJDUMP)

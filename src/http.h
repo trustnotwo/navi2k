@@ -33,11 +33,14 @@ public:
     HttpRequest();
     ~HttpRequest();
 
-    HttpResult Open(const std::wstring& url, const HttpOptions& opts);
+    // rangeStart > 0 asks for the body from that byte on ("Range: bytes=N-", 206 expected).
+    HttpResult Open(const std::wstring& url, const HttpOptions& opts, DWORD rangeStart = 0);
     int  Read(void* buf, int len);     // >0 bytes read, 0 = end of body, -1 = error or aborted
     void Abort();
 
     DWORD StatusCode() const { return m_status; }
+    // Length of the body from Content-Length, or 0 if the server didn't say.
+    DWORD ContentLength() const { return m_contentLength; }
     DWORD LastError() const  { return m_lastError; }
 
 private:
@@ -50,6 +53,7 @@ private:
     volatile LONG m_aborted;
     DWORD m_status;
     DWORD m_lastError;
+    DWORD m_contentLength;
     bool  m_https;
 };
 

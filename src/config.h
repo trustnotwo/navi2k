@@ -22,6 +22,7 @@ struct PlaybackSettings {
     std::wstring device;    // waveOut device name; empty = system default
     int bufferCount;        // 8 KB buffers queued ahead
     bool scrobble;          // report plays to the server
+    bool gapless;           // join tracks with no pause between them
 };
 
 void PlaybackLoad(const std::wstring& iniPath, PlaybackSettings& s);

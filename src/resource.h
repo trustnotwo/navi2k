@@ -4,6 +4,8 @@
 #define IDI_APPICON     101     // lowest icon id: Explorer shows this one for the .exe
 #define IDD_NAME        200
 #define IDC_NAME_EDIT   201
+#define IDD_PLAYLIST    202     // playlist name + description
+#define IDC_PL_COMMENT  203
 
 // Settings property sheet.
 #define IDD_SET_SERVER      300
@@ -22,7 +24,12 @@
 #define IDC_SET_DEVICE      321
 #define IDC_SET_BUFFER      322
 #define IDC_SET_SCROBBLE    323
+#define IDC_SET_GAPLESS     324
 #define IDC_SET_SHOWFAV     330
 #define IDC_SET_SHOWRATING  331
+#define IDC_SET_TRAYICON    332
+#define IDC_SET_TRAYMIN     333
+#define IDC_SET_MEDIAKEYS   334
+#define IDC_SET_LASTFM      335
 
 #endif

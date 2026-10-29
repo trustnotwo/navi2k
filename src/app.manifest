@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Navi2KPlayer" version="0.1.0.0" processorArchitecture="x86"/>
+  <assemblyIdentity type="win32" name="Navi2KPlayer" version="1.1.0.0" processorArchitecture="x86"/>
   <description>Navi2K Player</description>
   <!-- XP: themed common controls (comctl32 v6). Windows 2000 ignores manifests and uses comctl32 5.8x. -->
   <dependency>

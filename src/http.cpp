@@ -76,7 +76,7 @@ static HttpResult Classify(DWORD err, bool https)
 }
 
 HttpRequest::HttpRequest()
-    : m_conn(NULL), m_req(NULL), m_aborted(0), m_status(0), m_lastError(0), m_https(false)
+    : m_conn(NULL), m_req(NULL), m_aborted(0), m_status(0), m_lastError(0), m_contentLength(0), m_https(false)
 {
 }
 
@@ -102,11 +102,12 @@ void HttpRequest::Abort()
     CloseHandles();
 }
 
-HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts)
+HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts, DWORD rangeStart)
 {
     CloseHandles();
     m_status = 0;
     m_lastError = 0;
+    m_contentLength = 0;
     if (!g_session)
         return HTTP_ERR_OTHER;
 
@@ -170,7 +171,10 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts)
         InternetSetOptionW(req, INTERNET_OPTION_SECURITY_FLAGS, &sf, sizeof(sf));
     }
 
-    if (!HttpSendRequestW(req, NULL, 0, NULL, 0)) {
+    wchar_t range[48] = L"";
+    if (rangeStart > 0)
+        _snwprintf(range, 47, L"Range: bytes=%lu-\r\n", rangeStart);
+    if (!HttpSendRequestW(req, rangeStart > 0 ? range : NULL, rangeStart > 0 ? (DWORD)-1L : 0, NULL, 0)) {
         m_lastError = GetLastError();
         if (m_aborted)
             return HTTP_ERR_CANCELLED;
@@ -184,7 +188,11 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts)
         return HTTP_ERR_OTHER;
     }
     m_status = status;
-    return status == 200 ? HTTP_OK : HTTP_ERR_STATUS;
+    DWORD length = 0;
+    len = sizeof(length);
+    if (HttpQueryInfoW(req, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &length, &len, NULL))
+        m_contentLength = length;
+    return (status == 200 && rangeStart == 0) || (status == 206 && rangeStart > 0) ? HTTP_OK : HTTP_ERR_STATUS;
 }
 
 int HttpRequest::Read(void* buf, int len)

@@ -16,7 +16,8 @@ struct SubsonicConfig {
     std::string token;           // md5(password + salt), lowercase hex
     std::string salt;
     int maxBitRate;              // kbps for server-side MP3 transcoding
-    SubsonicConfig() : allowHttpFallback(false), allowUntrustedCert(false), maxBitRate(192) {}
+    bool lossless;               // stream FLAC originals untouched (others still as MP3)
+    SubsonicConfig() : allowHttpFallback(false), allowUntrustedCert(false), maxBitRate(192), lossless(false) {}
 };
 
 struct SubsonicAlbum {
@@ -29,8 +30,10 @@ struct SubsonicAlbum {
 struct SubsonicSong {
     std::string id;
     std::string coverArt;           // the track's album cover, for the now-playing panel
+    std::string albumId, artistId;  // for Go to album / Go to artist; may be empty
     std::wstring title, artist, album, suffix;
     int track, disc, duration, bitRate;   // duration in s, bitRate in kbps (0 = unknown)
+    int bitDepth, samplingRate, channelCount;   // of the original file; 0 = not reported
     int userRating;                 // 0 = unrated, 1..5
     bool starred;                   // in Favorites
 };
@@ -45,7 +48,7 @@ struct SubsonicArtist {
 struct SubsonicPlaylist {
     std::string id;
     std::string coverArt;
-    std::wstring name, owner;
+    std::wstring name, owner, comment;
     int songCount, duration;
     bool readOnly;               // smart playlist (.nsp) or otherwise not editable by the server
 };
@@ -57,8 +60,9 @@ bool SubsonicMakeToken(const std::string& passwordUtf8, std::string& token, std:
 class SubsonicClient {
 public:
     void Configure(const SubsonicConfig& cfg);
-    // Streaming quality for the next StreamUrl, without reconnecting.
+    // Streaming quality for the next track, without reconnecting.
     void SetMaxBitRate(int kbps) { m_cfg.maxBitRate = kbps; }
+    void SetLossless(bool on) { m_cfg.lossless = on; }
 
     // Pings the primary URL; on a TLS failure, falls back to lanUrl if allowed.
     // On success 'notice' may describe the fallback that was taken.
@@ -78,6 +82,11 @@ public:
     // Always asks for MP3: the decoder is libmad only, so Navidrome transcodes FLAC/M4A/OGG.
     // timeOffsetSec starts the transcode partway in (honoured only when the server transcodes).
     std::wstring StreamUrl(const std::string& songId, int timeOffsetSec = 0) const;
+
+    // With the lossless option: true for FLAC originals this player can output (stereo or
+    // mono, up to 48 kHz, up to 24-bit). Those are fetched with OriginalUrl and decoded locally.
+    bool StreamsLossless(const SubsonicSong& song) const;
+    std::wstring OriginalUrl(const std::string& songId) const;   // format=raw
 
     // False when Navidrome will send the original file untouched (already MP3 within
     // maxBitRate); such streams ignore timeOffset, so the client must skip instead.
@@ -108,6 +117,13 @@ public:
     bool SetPlaylistSongs(const std::string& playlistId, const std::vector<std::string>& songIds,
                           std::wstring& err);
     bool RenamePlaylist(const std::string& playlistId, const std::wstring& name, std::wstring& err);
+    // Last.fm text through Navidrome (getAlbumInfo2 notes, getArtistInfo2 biography), as plain
+    // text; empty when Last.fm has none or is turned off on the server.
+    bool GetAlbumNotes(const std::string& albumId, std::wstring& notes, std::wstring& err);
+    bool GetArtistBio(const std::string& artistId, std::wstring& bio, std::wstring& err);
+    // Name and comment together; an empty comment clears it.
+    bool SetPlaylistDetails(const std::string& playlistId, const std::wstring& name, const std::wstring& comment,
+                            std::wstring& err);
     bool AddToPlaylist(const std::string& playlistId, const std::vector<std::string>& songIds,
                        std::wstring& err);
     bool RemoveFromPlaylist(const std::string& playlistId, int index, std::wstring& err);

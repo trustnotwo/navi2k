@@ -14,6 +14,7 @@
 #include <shellapi.h>
 #include <process.h>
 #include <stdlib.h>
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -29,7 +30,7 @@
 #include "util.h"
 
 #define APP_TITLE   L"Navi2K Player"
-#define APP_VERSION L"0.2"
+#define APP_VERSION L"1.1"
 
 enum {
     IDC_PLAY = 102, IDC_PAUSE, IDC_STOP,
@@ -39,34 +40,52 @@ enum {
     IDC_SEARCH, IDC_SEARCH_LABEL,
     // Mini player.
     IDC_MINI_PREV, IDC_MINI_PLAYPAUSE, IDC_MINI_STOP, IDC_MINI_NEXT,
-    IDC_MINI_SEEK, IDC_MINI_VOLUME, IDC_MINI_TIME_CUR, IDC_MINI_TIME_TOTAL
+    IDC_MINI_SEEK, IDC_MINI_VOLUME, IDC_MINI_TIME_CUR, IDC_MINI_TIME_TOTAL,
+    IDC_REPEAT, IDC_PREV, IDC_NEXT
 };
 
 // Menu bar.
 enum {
     IDM_CONNECT = 40001, IDM_EXIT, IDM_PLAY, IDM_PAUSE, IDM_STOP, IDM_SHUFFLE,
     IDM_ALBUMS, IDM_NEW_PLAYLIST, IDM_ABOUT, IDM_ARTISTS, IDM_SONGS, IDM_FIND,
-    IDM_MINI, IDM_PREV, IDM_NEXT, IDM_SETTINGS, IDM_FAVORITES
+    IDM_MINI, IDM_PREV, IDM_NEXT, IDM_SETTINGS, IDM_FAVORITES, IDM_QUEUE, IDM_SHOW, IDM_PLAYPAUSE,
+    IDM_REPEAT_OFF, IDM_REPEAT_ALL, IDM_REPEAT_ONE, IDM_REPEAT_CYCLE, IDM_EDIT_PLAYLIST
 };
+
+enum RepeatMode { REPEAT_OFF, REPEAT_ALL, REPEAT_ONE };
+
+// Media keys, as global hotkeys (Settings > Display) and as WM_APPCOMMAND when focused.
+enum { HOTKEY_PLAYPAUSE = 1, HOTKEY_STOP, HOTKEY_PREV, HOTKEY_NEXT };
+#ifndef APPCOMMAND_MEDIA_PLAY       // Windows XP and later only; harmless to handle on 2000
+#define APPCOMMAND_MEDIA_PLAY  46
+#define APPCOMMAND_MEDIA_PAUSE 47
+#endif
+#ifndef HDF_SORTUP                  // comctl32 6 (XP themes); set only when it's loaded
+#define HDF_SORTUP   0x0400
+#define HDF_SORTDOWN 0x0200
+#endif
 
 // Popup menu commands (TrackPopupMenu with TPM_RETURNCMD).
 enum {
     CMD_PLAY = 1001, CMD_MOVE_UP, CMD_MOVE_DOWN, CMD_REMOVE,
     CMD_PL_PLAY, CMD_PL_NEW, CMD_PL_RENAME, CMD_PL_DELETE, CMD_FAV,
+    CMD_PLAY_NEXT, CMD_ADD_QUEUE, CMD_CLEAR_UPCOMING, CMD_GO_ALBUM, CMD_GO_ARTIST,
     CMD_ADD_NEW = 1050,
     CMD_RATE_BASE = 1100,       // + 0..5
     CMD_ADD_BASE = 2000         // + playlist index
 };
 
-enum { TIMER_POSITION = 1, TIMER_SEARCH = 2 };
+enum { TIMER_POSITION = 1, TIMER_SEARCH = 2, TIMER_DRAGSCROLL = 3 };
 enum { COL_NUM = 0, COL_TITLE, COL_ARTIST, COL_FAV, COL_RATING, COL_LENGTH, COL_ALBUM };
 
 // Sidebar tree item data (playlists use their index, >= 0).
 enum { TREE_LIBRARY = -1, TREE_ALBUMS = -2, TREE_PLAYLISTS = -3, TREE_ARTISTS = -4, TREE_SONGS = -5,
-       TREE_FAVORITES = -6 };
+       TREE_FAVORITES = -6, TREE_QUEUE = -7 };
 
 #define WM_APP_JOB_DONE (WM_APP + 10)
 #define WM_APP_TEST_DONE (WM_APP + 11)   // Settings > Test Connection finished (to the page)
+#define WM_APP_TRAY (WM_APP + 12)        // notification-area icon mouse messages
+static const UINT kTrayId = 1;
 
 static const int kArtSize = 160;        // requested from the server and drawn 1:1
 static const size_t kArtCacheMax = 48;  // ~5 MB of 160x160 DIBs
@@ -79,7 +98,7 @@ static const int kSidebarW = kArtSize + 12;
 // removal is by index.
 
 enum JobKind { JOB_CONNECT, JOB_ALBUM, JOB_PLAYLIST, JOB_RATE, JOB_PLEDIT, JOB_ART, JOB_ARTIST, JOB_SONGS,
-               JOB_FAVORITES, JOB_STAR, JOB_SCROBBLE };
+               JOB_FAVORITES, JOB_STAR, JOB_SCROBBLE, JOB_QUEUE_FETCH, JOB_INFO };
 enum PlEdit { PL_CREATE, PL_RENAME, PL_ADD, PL_REMOVE, PL_SETSONGS, PL_DELETE };
 
 static bool IsLoadJob(JobKind k)
@@ -108,12 +127,13 @@ struct Job {
     // rating
     std::string songId;
     int rating, oldRating;
-    bool flag, oldFlag;         // star: new/old state; scrobble: submission
+    bool flag, oldFlag;         // star: new/old state; scrobble: submission; queue fetch: play next
 
     // playlist edit
     PlEdit edit;
     std::string plId;
-    std::wstring name;
+    std::wstring name, comment;
+    std::wstring notes;         // Last.fm description (JOB_INFO: songId = album/artist, flag = artist)
     std::vector<std::string> songIds;
     std::string addAlbumId;     // add/create from a whole album (fetched in the job)
     int index;
@@ -122,17 +142,18 @@ struct Job {
     int selectAfter;
 };
 
-enum SongSource { SRC_NONE, SRC_ALBUM, SRC_PLAYLIST, SRC_LIBRARY, SRC_FAVORITES };
+enum SongSource { SRC_NONE, SRC_ALBUM, SRC_PLAYLIST, SRC_LIBRARY, SRC_FAVORITES, SRC_QUEUE };
 // VIEW_ALBUMS: all albums. VIEW_ARTISTS: all artists. VIEW_ARTIST: one artist's albums
 // (same list control as VIEW_ALBUMS). VIEW_TRACKS: an album's or playlist's tracks.
-// VIEW_SONGS: every song in the library; VIEW_FAVORITES: starred songs (both use the same
-// list control as VIEW_TRACKS).
-enum MainView { VIEW_ALBUMS, VIEW_TRACKS, VIEW_ARTISTS, VIEW_ARTIST, VIEW_SONGS, VIEW_FAVORITES };
+// VIEW_SONGS: every song in the library; VIEW_FAVORITES: starred songs; VIEW_QUEUE: the play
+// queue (all use the same list control as VIEW_TRACKS).
+enum MainView { VIEW_ALBUMS, VIEW_TRACKS, VIEW_ARTISTS, VIEW_ARTIST, VIEW_SONGS, VIEW_FAVORITES, VIEW_QUEUE };
 
 struct Shown {                  // what the header describes
     bool has;
     std::string id, coverArt;
     std::wstring title, line2, line3;
+    std::wstring note;          // free text under the details (playlist comment)
 };
 
 struct App {
@@ -142,7 +163,7 @@ struct App {
     HWND mini, miniPrev, miniPlayPause, miniStop, miniNext, miniSeek, miniVolume, miniTimeCur, miniTimeTotal;
     HWND miniTooltip;
     RECT miniSpeakerRect;
-    HWND btnPlay, btnPause, btnStop, btnShuffle, hdrPlay, hdrShuffle;
+    HWND btnPrev, btnPlay, btnPause, btnStop, btnNext, btnShuffle, btnRepeat, hdrPlay, hdrShuffle;
     HWND volume, seek, timeCur, timeTotal, tooltip;
     HMENU menu;
     HFONT font, fontBold, fontTitle;
@@ -160,11 +181,12 @@ struct App {
     std::vector<SubsonicAlbum> artistAlbums; // albums of shownArtist
     bool albumListIsArtist;                  // album list control shows artistAlbums
     SubsonicArtist shownArtist;
-    std::string shownArtistCover;            // artist image, or their first album's cover
+    SubsonicAlbum shownAlbum;               // valid when songSource == SRC_ALBUM
+    std::string shownArtistCover;            // artist image, or a collage of their album covers
     std::vector<SubsonicSong> allSongs;      // the whole library, loaded on first visit to Songs
     bool allSongsLoaded;
     bool pendingSongs;
-    HTREEITEM treeFavorites;
+    HTREEITEM treeFavorites, treeQueue;
     bool favoritesLoaded;
     bool pendingFavorites;
 
@@ -189,11 +211,44 @@ struct App {
 
     // Playback queue: queueSource is the list as it was when playback started; queue is the
     // play order (shuffled or not) and queueSrcIdx maps each queue entry back to the source.
+    // Editing the queue (Play next, Add to queue, remove, reorder) makes its current order
+    // the new source.
     std::vector<SubsonicSong> queueSource, queue;
     std::vector<int> queueSrcIdx;
     int queueIndex;
+    bool queueFinished;                // played to the end; adding tracks starts them
     bool shuffle;
+    int repeat;                        // RepeatMode
+
+    // Column sorting. The track list sorts a copy (songUnsorted keeps the original order,
+    // restored by clicking "#"); songSortKey names the list it applies to, so another
+    // album or playlist opens unsorted. -1 = not sorted.
+    int songSortCol, albumSortCol, artistSortCol;
+    bool songSortDesc, albumSortDesc, artistSortDesc;
+    std::string songSortKey;
+    std::vector<SubsonicSong> songUnsorted;
+    bool headerArrows;                 // comctl32 6 draws sort arrows in list headers
+
+    bool mediaKeysGlobal;              // Settings > Display
+    bool lastfmInfo;                   // Settings > Display: album/artist descriptions (off by default)
+    std::map<std::string, std::wstring> infoCache;   // "al:"/"ar:" + id -> description ("" = none)
+    std::string infoPending;
+    RECT noteRect;                     // where the header's description was drawn
+    bool noteCut;                      // ...and whether it was cut short (click shows all of it)
+    bool hotkeysRegistered;
     bool showFavorites, showRatings;   // File > Settings > Display
+    bool playingFlac;                  // current track streams as original FLAC
+    bool gapless;                      // Settings > Playback
+    bool dragging;                     // a track is being dragged to a new place
+    int dragFrom, dragInsert;          // its row, and the row it would go before (-1: none)
+    POINT dragPt;                      // last mouse position, in the track list's coordinates
+    int gaplessIdx;                    // queue entry given to the player as the next track
+
+    // Notification-area icon (Settings > Display).
+    bool trayIcon, trayMinimize;
+    bool trayAdded;
+    HWND trayHidden;                   // window hidden by minimize-to-tray, shown again on click
+    UINT taskbarCreatedMsg;            // Explorer restarted: add the icon again
 
     Shown shown;
     HBITMAP shownArt;
@@ -246,6 +301,41 @@ static void FetchArt(Job* job)
     job->artTried = true;
 }
 
+// No artist photo: one album's cover, or a collage of up to four (worker thread).
+static void ArtistCollage(Job* job)
+{
+    std::vector<std::string> ids;
+    for (size_t i = 0; i < job->albums.size() && ids.size() < 4; ++i) {
+        const std::string& id = job->albums[i].coverArt;
+        if (!id.empty() && std::find(ids.begin(), ids.end(), id) == ids.end())
+            ids.push_back(id);
+    }
+    if (ids.empty())
+        return;
+    if (ids.size() == 1) {   // the album's own cover, shared with its album page
+        job->artId = ids[0];
+        job->artTried = false;
+        job->needArt = true;
+        FetchArt(job);
+        return;
+    }
+    std::vector<std::string> images;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        std::string bytes;
+        std::wstring err;
+        if (g_app.client.GetCoverArt(ids[i], kArtSize, bytes, err))
+            images.push_back(bytes);
+        else
+            LogF(L"Cover art: %ls", err.c_str());
+    }
+    std::wstring err;
+    job->artId = "collage:" + job->artist.id;
+    job->art = ArtCollage(images, kArtSize, GetSysColor(COLOR_BTNFACE), err);
+    if (!job->art)
+        LogF(L"Artist collage: %ls", err.c_str());
+    job->artTried = true;
+}
+
 static void RunPlaylistEdit(Job* job)
 {
     SubsonicClient& c = g_app.client;
@@ -262,7 +352,7 @@ static void RunPlaylistEdit(Job* job)
         job->ok = idsOk && c.CreatePlaylist(job->name, job->songIds, NULL, job->message);
         break;
     case PL_RENAME:
-        job->ok = c.RenamePlaylist(job->plId, job->name, job->message);
+        job->ok = c.SetPlaylistDetails(job->plId, job->name, job->comment, job->message);
         break;
     case PL_ADD:
         job->ok = idsOk && c.AddToPlaylist(job->plId, job->songIds, job->message);
@@ -316,21 +406,22 @@ static unsigned __stdcall JobThread(void* p)
     case JOB_SCROBBLE:
         job->ok = c.Scrobble(job->songId, job->flag, job->message);
         break;
+    case JOB_QUEUE_FETCH:   // an album's or playlist's tracks, for Play next / Add to queue
+        job->ok = !job->addAlbumId.empty() ? c.GetAlbum(job->addAlbumId, job->songs, job->message)
+                                           : c.GetPlaylist(job->plId, job->songs, job->message);
+        break;
     case JOB_ARTIST:
         job->ok = c.GetArtist(job->artist.id, job->albums, job->message);
         // Navidrome sends a WebP placeholder when it has no artist photo, which we can't
-        // decode; fall back to the artist's first album cover.
+        // decode, or a "no photo" silhouette from an online source; fall back to the
+        // artist's album covers.
         FetchArt(job);
-        if (!job->art && job->ok) {
-            for (size_t i = 0; i < job->albums.size(); ++i)
-                if (!job->albums[i].coverArt.empty()) {
-                    job->artId = job->albums[i].coverArt;
-                    job->artTried = false;
-                    job->needArt = true;
-                    FetchArt(job);
-                    break;
-                }
+        if (job->art && ArtIsPlaceholder(job->art)) {
+            DeleteObject(job->art);
+            job->art = NULL;
         }
+        if (!job->art && job->ok)
+            ArtistCollage(job);
         break;
     case JOB_ALBUM:
         job->ok = c.GetAlbum(job->album.id, job->songs, job->message);
@@ -349,6 +440,10 @@ static unsigned __stdcall JobThread(void* p)
     case JOB_ART:
         FetchArt(job);
         job->ok = job->art != NULL;
+        break;
+    case JOB_INFO:
+        job->ok = job->flag ? c.GetArtistBio(job->songId, job->notes, job->message)
+                            : c.GetAlbumNotes(job->songId, job->notes, job->message);
         break;
     }
     if (!PostMessageW(g_app.wnd, WM_APP_JOB_DONE, 0, (LPARAM)job)) {
@@ -456,7 +551,8 @@ static void InvalidateHeader()
 }
 
 static void ShowInfo(const std::string& id, const std::string& coverArt, const std::wstring& title,
-                     const std::wstring& line2, const std::wstring& line3)
+                     const std::wstring& line2, const std::wstring& line3,
+                     const std::wstring& note = std::wstring())
 {
     g_app.shown.has = true;
     g_app.shown.id = id;
@@ -464,6 +560,7 @@ static void ShowInfo(const std::string& id, const std::string& coverArt, const s
     g_app.shown.title = title;
     g_app.shown.line2 = line2;
     g_app.shown.line3 = line3;
+    g_app.shown.note = note;
     g_app.shownArt = CachedArt(coverArt);
     InvalidateHeader();
 }
@@ -482,16 +579,53 @@ static void ShowPlaylistInfo(const SubsonicPlaylist& pl)
     if (!g_app.client.CanEdit(pl))
         by += L"  (read-only)";
     ShowInfo(pl.id, pl.coverArt, pl.name, by,
-             Fmt(L"%d tracks  \x00B7  %ls", pl.songCount, FormatTime(pl.duration).c_str()));
+             Fmt(L"%d tracks  \x00B7  %ls", pl.songCount, FormatTime(pl.duration).c_str()), pl.comment);
+}
+
+// --- Last.fm descriptions (Settings > Display, off by default) -----------------------------
+
+static std::string InfoKey(bool artist, const std::string& id)
+{
+    return (artist ? "ar:" : "al:") + id;
+}
+
+// The album or artist page on screen, as an InfoKey; "" on other pages.
+static std::string ShownInfoKey()
+{
+    if (g_app.mainView == VIEW_ARTIST)
+        return InfoKey(true, g_app.shownArtist.id);
+    if (g_app.mainView == VIEW_TRACKS && g_app.songSource == SRC_ALBUM)
+        return InfoKey(false, g_app.shownAlbum.id);
+    return std::string();
+}
+
+// The cached description, or "" for now and a background fetch the first time.
+static std::wstring InfoNote(bool artist, const std::string& id)
+{
+    if (!g_app.lastfmInfo || id.empty())
+        return std::wstring();
+    const std::string key = InfoKey(artist, id);
+    std::map<std::string, std::wstring>::iterator it = g_app.infoCache.find(key);
+    if (it != g_app.infoCache.end())
+        return it->second;
+    if (g_app.infoPending != key) {
+        g_app.infoPending = key;
+        Job* job = NewJob(JOB_INFO);
+        job->songId = id;
+        job->flag = artist;
+        LaunchJob(job);
+    }
+    return std::wstring();
 }
 
 static void ShowAlbumInfo(const SubsonicAlbum& a)
 {
+    g_app.shownAlbum = a;
     std::wstring details = Fmt(L"%d tracks  \x00B7  %ls", (int)g_app.songData.size(),
                                FormatTime(TotalDuration(g_app.songData)).c_str());
     if (a.year)
         details = Fmt(L"%d  \x00B7  ", a.year) + details;
-    ShowInfo(a.id, a.coverArt, a.name, L"by " + a.artist, details);
+    ShowInfo(a.id, a.coverArt, a.name, L"by " + a.artist, details, InfoNote(false, a.id));
 }
 
 static bool QueueValid()
@@ -499,16 +633,128 @@ static bool QueueValid()
     return g_app.queueIndex >= 0 && g_app.queueIndex < (int)g_app.queue.size();
 }
 
+// --- Notification-area icon -------------------------------------------------------------
+// Built with _WIN32_IE=0x0500, so NOTIFYICONDATAW is the Windows 2000 size (128-char tip).
+
+static std::wstring NowPlayingCaption()
+{
+    if (!QueueValid())
+        return APP_TITLE;
+    const SubsonicSong& s = g_app.queue[g_app.queueIndex];
+    return L"Navi2K - " + s.title + (s.artist.empty() ? L"" : L" - " + s.artist);
+}
+
+static void TrayData(NOTIFYICONDATAW& nid)
+{
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_app.wnd;
+    nid.uID = kTrayId;
+}
+
+static void TrayUpdate()
+{
+    if (!g_app.trayAdded)
+        return;
+    NOTIFYICONDATAW nid;
+    TrayData(nid);
+    nid.uFlags = NIF_TIP;
+    lstrcpynW(nid.szTip, NowPlayingCaption().c_str(), sizeof(nid.szTip) / sizeof(nid.szTip[0]));
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+static void TrayAdd()
+{
+    if (g_app.trayAdded)
+        return;
+    NOTIFYICONDATAW nid;
+    TrayData(nid);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_APP_TRAY;
+    nid.hIcon = (HICON)GetClassLongPtrW(g_app.wnd, GCLP_HICONSM);
+    lstrcpynW(nid.szTip, NowPlayingCaption().c_str(), sizeof(nid.szTip) / sizeof(nid.szTip[0]));
+    g_app.trayAdded = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+    if (!g_app.trayAdded)
+        LogF(L"Could not add the notification-area icon (%lu).", GetLastError());
+}
+
+static void TrayRemove()
+{
+    if (!g_app.trayAdded)
+        return;
+    NOTIFYICONDATAW nid;
+    TrayData(nid);
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    g_app.trayAdded = false;
+}
+
+// Brings back the window that minimize-to-tray hid (the main window or the mini player).
+static void TrayRestore()
+{
+    HWND w = g_app.trayHidden;
+    if (!w)
+        w = (g_app.mini && IsWindowVisible(g_app.mini)) ? g_app.mini : g_app.wnd;
+    g_app.trayHidden = NULL;
+    ShowWindow(w, IsIconic(w) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(w);
+}
+
+// Called on WM_SIZE / SIZE_MINIMIZED: true if the window was hidden into the tray.
+static bool TrayMinimize(HWND w)
+{
+    if (!g_app.trayIcon || !g_app.trayMinimize || !g_app.trayAdded)
+        return false;
+    g_app.trayHidden = w;
+    ShowWindow(w, SW_HIDE);
+    return true;
+}
+
+// --- Media keys -------------------------------------------------------------------------
+// With "media keys in the background" on, the four media keys are global hotkeys (only one
+// program can hold them; if another has, we fall back). Otherwise they arrive as
+// WM_APPCOMMAND while the player has focus.
+
+static void RegisterMediaKeys(bool on)
+{
+    if (g_app.hotkeysRegistered) {
+        for (int id = HOTKEY_PLAYPAUSE; id <= HOTKEY_NEXT; ++id)
+            UnregisterHotKey(g_app.wnd, id);
+        g_app.hotkeysRegistered = false;
+    }
+    if (!on)
+        return;
+    const struct { int id; UINT vk; } keys[] = {
+        { HOTKEY_PLAYPAUSE, VK_MEDIA_PLAY_PAUSE }, { HOTKEY_STOP, VK_MEDIA_STOP },
+        { HOTKEY_PREV, VK_MEDIA_PREV_TRACK }, { HOTKEY_NEXT, VK_MEDIA_NEXT_TRACK },
+    };
+    int ok = 0;
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i)
+        if (RegisterHotKey(g_app.wnd, keys[i].id, 0, keys[i].vk))
+            ++ok;
+        else
+            LogF(L"Media key %u is taken by another program (%lu).", keys[i].vk, GetLastError());
+    g_app.hotkeysRegistered = ok > 0;
+}
+
+// comctl32 6 (XP with themes) draws sort arrows in list headers; 5.x doesn't know the flags.
+static bool CommonControls6()
+{
+    struct DllVersion { DWORD cbSize, major, minor, build, platform; };
+    typedef HRESULT (CALLBACK* GetVersionFn)(DllVersion*);
+    HMODULE cc = GetModuleHandleW(L"comctl32.dll");
+    GetVersionFn fn = cc ? (GetVersionFn)GetProcAddress(cc, "DllGetVersion") : NULL;
+    DllVersion v;
+    ZeroMemory(&v, sizeof(v));
+    v.cbSize = sizeof(v);
+    return fn && SUCCEEDED(fn(&v)) && v.major >= 6;
+}
+
 // Shows the playing track's cover in the sidebar, fetching it if needed, and names the
-// track in the title bar (and so the taskbar button).
+// track in the title bar (and so the taskbar button) and the tray icon's tooltip.
 static void UpdateNowPlaying()
 {
-    if (QueueValid()) {
-        const SubsonicSong& s = g_app.queue[g_app.queueIndex];
-        SetWindowTextW(g_app.wnd, (L"Navi2K - " + s.title + (s.artist.empty() ? L"" : L" - " + s.artist)).c_str());
-    } else {
-        SetWindowTextW(g_app.wnd, APP_TITLE);
-    }
+    SetWindowTextW(g_app.wnd, NowPlayingCaption().c_str());
+    TrayUpdate();
     g_app.nowCover = QueueValid() ? g_app.queue[g_app.queueIndex].coverArt : std::string();
     g_app.nowArt = CachedArt(g_app.nowCover);
     if (NeedArt(g_app.nowCover) && g_app.nowCoverPending != g_app.nowCover) {
@@ -660,6 +906,113 @@ static void FillAlbums()
     InvalidateRect(lv, NULL, TRUE);
 }
 
+// --- Column sorting ------------------------------------------------------------------------
+// Click a column header to sort, again to reverse. Sorts are stable, so equal rows keep the
+// server's order. The track list's "#" column restores the original order.
+
+// Sort arrows in the header: comctl32 6 only (XP with themes); older versions just don't show them.
+static void SetHeaderArrow(HWND lv, int col, bool desc)
+{
+    if (!g_app.headerArrows)
+        return;
+    HWND hdr = ListView_GetHeader(lv);
+    const int n = Header_GetItemCount(hdr);
+    for (int i = 0; i < n; ++i) {
+        HDITEMW it;
+        ZeroMemory(&it, sizeof(it));
+        it.mask = HDI_FORMAT;
+        Header_GetItem(hdr, i, &it);
+        it.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (i == col)
+            it.fmt |= desc ? HDF_SORTDOWN : HDF_SORTUP;
+        Header_SetItem(hdr, i, &it);
+    }
+}
+
+static int CmpText(const std::wstring& a, const std::wstring& b)
+{
+    return lstrcmpiW(a.c_str(), b.c_str());
+}
+
+static int CmpInt(int a, int b)
+{
+    return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+struct AlbumLess {
+    int col;
+    bool operator()(const SubsonicAlbum& a, const SubsonicAlbum& b) const
+    {
+        int c = 0;
+        switch (col) {
+        case 0: c = CmpText(a.name, b.name); break;
+        case 1:   // artist, then their albums by year
+            c = CmpText(a.artist, b.artist);
+            if (!c) c = CmpInt(a.year, b.year);
+            if (!c) c = CmpText(a.name, b.name);
+            break;
+        case 2: c = CmpInt(a.year, b.year); break;
+        case 3: c = CmpInt(a.songCount, b.songCount); break;
+        }
+        return c < 0;
+    }
+};
+
+struct ArtistLess {
+    int col;
+    bool operator()(const SubsonicArtist& a, const SubsonicArtist& b) const
+    {
+        return (col == 0 ? CmpText(a.name, b.name) : CmpInt(a.albumCount, b.albumCount)) < 0;
+    }
+};
+
+struct SongLess {
+    int col;
+    bool operator()(const SubsonicSong& a, const SubsonicSong& b) const
+    {
+        int c = 0;
+        switch (col) {
+        case COL_TITLE:  c = CmpText(a.title, b.title); break;
+        case COL_ARTIST:   // artist, then album, then track order
+            c = CmpText(a.artist, b.artist);
+            if (!c) c = CmpText(a.album, b.album);
+            if (!c) c = CmpInt(a.disc, b.disc);
+            if (!c) c = CmpInt(a.track, b.track);
+            break;
+        case COL_ALBUM:
+            c = CmpText(a.album, b.album);
+            if (!c) c = CmpInt(a.disc, b.disc);
+            if (!c) c = CmpInt(a.track, b.track);
+            break;
+        case COL_FAV:    c = CmpInt(a.starred ? 1 : 0, b.starred ? 1 : 0); break;
+        case COL_RATING: c = CmpInt(a.userRating, b.userRating); break;
+        case COL_LENGTH: c = CmpInt(a.duration, b.duration); break;
+        }
+        return c < 0;
+    }
+};
+
+// Descending sorts swap the arguments, which keeps them stable.
+template <class T, class Less>
+struct Reversed {
+    Less less;
+    bool operator()(const T& a, const T& b) const { return less(b, a); }
+};
+
+template <class T, class Less>
+static void SortList(std::vector<T>& v, int col, bool desc)
+{
+    Less less;
+    less.col = col;
+    if (desc) {
+        Reversed<T, Less> r;
+        r.less = less;
+        std::stable_sort(v.begin(), v.end(), r);
+    } else {
+        std::stable_sort(v.begin(), v.end(), less);
+    }
+}
+
 // Rebuilds the album list from every album (filtered by the Albums search) or the open artist.
 static void RebuildAlbumList()
 {
@@ -667,6 +1020,8 @@ static void RebuildAlbumList()
         g_app.albumList = g_app.artistAlbums;
     else
         FilterInto(g_app.albumData, g_app.albumKeys, g_app.queryAlbums, g_app.albumList);
+    if (g_app.albumSortCol >= 0)
+        SortList<SubsonicAlbum, AlbumLess>(g_app.albumList, g_app.albumSortCol, g_app.albumSortDesc);
     FillAlbums();
 }
 
@@ -674,6 +1029,8 @@ static void FillArtists()
 {
     HWND lv = g_app.artists;
     FilterInto(g_app.artistData, g_app.artistKeys, g_app.queryArtists, g_app.artistList);
+    if (g_app.artistSortCol >= 0)
+        SortList<SubsonicArtist, ArtistLess>(g_app.artistList, g_app.artistSortCol, g_app.artistSortDesc);
     SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(lv);
     for (size_t i = 0; i < g_app.artistList.size(); ++i) {
@@ -684,16 +1041,128 @@ static void FillArtists()
     InvalidateRect(lv, NULL, TRUE);
 }
 
+// Which list the track table shows, so a sort stays with that list (a Songs search or a
+// playlist reload keeps it) and a different album or playlist starts unsorted.
+static std::string SongListKey()
+{
+    switch (g_app.songSource) {
+    case SRC_ALBUM:     return "a:" + g_app.shown.id;
+    case SRC_PLAYLIST:  return "p:" + g_app.shown.id;
+    case SRC_LIBRARY:   return "library";
+    case SRC_FAVORITES: return "favorites";
+    default:            return std::string();   // the queue (its order is the play order) and nothing
+    }
+}
+
+static bool SongsSorted()
+{
+    return g_app.songSortCol >= 0;
+}
+
+// The track table is going to show new songData: re-applies the sort if it's the same list.
+static void ApplySongSortToNewData()
+{
+    const std::string key = SongListKey();
+    if (SongsSorted() && !key.empty() && key == g_app.songSortKey) {
+        g_app.songUnsorted = g_app.songData;
+        SortList<SubsonicSong, SongLess>(g_app.songData, g_app.songSortCol, g_app.songSortDesc);
+    } else if (SongsSorted()) {
+        g_app.songSortCol = -1;
+        g_app.songUnsorted.clear();
+        SetHeaderArrow(g_app.songs, -1, false);
+    }
+}
+
 // The track list is virtual (LVS_OWNERDATA): it holds only a row count and asks for the
 // text of visible cells (OnSongsDispInfo), so the 7,000-song library view fills instantly.
 static void FillSongs()
 {
     HWND lv = g_app.songs;
+    ApplySongSortToNewData();
     ListView_SetItemState(lv, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_SetItemCountEx(lv, (int)g_app.songData.size(), 0);
     if (!g_app.songData.empty())
         ListView_EnsureVisible(lv, 0, FALSE);
     InvalidateRect(lv, NULL, TRUE);
+}
+
+static const wchar_t* const kSongColNames[] = { L"#", L"Track", L"Artist", L"Favorites", L"Rating", L"Time", L"Album" };
+
+// Header click on the track table. Rating and favorites sort highest first.
+static void OnSongsColumnClick(int col)
+{
+    if (g_app.songSource == SRC_QUEUE) {
+        SetStatus(L"The queue plays in the order shown: right-click a track to move it.");
+        return;
+    }
+    if (SongListKey().empty() || (col == COL_FAV && !g_app.showFavorites) || (col == COL_RATING && !g_app.showRatings))
+        return;
+    const int sel = SelectedIndex(g_app.songs);
+    const std::string selId = sel >= 0 && sel < (int)g_app.songData.size() ? g_app.songData[sel].id : std::string();
+
+    if (col == COL_NUM) {
+        if (!SongsSorted())
+            return;
+        g_app.songData = g_app.songUnsorted;
+        g_app.songUnsorted.clear();
+        g_app.songSortCol = -1;
+        SetHeaderArrow(g_app.songs, -1, false);
+        SetStatus(L"Back to the original order.");
+    } else {
+        if (!SongsSorted()) {
+            g_app.songUnsorted = g_app.songData;
+            g_app.songSortKey = SongListKey();
+        }
+        g_app.songSortDesc = col == g_app.songSortCol ? !g_app.songSortDesc : (col == COL_FAV || col == COL_RATING);
+        g_app.songSortCol = col;
+        g_app.songData = g_app.songUnsorted;
+        SortList<SubsonicSong, SongLess>(g_app.songData, col, g_app.songSortDesc);
+        SetHeaderArrow(g_app.songs, col, g_app.songSortDesc);
+        std::wstring msg = Fmt(L"Sorted by %ls%ls. Click # for the original order", kSongColNames[col],
+                               g_app.songSortDesc ? L" (reversed)" : L"");
+        if (g_app.songSource == SRC_PLAYLIST)
+            msg += L" (needed to move or remove tracks)";
+        SetStatus(msg + L".");
+    }
+    ListView_SetItemState(g_app.songs, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    InvalidateRect(g_app.songs, NULL, TRUE);
+    for (size_t i = 0; i < g_app.songData.size() && !selId.empty(); ++i)
+        if (g_app.songData[i].id == selId) {
+            SelectRow(g_app.songs, (int)i);
+            break;
+        }
+}
+
+static void OnAlbumsColumnClick(int col)
+{
+    const int sel = SelectedIndex(g_app.albums);
+    const std::string selId = sel >= 0 && sel < (int)g_app.albumList.size() ? g_app.albumList[sel].id : std::string();
+    g_app.albumSortDesc = col == g_app.albumSortCol ? !g_app.albumSortDesc : false;
+    g_app.albumSortCol = col;
+    RebuildAlbumList();
+    SetHeaderArrow(g_app.albums, col, g_app.albumSortDesc);
+    for (size_t i = 0; i < g_app.albumList.size(); ++i)
+        if (g_app.albumList[i].id == selId) {
+            SelectRow(g_app.albums, (int)i);
+            return;
+        }
+    SelectRow(g_app.albums, 0);
+}
+
+static void OnArtistsColumnClick(int col)
+{
+    const int sel = SelectedIndex(g_app.artists);
+    const std::string selId = sel >= 0 && sel < (int)g_app.artistList.size() ? g_app.artistList[sel].id : std::string();
+    g_app.artistSortDesc = col == g_app.artistSortCol ? !g_app.artistSortDesc : col == 1;
+    g_app.artistSortCol = col;
+    FillArtists();
+    SetHeaderArrow(g_app.artists, col, g_app.artistSortDesc);
+    for (size_t i = 0; i < g_app.artistList.size(); ++i)
+        if (g_app.artistList[i].id == selId) {
+            SelectRow(g_app.artists, (int)i);
+            return;
+        }
+    SelectRow(g_app.artists, 0);
 }
 
 static void OnSongsDispInfo(NMLVDISPINFOW* di)
@@ -705,8 +1174,9 @@ static void OnSongsDispInfo(NMLVDISPINFOW* di)
     std::wstring text;
     switch (di->item.iSubItem) {
     case COL_NUM: {
-        // Playlists number by position; albums and the library by track number.
-        int n = (g_app.songSource == SRC_PLAYLIST || g_app.songSource == SRC_FAVORITES) ? i + 1 : s.track;
+        // Playlists and the queue number by position; albums and the library by track number.
+        int n = (g_app.songSource == SRC_PLAYLIST || g_app.songSource == SRC_FAVORITES ||
+                 g_app.songSource == SRC_QUEUE) ? i + 1 : s.track;
         if (n)
             text = Fmt(L"%d", n);
         break;
@@ -779,6 +1249,8 @@ static void RebuildPlaylistTree()
         TreeView_SelectItem(g_app.tree, g_app.treeSongs);
     else if (g_app.mainView == VIEW_FAVORITES)
         TreeView_SelectItem(g_app.tree, g_app.treeFavorites);
+    else if (g_app.mainView == VIEW_QUEUE)
+        TreeView_SelectItem(g_app.tree, g_app.treeQueue);
     g_app.treeUpdating = false;
 }
 
@@ -871,8 +1343,19 @@ static LRESULT OnSongsCustomDraw(NMLVCUSTOMDRAW* cd)
     case CDDS_PREPAINT:
         return CDRF_NOTIFYITEMDRAW;
     case CDDS_ITEMPREPAINT: {
-        // The playing track is shown in bold, as in the classic Spotify list.
+        // The playing track is shown in bold, as in the classic Spotify list. In the queue
+        // it's the row at the play position (a track can be queued twice), and tracks
+        // already played are greyed.
         int item = (int)cd->nmcd.dwItemSpec;
+        if (g_app.songSource == SRC_QUEUE) {
+            if (item == g_app.queueIndex) {
+                SelectObject(cd->nmcd.hdc, g_app.fontBold);
+                return CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT;
+            }
+            if (item < g_app.queueIndex && !ListView_GetItemState(g_app.songs, item, LVIS_SELECTED))
+                cd->clrText = GetSysColor(COLOR_GRAYTEXT);
+            return CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT;
+        }
         if (QueueValid() && item < (int)g_app.songData.size() &&
             g_app.songData[item].id == g_app.queue[g_app.queueIndex].id) {
             SelectObject(cd->nmcd.hdc, g_app.fontBold);
@@ -880,9 +1363,20 @@ static LRESULT OnSongsCustomDraw(NMLVCUSTOMDRAW* cd)
         }
         return CDRF_NOTIFYPOSTPAINT;
     }
-    case CDDS_ITEMPOSTPAINT:
-        DrawRowExtras(cd->nmcd.hdc, (int)cd->nmcd.dwItemSpec);
+    case CDDS_ITEMPOSTPAINT: {
+        const int item = (int)cd->nmcd.dwItemSpec;
+        DrawRowExtras(cd->nmcd.hdc, item);
+        // Drag and drop: a line where the track would go (above this row, or below the last).
+        const int last = (int)g_app.songData.size() - 1;
+        if (g_app.dragging && (item == g_app.dragInsert || (item == last && g_app.dragInsert == last + 1))) {
+            RECT r;
+            ListView_GetItemRect(g_app.songs, item, &r, LVIR_BOUNDS);
+            const int y = item == g_app.dragInsert ? r.top : r.bottom - 2;
+            RECT line = { r.left, y, r.right, y + 2 };
+            FillRect(cd->nmcd.hdc, &line, GetSysColorBrush(COLOR_WINDOWTEXT));
+        }
         return CDRF_DODEFAULT;
+    }
     }
     return CDRF_DODEFAULT;
 }
@@ -895,6 +1389,9 @@ static void ApplyRatingLocal(const std::string& songId, int rating)
             g_app.songData[i].userRating = rating;
             ListView_RedrawItems(g_app.songs, (int)i, (int)i);
         }
+    for (size_t i = 0; i < g_app.songUnsorted.size(); ++i)
+        if (g_app.songUnsorted[i].id == songId)
+            g_app.songUnsorted[i].userRating = rating;
     for (size_t i = 0; i < g_app.queue.size(); ++i)
         if (g_app.queue[i].id == songId)
             g_app.queue[i].userRating = rating;
@@ -934,6 +1431,9 @@ static void ApplyFavoriteLocal(const std::string& songId, bool starred)
             g_app.songData[i].starred = starred;
             ListView_RedrawItems(g_app.songs, (int)i, (int)i);
         }
+    for (size_t i = 0; i < g_app.songUnsorted.size(); ++i)
+        if (g_app.songUnsorted[i].id == songId)
+            g_app.songUnsorted[i].starred = starred;
     for (size_t i = 0; i < g_app.queue.size(); ++i)
         if (g_app.queue[i].id == songId)
             g_app.queue[i].starred = starred;
@@ -1082,7 +1582,8 @@ static void ScrobbleTrackPosition(DWORD posMs)
 
 static void UpdatePosition()
 {
-    if (g_app.seekDragging || !g_app.player.IsActive() || !QueueValid())
+    // After the last track ends the player thread lingers (IsActive) until the next Play/Stop.
+    if (g_app.seekDragging || !g_app.player.IsActive() || !QueueValid() || g_app.queueFinished)
         return;
     const DWORD posMs = g_app.player.PositionMs();
     ScrobbleTrackPosition(posMs);
@@ -1103,14 +1604,97 @@ static void RefreshTransport()
 {
     InvalidateRect(g_app.btnPause, NULL, FALSE);
     InvalidateRect(g_app.btnShuffle, NULL, FALSE);
+    InvalidateRect(g_app.btnRepeat, NULL, FALSE);
     if (g_app.miniPlayPause)
         InvalidateRect(g_app.miniPlayPause, NULL, FALSE);
     CheckMenuItem(g_app.menu, IDM_SHUFFLE, g_app.shuffle ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuRadioItem(g_app.menu, IDM_REPEAT_OFF, IDM_REPEAT_ONE, IDM_REPEAT_OFF + g_app.repeat, MF_BYCOMMAND);
+}
+
+// The stream for a queue entry. Transcoded streams seek on the server (timeOffset, whole
+// seconds); original MP3s that Navidrome passes through untouched are skipped client-side by
+// frame headers; FLAC originals (lossless option) seek client-side with HTTP Range requests.
+static std::wstring TrackUrl(const SubsonicSong& s, DWORD startMs, DWORD& start, DWORD& skip, bool& flac)
+{
+    flac = g_app.client.StreamsLossless(s);
+    const bool serverSide = !flac && g_app.client.ServerTranscodes(s);
+    const int offsetSec = (int)(startMs / 1000);
+    start = serverSide ? (DWORD)offsetSec * 1000 : startMs;
+    skip = serverSide ? 0 : startMs;
+    return flac ? g_app.client.OriginalUrl(s.id) : g_app.client.StreamUrl(s.id, serverSide ? offsetSec : 0);
+}
+
+// Where the queue goes when the current track ends (the PS_FINISHED rules), or -1.
+static int GaplessNextIndex()
+{
+    if (!QueueValid())
+        return -1;
+    if (g_app.repeat == REPEAT_ONE)
+        return g_app.queueIndex;
+    if (g_app.queueIndex + 1 < (int)g_app.queue.size())
+        return g_app.queueIndex + 1;
+    return g_app.repeat == REPEAT_ALL ? 0 : -1;
+}
+
+// Tells the player what to join on to the current track. Called whenever that may change:
+// a new track, queue edits, shuffle, repeat, settings.
+static void UpdateGaplessNext()
+{
+    const int i = (g_app.gapless && g_app.player.IsActive() && !g_app.queueFinished) ? GaplessNextIndex() : -1;
+    g_app.gaplessIdx = i;
+    if (i < 0) {
+        g_app.player.ClearNext();
+        return;
+    }
+    const SubsonicSong& s = g_app.queue[i];
+    DWORD start, skip;
+    bool flac;
+    const std::wstring url = TrackUrl(s, 0, start, skip, flac);
+    g_app.player.SetNext(url, flac ? CODEC_FLAC : CODEC_MP3, Utf8ToWide(s.id), (DWORD)s.duration * 1000);
+}
+
+static const wchar_t* RepeatName(int mode)
+{
+    return mode == REPEAT_ALL ? L"Repeat all" : (mode == REPEAT_ONE ? L"Repeat one" : L"Repeat off");
+}
+
+// Repeat off / all (the whole queue) / one (the current track); remembered in the ini.
+static void SetRepeat(int mode)
+{
+    g_app.repeat = (mode >= REPEAT_OFF && mode <= REPEAT_ONE) ? mode : REPEAT_OFF;
+    WritePrivateProfileStringW(L"Player", L"Repeat", Fmt(L"%d", g_app.repeat).c_str(), g_app.iniPath.c_str());
+    RefreshTransport();
+    UpdateGaplessNext();
+    SetStatus(std::wstring(RepeatName(g_app.repeat)) + L".");
 }
 
 static int RandomBelow(int n)
 {
     return n > 0 ? (int)((((unsigned)rand() << 15) | (unsigned)rand()) % (unsigned)n) : 0;
+}
+
+// If the Play Queue page is showing, refills it from the queue and selects 'select'
+// (-1: keep the selected row where it is).
+static void RefreshQueueView(int select = -1)
+{
+    if (g_app.songSource != SRC_QUEUE)
+        return;
+    if (select < 0)
+        select = SelectedIndex(g_app.songs);
+    const int top = ListView_GetTopIndex(g_app.songs);
+    g_app.songData = g_app.queue;
+    ListView_SetItemState(g_app.songs, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_SetItemCountEx(g_app.songs, (int)g_app.songData.size(), LVSICF_NOSCROLL);
+    if (select >= (int)g_app.songData.size())
+        select = (int)g_app.songData.size() - 1;
+    if (top > 0 && top < (int)g_app.songData.size()) {
+        // Keep the scroll position: scroll to the bottom, then back up to the old top row.
+        ListView_EnsureVisible(g_app.songs, (int)g_app.songData.size() - 1, FALSE);
+        ListView_EnsureVisible(g_app.songs, top, FALSE);
+    }
+    SelectRow(g_app.songs, select);
+    InvalidateRect(g_app.songs, NULL, TRUE);
+    InvalidateHeader();
 }
 
 // Builds the play order from queueSource. With shuffle on, 'startSrc' plays first and the
@@ -1136,6 +1720,31 @@ static void BuildQueue(int startSrc)
     for (size_t i = 0; i < g_app.queueSrcIdx.size(); ++i)
         g_app.queue.push_back(g_app.queueSource[g_app.queueSrcIdx[i]]);
     g_app.queueIndex = g_app.shuffle ? 0 : startSrc;
+    RefreshQueueView(g_app.queueIndex);
+    UpdateGaplessNext();
+}
+
+// After the queue itself is edited, its current order becomes the source, so turning
+// shuffle off later keeps the user's order rather than the original album/playlist order.
+static void QueueEdited(int select)
+{
+    g_app.queueSource = g_app.queue;
+    g_app.queueSrcIdx.clear();
+    for (int i = 0; i < (int)g_app.queue.size(); ++i)
+        g_app.queueSrcIdx.push_back(i);
+    RefreshQueueView(select);
+    UpdateGaplessNext();
+}
+
+// Highlights queue entry i if the list on screen holds it at the same position.
+static void ShowTrackRow(int i)
+{
+    int row = g_app.songSource == SRC_QUEUE ? i : g_app.queueSrcIdx[i];
+    if (row < (int)g_app.songData.size() && g_app.songData[row].id == g_app.queue[i].id)
+        SelectRow(g_app.songs, row);
+    InvalidateRect(g_app.songs, NULL, FALSE);   // bold "now playing" row
+    if (g_app.songSource == SRC_QUEUE)
+        InvalidateHeader();                     // "track N of M"
 }
 
 static void StartQueue(int i, DWORD startMs)
@@ -1144,14 +1753,12 @@ static void StartQueue(int i, DWORD startMs)
         return;
     const SubsonicSong& s = g_app.queue[i];
     g_app.queueIndex = i;
+    g_app.queueFinished = false;
 
-    // Transcoded streams seek on the server (timeOffset, whole seconds); original MP3s that
-    // Navidrome passes through untouched are skipped client-side by frame headers.
-    const bool serverSide = g_app.client.ServerTranscodes(s);
-    const int offsetSec = (int)(startMs / 1000);
-    std::wstring url = g_app.client.StreamUrl(s.id, serverSide ? offsetSec : 0);
-    DWORD start = serverSide ? (DWORD)offsetSec * 1000 : startMs;
-    DWORD skip = serverSide ? 0 : startMs;
+    DWORD start, skip;
+    bool flac;
+    const std::wstring url = TrackUrl(s, startMs, start, skip, flac);
+    g_app.playingFlac = flac;
 
     ResetSeekBar(s.duration);
     if (start) {
@@ -1159,26 +1766,145 @@ static void StartQueue(int i, DWORD startMs)
         SetSeekPos(g_app.shownSec);
         SetTimeCur(g_app.shownSec);
     }
-
-    // Highlight it if the list on screen holds it at the same position.
-    int row = g_app.queueSrcIdx[i];
-    if (row < (int)g_app.songData.size() && g_app.songData[row].id == s.id)
-        SelectRow(g_app.songs, row);
-    InvalidateRect(g_app.songs, NULL, FALSE);   // bold "now playing" row
+    ShowTrackRow(i);
     SetStatus(L"Buffering: " + s.title);
     ScrobbleTrackStarted(s.id, startMs);
-    g_app.player.Play(url, g_app.client.Options(), start, skip);
+    g_app.player.Play(url, g_app.client.Options(), start, skip, flac ? CODEC_FLAC : CODEC_MP3,
+                      (DWORD)s.duration * 1000);
+    UpdateGaplessNext();
     UpdateNowPlaying();
     RefreshTransport();
+}
+
+// The player joined the next track with no gap and it's now being heard: move the queue
+// on to it (the player tells us which by its song id).
+static void AdoptNextTrack(const wchar_t* tag)
+{
+    ScrobbleCheck(true);
+    const std::string id = tag ? WideToUtf8(tag) : std::string();
+    const int n = (int)g_app.queue.size();
+    int i = g_app.gaplessIdx;
+    if (i < 0 || i >= n || g_app.queue[i].id != id) {   // the queue changed meanwhile
+        i = -1;
+        for (int k = 1; k <= n && i < 0; ++k)
+            if (g_app.queue[(g_app.queueIndex + k) % n].id == id)
+                i = (g_app.queueIndex + k) % n;
+    }
+    if (i < 0)
+        return;
+    const SubsonicSong& s = g_app.queue[i];
+    g_app.queueIndex = i;
+    g_app.queueFinished = false;
+    g_app.playingFlac = g_app.client.StreamsLossless(s);
+    ResetSeekBar(s.duration);
+    ShowTrackRow(i);
+    ScrobbleTrackStarted(s.id, 0);
+    SetStatus(L"Playing: " + s.title + L"  -  " + s.artist + (g_app.playingFlac ? L"  (FLAC)" : L""));
+    if (g_app.scrobbleEnabled) {
+        g_app.nowPlayingSent = true;
+        SendScrobble(s.id, false);
+    }
+    UpdateNowPlaying();
+    RefreshTransport();
+    UpdateGaplessNext();
 }
 
 static void PlayFromSongList(int i)
 {
     if (i < 0 || i >= (int)g_app.songData.size())
         return;
+    if (g_app.songSource == SRC_QUEUE) {   // the list is the queue: jump within it
+        StartQueue(i, 0);
+        return;
+    }
     g_app.queueSource = g_app.songData;
     BuildQueue(i);
     StartQueue(g_app.queueIndex, 0);
+}
+
+// Play next / Add to queue. With nothing queued, or the queue played to the end, the new
+// tracks start playing straight away.
+static void QueueSongs(const std::vector<SubsonicSong>& songs, bool next)
+{
+    if (songs.empty())
+        return;
+    const std::wstring what = songs.size() == 1 ? L"\"" + songs[0].title + L"\""
+                                                : Fmt(L"%u tracks", (unsigned)songs.size());
+    if (!QueueValid()) {
+        g_app.queue = songs;
+        g_app.queueIndex = 0;
+        QueueEdited(0);
+        StartQueue(0, 0);
+        return;
+    }
+    const bool resume = g_app.queueFinished;
+    const int at = (next && !resume) ? g_app.queueIndex + 1 : (int)g_app.queue.size();
+    g_app.queue.insert(g_app.queue.begin() + at, songs.begin(), songs.end());
+    QueueEdited(-1);
+    if (resume) {
+        StartQueue(at, 0);
+        return;
+    }
+    SetStatus((next ? L"Playing next: " : L"Added to the queue: ") + what);
+}
+
+// Fetches an album's or playlist's tracks in the background, then queues them (OnJobDone).
+static void QueueFetched(const std::string& albumId, const std::string& playlistId, const std::wstring& name,
+                         bool next)
+{
+    Job* job = NewJob(JOB_QUEUE_FETCH);
+    job->addAlbumId = albumId;
+    job->plId = playlistId;
+    job->flag = next;
+    SetStatus(L"Getting the tracks of \"" + name + L"\"...");
+    LaunchJob(job);
+}
+
+static void RemoveFromQueue(int i)
+{
+    // The playing track stays; skip it with Next instead.
+    if (i < 0 || i >= (int)g_app.queue.size() || i == g_app.queueIndex)
+        return;
+    const std::wstring title = g_app.queue[i].title;
+    g_app.queue.erase(g_app.queue.begin() + i);
+    if (i < g_app.queueIndex)
+        --g_app.queueIndex;
+    QueueEdited(i);
+    SetStatus(L"Removed from the queue: \"" + title + L"\"");
+}
+
+// Moves queue entry 'from' so it ends up at 'to'; the playing track keeps playing.
+static void MoveQueueEntry(int from, int to)
+{
+    const int n = (int)g_app.queue.size();
+    if (from < 0 || to < 0 || from >= n || to >= n || from == to)
+        return;
+    const SubsonicSong s = g_app.queue[from];
+    g_app.queue.erase(g_app.queue.begin() + from);
+    g_app.queue.insert(g_app.queue.begin() + to, s);
+    int& cur = g_app.queueIndex;
+    if (cur == from)
+        cur = to;
+    else if (from < cur && to >= cur)
+        --cur;
+    else if (from > cur && to <= cur)
+        ++cur;
+    QueueEdited(to);
+}
+
+static void MoveInQueue(int i, int delta)
+{
+    MoveQueueEntry(i, i + delta);
+}
+
+// Drops everything after the playing track.
+static void ClearUpcoming()
+{
+    if (!QueueValid() || g_app.queueIndex + 1 >= (int)g_app.queue.size())
+        return;
+    g_app.queue.erase(g_app.queue.begin() + g_app.queueIndex + 1, g_app.queue.end());
+    QueueEdited(g_app.queueIndex);
+    SetStatus(L"Cleared the upcoming tracks.");
 }
 
 static void ToggleShuffle()
@@ -1211,6 +1937,7 @@ static void SeekTo(int sec)
 static void StopPlayback()
 {
     g_app.player.Stop();
+    g_app.queueFinished = false;
     ResetSeekBar(QueueValid() ? g_app.queue[g_app.queueIndex].duration : 0);
     RefreshTransport();
     SetStatus(L"Stopped.");
@@ -1234,8 +1961,8 @@ static void DoPlay()
         DoPause();
         return;
     }
-    if ((g_app.mainView == VIEW_TRACKS || g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_FAVORITES) &&
-        !g_app.songData.empty()) {
+    if ((g_app.mainView == VIEW_TRACKS || g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_FAVORITES ||
+         g_app.mainView == VIEW_QUEUE) && !g_app.songData.empty()) {
         int sel = SelectedIndex(g_app.songs);
         PlayFromSongList(sel >= 0 ? sel : (g_app.shuffle ? RandomBelow((int)g_app.songData.size()) : 0));
     } else if (QueueValid()) {
@@ -1254,10 +1981,30 @@ static void PlayPrevious()
         StartQueue(g_app.queueIndex - 1, 0);
 }
 
+// Next: the following track, or back to the first with Repeat all. (Repeat one only
+// repeats a track that plays to its end; Next still moves on.)
 static void PlayNext()
 {
-    if (QueueValid() && g_app.queueIndex + 1 < (int)g_app.queue.size())
+    if (!QueueValid())
+        return;
+    if (g_app.queueIndex + 1 < (int)g_app.queue.size())
         StartQueue(g_app.queueIndex + 1, 0);
+    else if (g_app.repeat == REPEAT_ALL)
+        StartQueue(0, 0);
+}
+
+// Play/pause for the keyboard, media keys and tray: pause or resume, else start the queue
+// where it is (from the top once it has finished), else play from the list on screen.
+static void PlayPause()
+{
+    if (g_app.queueFinished && QueueValid())
+        StartQueue(0, 0);
+    else if (g_app.player.IsActive())
+        DoPause();
+    else if (QueueValid())
+        StartQueue(g_app.queueIndex, 0);
+    else
+        DoPlay();
 }
 
 // --- Views and loading -----------------------------------------------------------------------
@@ -1282,7 +2029,8 @@ static HWND CurrentList()
     case VIEW_ARTISTS: return g_app.artists;
     case VIEW_TRACKS:
     case VIEW_SONGS:
-    case VIEW_FAVORITES: return g_app.songs;
+    case VIEW_FAVORITES:
+    case VIEW_QUEUE:   return g_app.songs;
     default:           return g_app.albums;
     }
 }
@@ -1290,11 +2038,13 @@ static HWND CurrentList()
 static void SetView(MainView v)
 {
     g_app.mainView = v;
+    if (v != VIEW_QUEUE && g_app.songSource == SRC_QUEUE)
+        g_app.songSource = SRC_NONE;   // the hidden list no longer follows the queue
     const bool albumList = v == VIEW_ALBUMS || v == VIEW_ARTIST;
     const bool trackList = v == VIEW_TRACKS || v == VIEW_SONGS || v == VIEW_FAVORITES;
     ShowWindow(g_app.albums, albumList ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.artists, v == VIEW_ARTISTS ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_app.songs, trackList ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.songs, trackList || v == VIEW_QUEUE ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.hdrPlay, trackList ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.hdrShuffle, trackList ? SW_SHOW : SW_HIDE);
     // Each library section keeps its own search text.
@@ -1380,6 +2130,19 @@ static void ShowFavoritesView()
     LoadFavorites();
 }
 
+// Library > Play Queue: the play order, with the playing track in bold. It follows the queue
+// as it changes (RefreshQueueView).
+static void ShowQueueView()
+{
+    g_app.songSource = SRC_QUEUE;
+    g_app.songData = g_app.queue;
+    FillSongs();
+    SetView(VIEW_QUEUE);
+    TreeSelectQuietly(g_app.treeQueue);
+    SelectRow(g_app.songs, QueueValid() ? g_app.queueIndex : 0);
+    SetFocus(g_app.songs);
+}
+
 static void ShowArtistsView()
 {
     SetView(VIEW_ARTISTS);
@@ -1455,7 +2218,16 @@ static void ShowArtistInfo()
         tracks += g_app.artistAlbums[i].songCount;
     ShowInfo(ar.id, g_app.shownArtistCover, ar.name,
              Fmt(L"%u album%ls", (unsigned)g_app.artistAlbums.size(), g_app.artistAlbums.size() == 1 ? L"" : L"s"),
-             Fmt(L"%d tracks", tracks));
+             Fmt(L"%d tracks", tracks), InfoNote(true, ar.id));
+}
+
+// After the setting changes: show or drop the description on the page on screen.
+static void RefreshShownInfo()
+{
+    if (g_app.mainView == VIEW_ARTIST)
+        ShowArtistInfo();
+    else if (g_app.mainView == VIEW_TRACKS && g_app.songSource == SRC_ALBUM)
+        ShowAlbumInfo(g_app.shownAlbum);
 }
 
 // Back to the artist page from one of their albums (its list is still loaded).
@@ -1533,7 +2305,10 @@ static void DoConnect()
     g_app.queueSource.clear();
     g_app.queueSrcIdx.clear();
     g_app.queueIndex = -1;
+    g_app.queueFinished = false;
     g_app.nowCoverPending.clear();
+    g_app.infoCache.clear();
+    g_app.infoPending.clear();
     ClearArtCache();
     ClearSongs();
     RebuildAlbumList();
@@ -1548,17 +2323,32 @@ static void DoConnect()
     LaunchJob(NewJob(JOB_CONNECT));
 }
 
-static void OpenSelectedArtist()
+static void OpenArtist(const SubsonicArtist& ar)
 {
-    int i = SelectedIndex(g_app.artists);
-    if (i < 0 || i >= (int)g_app.artistList.size() || !TryBeginLoad())
-        return;
-    const SubsonicArtist& ar = g_app.artistList[i];
     Job* job = NewJob(JOB_ARTIST);
     job->artist = ar;
     job->artId = ar.coverArt;
     job->needArt = !ar.coverArt.empty();   // always try: a cached miss still allows the album fallback
     SetStatus(L"Loading " + ar.name + L"...");
+    LaunchJob(job);
+}
+
+static void OpenSelectedArtist()
+{
+    int i = SelectedIndex(g_app.artists);
+    if (i < 0 || i >= (int)g_app.artistList.size() || !TryBeginLoad())
+        return;
+    OpenArtist(g_app.artistList[i]);
+}
+
+static void OpenAlbum(const SubsonicAlbum& a, MainView origin)
+{
+    g_app.albumOrigin = origin;
+    Job* job = NewJob(JOB_ALBUM);
+    job->album = a;
+    job->artId = a.coverArt;
+    job->needArt = NeedArt(a.coverArt);
+    SetStatus(L"Loading " + a.name + L"...");
     LaunchJob(job);
 }
 
@@ -1573,14 +2363,51 @@ static void OpenSelectedAlbum()
         g_app.pendingPlaylist = -1;
         return;
     }
-    const SubsonicAlbum& a = list[i];
-    g_app.albumOrigin = g_app.mainView == VIEW_ARTIST ? VIEW_ARTIST : VIEW_ALBUMS;
-    Job* job = NewJob(JOB_ALBUM);
-    job->album = a;
-    job->artId = a.coverArt;
-    job->needArt = NeedArt(a.coverArt);
-    SetStatus(L"Loading " + a.name + L"...");
-    LaunchJob(job);
+    OpenAlbum(list[i], g_app.mainView == VIEW_ARTIST ? VIEW_ARTIST : VIEW_ALBUMS);
+}
+
+// Right-click a track > Go to album / Go to artist. Uses the library lists loaded at connect;
+// a newer album or artist falls back to what the track itself says.
+static void GoToAlbum(const SubsonicSong& s)
+{
+    if (s.albumId.empty())
+        return;
+    if (!TryBeginLoad()) {
+        SetStatus(L"Still loading; try again in a moment.");
+        return;
+    }
+    SubsonicAlbum a;
+    a.id = s.albumId;
+    a.coverArt = s.coverArt;
+    a.name = s.album;
+    a.artist = s.artist;
+    a.year = a.songCount = 0;
+    for (size_t k = 0; k < g_app.albumData.size(); ++k)
+        if (g_app.albumData[k].id == s.albumId) {
+            a = g_app.albumData[k];
+            break;
+        }
+    OpenAlbum(a, VIEW_ALBUMS);
+}
+
+static void GoToArtist(const SubsonicSong& s)
+{
+    if (s.artistId.empty())
+        return;
+    if (!TryBeginLoad()) {
+        SetStatus(L"Still loading; try again in a moment.");
+        return;
+    }
+    SubsonicArtist ar;
+    ar.id = s.artistId;
+    ar.name = s.artist;
+    ar.albumCount = 0;
+    for (size_t k = 0; k < g_app.artistData.size(); ++k)
+        if (g_app.artistData[k].id == s.artistId) {
+            ar = g_app.artistData[k];
+            break;
+        }
+    OpenArtist(ar);
 }
 
 static void OpenPlaylist(int i)
@@ -1670,9 +2497,10 @@ static void StartEdit(Job* job, const std::wstring& status)
     LaunchJob(job);
 }
 
+// Moving and removing go by position, so they need the playlist's own order (not sorted).
 static bool ShownPlaylistEditable()
 {
-    return g_app.songSource == SRC_PLAYLIST && g_app.client.CanEdit(g_app.shownPlaylist);
+    return g_app.songSource == SRC_PLAYLIST && g_app.client.CanEdit(g_app.shownPlaylist) && !SongsSorted();
 }
 
 static void NewPlaylist(const std::vector<std::string>& songIds, const std::string& albumId,
@@ -1701,19 +2529,126 @@ static void AddToPlaylist(int plIndex, const std::vector<std::string>& songIds, 
     StartEdit(job, L"Adding to \"" + g_app.playlistData[plIndex].name + L"\"...");
 }
 
-static void MoveInPlaylist(int i, int delta)
+// Moves track 'from' of the playlist on screen so it ends up at 'to'.
+static void MovePlaylistEntry(int from, int to)
 {
-    int j = i + delta;
-    if (!ShownPlaylistEditable() || i < 0 || j < 0 || j >= (int)g_app.songData.size())
+    const int n = (int)g_app.songData.size();
+    if (!ShownPlaylistEditable() || from < 0 || to < 0 || from >= n || to >= n || from == to)
         return;
     Job* job = NewJob(JOB_PLEDIT);
     job->edit = PL_SETSONGS;
     job->plId = g_app.shownPlaylist.id;
-    for (size_t k = 0; k < g_app.songData.size(); ++k)
+    for (int k = 0; k < n; ++k)
         job->songIds.push_back(g_app.songData[k].id);
-    std::swap(job->songIds[i], job->songIds[j]);
-    job->selectAfter = j;
-    StartEdit(job, L"Moving \"" + g_app.songData[i].title + L"\"...");
+    const std::string id = job->songIds[from];
+    job->songIds.erase(job->songIds.begin() + from);
+    job->songIds.insert(job->songIds.begin() + to, id);
+    job->selectAfter = to;
+    StartEdit(job, L"Moving \"" + g_app.songData[from].title + L"\"...");
+}
+
+static void MoveInPlaylist(int i, int delta)
+{
+    MovePlaylistEntry(i, i + delta);
+}
+
+// --- Drag and drop in the track list (playlists and the Play Queue) ---------------------------
+
+static void DragBegin(int row)
+{
+    if (g_app.songSource == SRC_PLAYLIST && SongsSorted()) {
+        SetStatus(L"The playlist is sorted: click # to restore its order, then drag tracks.");
+        return;
+    }
+    if (row < 0 || !(g_app.songSource == SRC_QUEUE || ShownPlaylistEditable()))
+        return;
+    g_app.dragging = true;
+    g_app.dragFrom = row;
+    g_app.dragInsert = -1;
+    SetCapture(g_app.wnd);
+    SetTimer(g_app.wnd, TIMER_DRAGSCROLL, 80, NULL);
+}
+
+// Works out where the track would go for a mouse position in the list.
+static void DragUpdate(POINT pt)
+{
+    if (!g_app.dragging)
+        return;
+    g_app.dragPt = pt;
+    RECT rc, hr;
+    GetClientRect(g_app.songs, &rc);
+    GetWindowRect(ListView_GetHeader(g_app.songs), &hr);
+    const int headerH = hr.bottom - hr.top;
+    const int n = (int)g_app.songData.size();
+    int ins = -1;
+    if (pt.x >= rc.left - 40 && pt.x <= rc.right + 40 && n > 0) {
+        RECT last;
+        ListView_GetItemRect(g_app.songs, n - 1, &last, LVIR_BOUNDS);
+        if (pt.y < headerH) {
+            ins = ListView_GetTopIndex(g_app.songs);
+        } else if (pt.y >= last.bottom) {
+            ins = n;
+        } else {
+            LVHITTESTINFO ht;
+            ZeroMemory(&ht, sizeof(ht));
+            ht.pt.x = 4;
+            ht.pt.y = pt.y;
+            const int r = ListView_HitTest(g_app.songs, &ht);
+            if (r >= 0) {
+                RECT ir;
+                ListView_GetItemRect(g_app.songs, r, &ir, LVIR_BOUNDS);
+                ins = pt.y < (ir.top + ir.bottom) / 2 ? r : r + 1;
+            }
+        }
+    }
+    SetCursor(LoadCursor(NULL, ins >= 0 ? IDC_ARROW : IDC_NO));
+    if (ins != g_app.dragInsert) {
+        g_app.dragInsert = ins;
+        InvalidateRect(g_app.songs, NULL, FALSE);
+    }
+}
+
+// Scrolls while the mouse is held above or below the list.
+static void DragScroll()
+{
+    if (!g_app.dragging)
+        return;
+    RECT rc, hr;
+    GetClientRect(g_app.songs, &rc);
+    GetWindowRect(ListView_GetHeader(g_app.songs), &hr);
+    RECT row;
+    const int rowH = ListView_GetItemRect(g_app.songs, 0, &row, LVIR_BOUNDS) ? row.bottom - row.top : 16;
+    if (g_app.dragPt.y < hr.bottom - hr.top + 4)
+        ListView_Scroll(g_app.songs, 0, -rowH);
+    else if (g_app.dragPt.y > rc.bottom - 4)
+        ListView_Scroll(g_app.songs, 0, rowH);
+    else
+        return;
+    POINT pt = g_app.dragPt;
+    g_app.dragInsert = -2;   // force a recalculation and repaint after scrolling
+    DragUpdate(pt);
+}
+
+static void DragEnd(bool drop)
+{
+    if (!g_app.dragging)
+        return;
+    g_app.dragging = false;   // first: ReleaseCapture() sends WM_CAPTURECHANGED back here
+    KillTimer(g_app.wnd, TIMER_DRAGSCROLL);
+    if (GetCapture() == g_app.wnd)
+        ReleaseCapture();
+    const int from = g_app.dragFrom, ins = g_app.dragInsert;
+    g_app.dragInsert = -1;
+    InvalidateRect(g_app.songs, NULL, FALSE);
+    if (!drop || ins < 0)
+        return;
+    const int to = ins > from ? ins - 1 : ins;
+    if (to == from)
+        return;
+    if (g_app.songSource == SRC_QUEUE)
+        MoveQueueEntry(from, to);
+    else
+        MovePlaylistEntry(from, to);
 }
 
 static void RemoveFromPlaylist(int i)
@@ -1728,19 +2663,104 @@ static void RemoveFromPlaylist(int i)
     StartEdit(job, L"Removing \"" + g_app.songData[i].title + L"\"...");
 }
 
-static void RenamePlaylist(int plIndex)
+// The edit box wants CRLF; the server stores what it's given, so send plain LF.
+static std::wstring ReplaceAll(std::wstring s, const std::wstring& from, const std::wstring& to)
+{
+    for (size_t at = s.find(from); at != std::wstring::npos; at = s.find(from, at + to.size()))
+        s.replace(at, from.size(), to);
+    return s;
+}
+
+static std::wstring Trimmed(const std::wstring& s, const wchar_t* space)
+{
+    size_t a = s.find_first_not_of(space), b = s.find_last_not_of(space);
+    return a == std::wstring::npos ? std::wstring() : s.substr(a, b - a + 1);
+}
+
+struct PlaylistDlgData {
+    std::wstring name, comment;
+};
+
+static std::wstring DlgFullText(HWND dlg, int id)
+{
+    const int n = GetWindowTextLengthW(GetDlgItem(dlg, id));
+    std::vector<wchar_t> buf(n + 1);
+    GetDlgItemTextW(dlg, id, &buf[0], n + 1);
+    return std::wstring(&buf[0]);
+}
+
+static INT_PTR CALLBACK PlaylistDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_INITDIALOG: {
+        SetWindowLongPtrW(dlg, DWLP_USER, lp);
+        PlaylistDlgData* d = (PlaylistDlgData*)lp;
+        SendDlgItemMessageW(dlg, IDC_NAME_EDIT, EM_LIMITTEXT, 200, 0);
+        SendDlgItemMessageW(dlg, IDC_PL_COMMENT, EM_LIMITTEXT, 2000, 0);
+        SetDlgItemTextW(dlg, IDC_NAME_EDIT, d->name.c_str());
+        SetDlgItemTextW(dlg, IDC_PL_COMMENT, ReplaceAll(d->comment, L"\n", L"\r\n").c_str());
+        SendDlgItemMessageW(dlg, IDC_NAME_EDIT, EM_SETSEL, 0, -1);
+        SetFocus(GetDlgItem(dlg, IDC_NAME_EDIT));
+        return FALSE;   // focus set by hand
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            std::wstring name = Trimmed(DlgFullText(dlg, IDC_NAME_EDIT), L" \t");
+            if (name.empty()) {
+                MessageBeep(MB_ICONEXCLAMATION);
+                SetFocus(GetDlgItem(dlg, IDC_NAME_EDIT));
+                return TRUE;
+            }
+            PlaylistDlgData* d = (PlaylistDlgData*)GetWindowLongPtrW(dlg, DWLP_USER);
+            d->name = name;
+            d->comment = Trimmed(ReplaceAll(DlgFullText(dlg, IDC_PL_COMMENT), L"\r\n", L"\n"), L" \t\r\n");
+            EndDialog(dlg, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDCANCEL) {
+            EndDialog(dlg, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+static void EditPlaylist(int plIndex)
 {
     if (plIndex < 0 || plIndex >= (int)g_app.playlistData.size())
         return;
     const SubsonicPlaylist& p = g_app.playlistData[plIndex];
-    std::wstring name = p.name;
-    if (!AskName(L"Rename playlist", name) || name == p.name)
+    if (!g_app.client.CanEdit(p)) {
+        SetStatus(L"\"" + p.name + L"\" is read-only.");
+        return;
+    }
+    PlaylistDlgData d;
+    d.name = p.name;
+    d.comment = p.comment;
+    if (DialogBoxParamW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDD_PLAYLIST), g_app.wnd, PlaylistDlgProc,
+                        (LPARAM)&d) != IDOK)
+        return;
+    if (d.name == p.name && d.comment == p.comment)
         return;
     Job* job = NewJob(JOB_PLEDIT);
     job->edit = PL_RENAME;
     job->plId = p.id;
-    job->name = name;
-    StartEdit(job, L"Renaming to \"" + name + L"\"...");
+    job->name = d.name;
+    job->comment = d.comment;
+    StartEdit(job, L"Saving \"" + d.name + L"\"...");
+}
+
+// Playlist menu: the playlist on screen.
+static void EditShownPlaylist()
+{
+    if (g_app.songSource == SRC_PLAYLIST)
+        for (size_t i = 0; i < g_app.playlistData.size(); ++i)
+            if (g_app.playlistData[i].id == g_app.shownPlaylist.id) {
+                EditPlaylist((int)i);
+                return;
+            }
+    SetStatus(L"Open a playlist first, or right-click one in the sidebar.");
 }
 
 static void DeletePlaylist(int plIndex)
@@ -1778,6 +2798,13 @@ static void OnPlaylistEditDone(Job* job)
             if (g_app.playlistData[i].id == job->reloadId) {
                 g_app.shownPlaylist = g_app.playlistData[i];
                 ShowPlaylistInfo(g_app.shownPlaylist);
+                // Navidrome gives the playlist a new cover id whenever it changes.
+                if (NeedArt(g_app.shownPlaylist.coverArt)) {
+                    Job* art = NewJob(JOB_ART);
+                    art->artId = g_app.shownPlaylist.coverArt;
+                    art->needArt = true;
+                    LaunchJob(art);
+                }
             }
     }
     RebuildPlaylistTree();
@@ -1787,7 +2814,7 @@ static void OnPlaylistEditDone(Job* job)
         MessageBoxW(g_app.wnd, job->message.c_str(), APP_TITLE, MB_ICONERROR);
         return;
     }
-    static const wchar_t* kDone[] = { L"Playlist created.", L"Playlist renamed.", L"Added to playlist.",
+    static const wchar_t* kDone[] = { L"Playlist created.", L"Playlist details saved.", L"Added to playlist.",
                                       L"Removed from playlist.", L"Playlist reordered.", L"Playlist deleted." };
     SetStatus(kDone[job->edit]);
 }
@@ -1903,6 +2930,17 @@ static void OnJobDone(Job* job)
         OnPlaylistEditDone(job);
         break;
 
+    case JOB_QUEUE_FETCH:
+        if (job->ok && !job->songs.empty()) {
+            QueueSongs(job->songs, job->flag);
+        } else if (job->ok) {
+            SetStatus(L"Nothing to add: the list is empty.");
+        } else {
+            SetStatus(L"Could not get the tracks.");
+            MessageBoxW(g_app.wnd, job->message.c_str(), APP_TITLE, MB_ICONERROR);
+        }
+        break;
+
     case JOB_SONGS:
         if (job->ok) {
             g_app.allSongs.swap(job->songs);
@@ -1940,6 +2978,22 @@ static void OnJobDone(Job* job)
         if (g_app.nowCoverPending == job->artId)
             g_app.nowCoverPending.clear();
         break;
+
+    case JOB_INFO: {
+        const std::string key = InfoKey(job->flag, job->songId);
+        if (g_app.infoPending == key)
+            g_app.infoPending.clear();
+        if (!job->ok) {
+            LogF(L"Last.fm description: %ls", job->message.c_str());   // tried again next visit
+            break;
+        }
+        g_app.infoCache[key] = job->notes;
+        if (g_app.lastfmInfo && g_app.shown.has && ShownInfoKey() == key) {
+            g_app.shown.note = job->notes;
+            InvalidateHeader();
+        }
+        break;
+    }
     }
     delete job;
 
@@ -1969,17 +3023,26 @@ static void OnPlayerState(WPARAM wp, LPARAM lp)
             SetStatus(L"Buffering: " + title);
             break;
         case PS_PLAYING:
-            SetStatus(L"Playing: " + title + L"  -  " + g_app.queue[g_app.queueIndex].artist);
+            SetStatus(L"Playing: " + title + L"  -  " + g_app.queue[g_app.queueIndex].artist +
+                      (g_app.playingFlac ? L"  (FLAC)" : L""));
             if (g_app.scrobbleEnabled && !g_app.nowPlayingSent) {
                 g_app.nowPlayingSent = true;
                 SendScrobble(g_app.queue[g_app.queueIndex].id, false);
             }
             break;
+        case PS_NEXT_TRACK:
+            AdoptNextTrack(text);
+            break;
         case PS_FINISHED:
             ScrobbleCheck(true);
-            if (g_app.queueIndex + 1 < (int)g_app.queue.size()) {
+            if (g_app.repeat == REPEAT_ONE) {
+                StartQueue(g_app.queueIndex, 0);
+            } else if (g_app.queueIndex + 1 < (int)g_app.queue.size()) {
                 StartQueue(g_app.queueIndex + 1, 0);
+            } else if (g_app.repeat == REPEAT_ALL) {
+                StartQueue(0, 0);
             } else {
+                g_app.queueFinished = true;
                 ResetSeekBar(0);
                 RefreshTransport();
                 SetStatus(L"Finished.");
@@ -2051,8 +3114,17 @@ static void SongsContextMenu(LPARAM lp)
     AppendMenuW(rate, MF_SEPARATOR, 0, NULL);
     AppendMenuW(rate, MF_STRING | (s.userRating ? 0 : MF_GRAYED), CMD_RATE_BASE, L"&Clear rating");
 
+    const bool inQueue = g_app.songSource == SRC_QUEUE;
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, CMD_PLAY, L"&Play");
+    if (!inQueue) {
+        AppendMenuW(m, MF_STRING, CMD_PLAY_NEXT, L"Play &next");
+        AppendMenuW(m, MF_STRING, CMD_ADD_QUEUE, L"Add to &queue");
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    const bool onAlbum = g_app.songSource == SRC_ALBUM && g_app.shownAlbum.id == s.albumId;
+    AppendMenuW(m, MF_STRING | (!s.albumId.empty() && !onAlbum ? 0 : MF_GRAYED), CMD_GO_ALBUM, L"Go to a&lbum");
+    AppendMenuW(m, MF_STRING | (!s.artistId.empty() ? 0 : MF_GRAYED), CMD_GO_ARTIST, L"Go to ar&tist");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     if (g_app.showRatings)
         AppendMenuW(m, MF_POPUP, (UINT_PTR)rate, L"&Rate");
@@ -2066,7 +3138,17 @@ static void SongsContextMenu(LPARAM lp)
         AppendMenuW(m, MF_STRING | (editable && i > 0 ? 0 : MF_GRAYED), CMD_MOVE_UP, L"Move &up");
         AppendMenuW(m, MF_STRING | (editable && i + 1 < (int)g_app.songData.size() ? 0 : MF_GRAYED),
                     CMD_MOVE_DOWN, L"Move &down");
-        AppendMenuW(m, MF_STRING | (editable ? 0 : MF_GRAYED), CMD_REMOVE, L"Remo&ve from playlist\tDel");
+        AppendMenuW(m, MF_STRING | (editable ? 0 : MF_GRAYED), CMD_REMOVE,
+                    SongsSorted() ? L"Remo&ve from playlist (click # to unsort first)" : L"Remo&ve from playlist\tDel");
+    } else if (inQueue) {
+        const int n = (int)g_app.queue.size();
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(m, MF_STRING | (i > 0 ? 0 : MF_GRAYED), CMD_MOVE_UP, L"Move &up");
+        AppendMenuW(m, MF_STRING | (i + 1 < n ? 0 : MF_GRAYED), CMD_MOVE_DOWN, L"Move &down");
+        AppendMenuW(m, MF_STRING | (i != g_app.queueIndex ? 0 : MF_GRAYED), CMD_REMOVE,
+                    L"Remo&ve from queue\tDel");
+        AppendMenuW(m, MF_STRING | (QueueValid() && g_app.queueIndex + 1 < n ? 0 : MF_GRAYED),
+                    CMD_CLEAR_UPCOMING, L"&Clear upcoming tracks");
     }
 
     POINT pt = ListMenuPoint(g_app.songs, lp, i);
@@ -2076,6 +3158,20 @@ static void SongsContextMenu(LPARAM lp)
     std::vector<std::string> one(1, s.id);
     if (cmd == CMD_PLAY)
         PlayFromSongList(i);
+    else if (cmd == CMD_GO_ALBUM)
+        GoToAlbum(s);
+    else if (cmd == CMD_GO_ARTIST)
+        GoToArtist(s);
+    else if (cmd == CMD_PLAY_NEXT || cmd == CMD_ADD_QUEUE)
+        QueueSongs(std::vector<SubsonicSong>(1, s), cmd == CMD_PLAY_NEXT);
+    else if (inQueue && cmd == CMD_MOVE_UP)
+        MoveInQueue(i, -1);
+    else if (inQueue && cmd == CMD_MOVE_DOWN)
+        MoveInQueue(i, +1);
+    else if (inQueue && cmd == CMD_REMOVE)
+        RemoveFromQueue(i);
+    else if (cmd == CMD_CLEAR_UPCOMING)
+        ClearUpcoming();
     else if (cmd == CMD_FAV)
         ToggleFavorite(i);
     else if (cmd >= CMD_RATE_BASE && cmd <= CMD_RATE_BASE + 5)
@@ -2100,6 +3196,8 @@ static void AlbumsContextMenu(LPARAM lp)
         return;
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, CMD_PLAY, L"&Open");
+    AppendMenuW(m, MF_STRING, CMD_PLAY_NEXT, L"Play &next");
+    AppendMenuW(m, MF_STRING, CMD_ADD_QUEUE, L"Add to &queue");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)BuildAddToMenu(), L"&Add album to playlist");
     POINT pt = ListMenuPoint(g_app.albums, lp, i);
@@ -2110,10 +3208,50 @@ static void AlbumsContextMenu(LPARAM lp)
     const std::wstring albumName = list[i].name;
     if (cmd == CMD_PLAY)
         OpenSelectedAlbum();
+    else if (cmd == CMD_PLAY_NEXT || cmd == CMD_ADD_QUEUE)
+        QueueFetched(albumId, std::string(), albumName, cmd == CMD_PLAY_NEXT);
     else if (cmd == CMD_ADD_NEW)
         NewPlaylist(std::vector<std::string>(), albumId, albumName);
     else if (cmd >= CMD_ADD_BASE)
         AddToPlaylist(cmd - CMD_ADD_BASE, std::vector<std::string>(), albumId);
+}
+
+static void OnCommand(int id);
+
+// Right-click on the notification-area icon.
+static void TrayContextMenu()
+{
+    const bool active = g_app.player.IsActive() && !g_app.queueFinished;
+    const bool hidden = !IsWindowVisible(g_app.wnd) && !(g_app.mini && IsWindowVisible(g_app.mini));
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, IDM_SHOW, hidden ? L"&Show Navi2K Player" : L"&Bring to front");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | (active || QueueValid() ? 0 : MF_GRAYED), IDM_PLAYPAUSE,
+                !active ? L"&Play" : (g_app.player.IsPaused() ? L"&Resume" : L"P&ause"));
+    AppendMenuW(m, MF_STRING | (active ? 0 : MF_GRAYED), IDM_STOP, L"S&top");
+    AppendMenuW(m, MF_STRING | (QueueValid() ? 0 : MF_GRAYED), IDM_PREV, L"Pre&vious");
+    const bool canNext = QueueValid() && (g_app.queueIndex + 1 < (int)g_app.queue.size() || g_app.repeat == REPEAT_ALL);
+    AppendMenuW(m, MF_STRING | (canNext ? 0 : MF_GRAYED), IDM_NEXT, L"&Next");
+    AppendMenuW(m, MF_STRING | (g_app.shuffle ? MF_CHECKED : 0), IDM_SHUFFLE, L"S&huffle");
+    HMENU rep = CreatePopupMenu();
+    AppendMenuW(rep, MF_STRING, IDM_REPEAT_OFF, L"&Off");
+    AppendMenuW(rep, MF_STRING, IDM_REPEAT_ALL, L"&All");
+    AppendMenuW(rep, MF_STRING, IDM_REPEAT_ONE, L"O&ne");
+    CheckMenuRadioItem(rep, IDM_REPEAT_OFF, IDM_REPEAT_ONE, IDM_REPEAT_OFF + g_app.repeat, MF_BYCOMMAND);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)rep, L"&Repeat");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_EXIT, L"E&xit");
+    SetMenuDefaultItem(m, IDM_SHOW, FALSE);
+
+    POINT pt;
+    GetCursorPos(&pt);
+    // Without the foreground window the menu wouldn't close when clicking elsewhere (KB135788).
+    SetForegroundWindow(g_app.wnd);
+    UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, g_app.wnd, NULL);
+    PostMessageW(g_app.wnd, WM_NULL, 0, 0);
+    DestroyMenu(m);
+    if (cmd)
+        OnCommand((int)cmd);
 }
 
 static void TreeContextMenu(LPARAM lp)
@@ -2140,11 +3278,13 @@ static void TreeContextMenu(LPARAM lp)
     HMENU m = CreatePopupMenu();
     if (isPlaylist) {
         AppendMenuW(m, MF_STRING, CMD_PL_PLAY, L"&Play");
+        AppendMenuW(m, MF_STRING, CMD_PLAY_NEXT, L"Play ne&xt");
+        AppendMenuW(m, MF_STRING, CMD_ADD_QUEUE, L"Add to &queue");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     }
     AppendMenuW(m, MF_STRING, CMD_PL_NEW, L"&New playlist...");
     if (isPlaylist) {
-        AppendMenuW(m, MF_STRING | g, CMD_PL_RENAME, L"&Rename...");
+        AppendMenuW(m, MF_STRING | g, CMD_PL_RENAME, L"&Edit name and description...");
         AppendMenuW(m, MF_STRING | g, CMD_PL_DELETE, L"&Delete...");
     }
     RECT r;
@@ -2158,10 +3298,12 @@ static void TreeContextMenu(LPARAM lp)
             PlayFromSongList(g_app.shuffle ? RandomBelow((int)g_app.songData.size()) : 0);
         else
             OpenPlaylist(pl);
+    } else if (cmd == CMD_PLAY_NEXT || cmd == CMD_ADD_QUEUE) {
+        QueueFetched(std::string(), g_app.playlistData[pl].id, g_app.playlistData[pl].name, cmd == CMD_PLAY_NEXT);
     } else if (cmd == CMD_PL_NEW) {
         NewPlaylist(std::vector<std::string>(), std::string(), L"New playlist");
     } else if (cmd == CMD_PL_RENAME) {
-        RenamePlaylist(pl);
+        EditPlaylist(pl);
     } else if (cmd == CMD_PL_DELETE) {
         DeletePlaylist(pl);
     }
@@ -2169,7 +3311,8 @@ static void TreeContextMenu(LPARAM lp)
 
 // --- Drawn icons ------------------------------------------------------------------------
 
-enum Glyph { GLYPH_NONE, GLYPH_PLAY, GLYPH_PAUSE, GLYPH_STOP, GLYPH_SHUFFLE, GLYPH_PREV, GLYPH_NEXT };
+enum Glyph { GLYPH_NONE, GLYPH_PLAY, GLYPH_PAUSE, GLYPH_STOP, GLYPH_SHUFFLE, GLYPH_PREV, GLYPH_NEXT,
+             GLYPH_REPEAT, GLYPH_REPEAT_ONE };
 
 static void FillPoly(HDC dc, const POINT* pts, int n, COLORREF c)
 {
@@ -2245,6 +3388,34 @@ static void DrawGlyph(HDC dc, Glyph g, int cx, int cy, int s, COLORREF c)
         FillPoly(dc, bot, 3, c);
         break;
     }
+    case GLYPH_REPEAT:
+    case GLYPH_REPEAT_ONE: {
+        // A loop (16 x 11 px): the top runs right into an arrowhead, the bottom runs left into
+        // one. Repeat one adds a small "1" inside.
+        const int x0 = cx - 8, x1 = cx + 8, y0 = cy - 5, y1 = cy + 5;
+        HPEN pen = CreatePen(PS_SOLID, 1, c);
+        HGDIOBJ op = SelectObject(dc, pen);
+        POINT top[4] = { { x0, y1 - 3 }, { x0, y0 + 2 }, { x0 + 2, y0 }, { x1 - 4, y0 } };
+        POINT bot[4] = { { x1, y0 + 3 }, { x1, y1 - 2 }, { x1 - 2, y1 }, { x0 + 4, y1 } };
+        Polyline(dc, top, 4);
+        Polyline(dc, bot, 4);
+        // Second pass one pixel inside thickens the strokes.
+        POINT top2[4] = { { x0 + 1, y1 - 3 }, { x0 + 1, y0 + 2 }, { x0 + 2, y0 + 1 }, { x1 - 4, y0 + 1 } };
+        POINT bot2[4] = { { x1 - 1, y0 + 3 }, { x1 - 1, y1 - 2 }, { x1 - 2, y1 - 1 }, { x0 + 4, y1 - 1 } };
+        Polyline(dc, top2, 4);
+        Polyline(dc, bot2, 4);
+        SelectObject(dc, op);
+        DeleteObject(pen);
+        POINT ra[3] = { { x1, y0 }, { x1 - 3, y0 - 3 }, { x1 - 3, y0 + 3 } };
+        POINT la[3] = { { x0, y1 }, { x0 + 3, y1 - 3 }, { x0 + 3, y1 + 3 } };
+        FillPoly(dc, ra, 3, c);
+        FillPoly(dc, la, 3, c);
+        if (g == GLYPH_REPEAT_ONE) {   // "1": a 2 px stem with a flag, rows cy-2..cy+2
+            FillBox(dc, cx, cy - 2, cx + 2, cy + 3, c);
+            FillBox(dc, cx - 1, cy - 1, cx, cy, c);
+        }
+        break;
+    }
     case GLYPH_NONE:
         break;
     }
@@ -2276,10 +3447,16 @@ static void DrawIconButton(const DRAWITEMSTRUCT* d)
     case IDC_PAUSE:       glyph = GLYPH_PAUSE; latched = g_app.player.IsPaused(); break;
     case IDC_STOP:        glyph = GLYPH_STOP; break;
     case IDC_SHUFFLE:     glyph = GLYPH_SHUFFLE; latched = g_app.shuffle; break;
+    case IDC_REPEAT:
+        glyph = g_app.repeat == REPEAT_ONE ? GLYPH_REPEAT_ONE : GLYPH_REPEAT;
+        latched = g_app.repeat != REPEAT_OFF;
+        break;
     case IDC_HDR_PLAY:    glyph = GLYPH_PLAY; caption = L"Play"; break;
     case IDC_HDR_SHUFFLE: glyph = GLYPH_SHUFFLE; caption = L"Shuffle"; break;
+    case IDC_PREV:
     case IDC_MINI_PREV:   glyph = GLYPH_PREV; break;
     case IDC_MINI_STOP:   glyph = GLYPH_STOP; break;
+    case IDC_NEXT:
     case IDC_MINI_NEXT:   glyph = GLYPH_NEXT; break;
     case IDC_MINI_PLAYPAUSE:
         // One button: shows Pause while playing, Play when paused or stopped.
@@ -2353,6 +3530,42 @@ static void DrawCover(HDC dc, const RECT& r, HBITMAP bmp, const wchar_t* emptyTe
     }
 }
 
+// Word-wrapped text in whole lines between top and bottom, with "..." if it doesn't all fit.
+static void DrawNote(HDC dc, const std::wstring& note, int left, int top, int right, int bottom, int lineH)
+{
+    const int lines = (bottom - top) / lineH;
+    if (lines < 1 || right <= left)
+        return;
+    const wchar_t* more = L"... (click for more)";
+    RECT r = { left, top, right, top + lines * lineH };
+    const UINT fmt = DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX;
+    std::wstring s = note;
+    RECT calc = r;
+    DrawTextW(dc, s.c_str(), -1, &calc, fmt | DT_CALCRECT);
+    if (calc.bottom > r.bottom) {
+        // Longest prefix that still fits once "..." is added.
+        size_t lo = 0, hi = note.size();
+        while (lo < hi) {
+            const size_t mid = (lo + hi + 1) / 2;
+            const std::wstring tryS = note.substr(0, mid) + more;
+            calc = r;
+            DrawTextW(dc, tryS.c_str(), -1, &calc, fmt | DT_CALCRECT);
+            if (calc.bottom <= r.bottom)
+                lo = mid;
+            else
+                hi = mid - 1;
+        }
+        size_t cut = lo;
+        while (cut > 0 && (note[cut - 1] == L' ' || note[cut - 1] == L'\n' || note[cut - 1] == L'\r'))
+            --cut;
+        s = note.substr(0, cut) + more;
+        g_app.noteCut = true;
+    }
+    SetTextColor(dc, GetSysColor(COLOR_BTNTEXT));
+    DrawTextW(dc, s.c_str(), -1, &r, fmt);
+    g_app.noteRect = r;
+}
+
 static void PaintHeader(HDC dc)
 {
     RECT h = g_app.headerRect;
@@ -2360,7 +3573,7 @@ static void PaintHeader(HDC dc)
     const COLORREF text = GetSysColor(COLOR_BTNTEXT);
 
     int textX = h.left + 4;
-    std::wstring title, line2, line3;
+    std::wstring title, line2, line3, note;
     const bool searching = CurrentQuery() && !SearchTerms(*CurrentQuery()).empty();
     if (g_app.mainView == VIEW_ALBUMS) {
         title = L"Albums";
@@ -2396,17 +3609,26 @@ static void PaintHeader(HDC dc)
         else
             line2 = Fmt(L"%u song%ls  \x00B7  %ls", (unsigned)g_app.songData.size(),
                         g_app.songData.size() == 1 ? L"" : L"s", FormatTime(TotalDuration(g_app.songData)).c_str());
+    } else if (g_app.mainView == VIEW_QUEUE) {
+        title = L"Play Queue";
+        if (g_app.queue.empty())
+            line2 = L"Empty: right-click a track and choose Play next or Add to queue.";
+        else
+            line2 = Fmt(L"Track %d of %u  \x00B7  %ls", (QueueValid() ? g_app.queueIndex : 0) + 1,
+                        (unsigned)g_app.queue.size(), FormatTime(TotalDuration(g_app.queue)).c_str());
     } else if (g_app.shown.has) {
         DrawCover(dc, g_app.artRect, g_app.shownArt, L"No cover");
         textX = g_app.artRect.right + 14;
         title = g_app.shown.title;
         line2 = g_app.shown.line2;
         line3 = g_app.shown.line3;
+        note = g_app.shown.note;
     }
 
     // Section headers (Albums/Artists/Songs) are compact: title at the top, count right under it.
     const bool compact = !g_app.shown.has || g_app.mainView == VIEW_ALBUMS || g_app.mainView == VIEW_ARTISTS ||
-                         g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_FAVORITES;
+                         g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_FAVORITES ||
+                         g_app.mainView == VIEW_QUEUE;
     RECT t = { textX, h.top + (compact ? 0 : 6), h.right, h.top + (compact ? 32 : 40) };
     SetTextColor(dc, text);
     SelectObject(dc, g_app.fontTitle);
@@ -2421,6 +3643,13 @@ static void PaintHeader(HDC dc)
     t.top = t.bottom + 2;
     t.bottom = t.top + tm.tmHeight + 2;
     DrawTextW(dc, line3.c_str(), -1, &t, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetRectEmpty(&g_app.noteRect);
+    g_app.noteCut = false;
+    if (!note.empty() && !compact) {
+        // Stops above the Play/Shuffle buttons; artist pages have none.
+        const int noteBottom = h.top + kArtSize - (g_app.mainView == VIEW_ARTIST ? 0 : 26 + 8);
+        DrawNote(dc, note, t.left, t.bottom + 10, h.right, noteBottom, tm.tmHeight);
+    }
 }
 
 static void PaintNowPlaying(HDC dc)
@@ -2520,13 +3749,19 @@ static void Layout(HWND hwnd)
     SetRect(&g_app.transportRect, 0, ty, rc.right, ty + tH);
     const int by = ty + (tH - bh) / 2 + 1;
     int x = kPad;
+    MoveWindow(g_app.btnPrev, x, by, bw, bh, TRUE);
+    x += bw + 2;
     MoveWindow(g_app.btnPlay, x, by, bw, bh, TRUE);
     x += bw + 2;
     MoveWindow(g_app.btnPause, x, by, bw, bh, TRUE);
     x += bw + 2;
     MoveWindow(g_app.btnStop, x, by, bw, bh, TRUE);
+    x += bw + 2;
+    MoveWindow(g_app.btnNext, x, by, bw, bh, TRUE);
     x += bw + 10;
     MoveWindow(g_app.btnShuffle, x, by, bw, bh, TRUE);
+    x += bw + 2;
+    MoveWindow(g_app.btnRepeat, x, by, bw, bh, TRUE);
     x += bw + 12;
 
     const int volW = 100, timeW = 48;
@@ -2633,21 +3868,28 @@ static HMENU BuildMenuBar()
     AppendMenuW(view, MF_STRING, IDM_ARTISTS, L"A&rtists");
     AppendMenuW(view, MF_STRING, IDM_SONGS, L"&Songs");
     AppendMenuW(view, MF_STRING, IDM_FAVORITES, L"Fa&vorites");
+    AppendMenuW(view, MF_STRING, IDM_QUEUE, L"Play &Queue\tCtrl+Q");
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     AppendMenuW(view, MF_STRING, IDM_FIND, L"&Find\tCtrl+F");
     AppendMenuW(view, MF_STRING, IDM_MINI, L"&Mini Player\tCtrl+M");
 
+    // Shortcuts follow Windows Media Player's (Ctrl+P, Ctrl+S, Ctrl+B, Ctrl+H, Ctrl+T).
     HMENU playback = CreatePopupMenu();
     AppendMenuW(playback, MF_STRING, IDM_PLAY, L"&Play");
-    AppendMenuW(playback, MF_STRING, IDM_PAUSE, L"P&ause / Resume");
-    AppendMenuW(playback, MF_STRING, IDM_STOP, L"&Stop");
-    AppendMenuW(playback, MF_STRING, IDM_PREV, L"Pre&vious");
-    AppendMenuW(playback, MF_STRING, IDM_NEXT, L"&Next");
+    AppendMenuW(playback, MF_STRING, IDM_PLAYPAUSE, L"P&ause / Resume\tCtrl+P");
+    AppendMenuW(playback, MF_STRING, IDM_STOP, L"&Stop\tCtrl+S");
+    AppendMenuW(playback, MF_STRING, IDM_PREV, L"Pre&vious\tCtrl+B");
+    AppendMenuW(playback, MF_STRING, IDM_NEXT, L"&Next\tCtrl+N");
     AppendMenuW(playback, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(playback, MF_STRING, IDM_SHUFFLE, L"S&huffle");
+    AppendMenuW(playback, MF_STRING, IDM_SHUFFLE, L"S&huffle\tCtrl+H");
+    AppendMenuW(playback, MF_STRING, IDM_REPEAT_OFF, L"&Repeat off");
+    AppendMenuW(playback, MF_STRING, IDM_REPEAT_ALL, L"Repeat a&ll");
+    AppendMenuW(playback, MF_STRING, IDM_REPEAT_ONE, L"Repeat &one");
+    AppendMenuW(playback, MF_STRING, IDM_REPEAT_CYCLE, L"Change repea&t mode\tCtrl+T");
 
     HMENU playlist = CreatePopupMenu();
     AppendMenuW(playlist, MF_STRING, IDM_NEW_PLAYLIST, L"&New Playlist...");
+    AppendMenuW(playlist, MF_STRING, IDM_EDIT_PLAYLIST, L"&Edit Name and Description...");
 
     HMENU help = CreatePopupMenu();
     AppendMenuW(help, MF_STRING, IDM_ABOUT, L"&About Navi2K Player");
@@ -2669,6 +3911,9 @@ struct SettingsState {
     SubsonicConfig cfg;      // as saved
     PlaybackSettings pb;
     bool showFavorites, showRatings;
+    bool trayIcon, trayMinimize;
+    bool mediaKeys;
+    bool lastfmInfo;
     bool serverChanged;      // reconnect afterwards
     bool playbackChanged;    // apply to the player afterwards
     bool displayChanged;
@@ -2676,6 +3921,7 @@ struct SettingsState {
 static SettingsState* g_settings;
 
 static const int kQualities[] = { 96, 128, 160, 192, 256, 320 };
+static const int kLosslessChoice = sizeof(kQualities) / sizeof(kQualities[0]);   // last entry
 static const struct { int buffers; const wchar_t* label; } kBufferChoices[] = {
     { 8,  L"Short (0.4 s): quickest volume and seeking" },
     { 12, L"Normal (0.6 s)" },
@@ -2700,6 +3946,8 @@ static void ApplyPlayback(const PlaybackSettings& pb)
 {
     g_app.player.SetOutput(ResolveDevice(pb.device), pb.bufferCount);
     g_app.scrobbleEnabled = pb.scrobble;
+    g_app.gapless = pb.gapless;
+    UpdateGaplessNext();
 }
 
 static std::wstring DlgText(HWND dlg, int id)
@@ -2887,6 +4135,9 @@ static INT_PTR CALLBACK PlaybackPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM l
             if (kQualities[i] <= g_settings->cfg.maxBitRate)
                 sel = i;
         }
+        SendMessageW(q, CB_ADDSTRING, 0, (LPARAM)L"Lossless (FLAC files as they are)");
+        if (g_settings->cfg.lossless)
+            sel = kLosslessChoice;
         SendMessageW(q, CB_SETCURSEL, sel, 0);
 
         HWND d = GetDlgItem(dlg, IDC_SET_DEVICE);
@@ -2913,6 +4164,7 @@ static INT_PTR CALLBACK PlaybackPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM l
         SendMessageW(b, CB_SETCURSEL, bsel, 0);
 
         CheckDlgButton(dlg, IDC_SET_SCROBBLE, g_settings->pb.scrobble ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(dlg, IDC_SET_GAPLESS, g_settings->pb.gapless ? BST_CHECKED : BST_UNCHECKED);
         return TRUE;
     }
 
@@ -2924,13 +4176,18 @@ static INT_PTR CALLBACK PlaybackPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM l
             PlaybackSettings pb;
             pb.bufferCount = kBufferChoices[b >= 0 ? b : 1].buffers;
             pb.scrobble = IsDlgButtonChecked(dlg, IDC_SET_SCROBBLE) == BST_CHECKED;
+            pb.gapless = IsDlgButtonChecked(dlg, IDC_SET_GAPLESS) == BST_CHECKED;
             if (d > 0) {
                 wchar_t name[MAXPNAMELEN + 1] = L"";
                 SendDlgItemMessageW(dlg, IDC_SET_DEVICE, CB_GETLBTEXT, d, (LPARAM)name);
                 pb.device = name;
             }
-            g_settings->cfg.maxBitRate = kQualities[q >= 0 ? q : 3];
+            // Lossless still needs an MP3 quality for files that aren't FLAC: use the best.
+            g_settings->cfg.lossless = q == kLosslessChoice;
+            g_settings->cfg.maxBitRate = q == kLosslessChoice ? 320 : kQualities[q >= 0 ? q : 3];
             WritePrivateProfileStringW(L"Server", L"MaxBitRate", Fmt(L"%d", g_settings->cfg.maxBitRate).c_str(),
+                                       g_app.iniPath.c_str());
+            WritePrivateProfileStringW(L"Server", L"Lossless", g_settings->cfg.lossless ? L"1" : L"0",
                                        g_app.iniPath.c_str());
             PlaybackSave(g_app.iniPath, pb);
             g_settings->pb = pb;
@@ -2950,12 +4207,26 @@ static INT_PTR CALLBACK DisplayPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp
     case WM_INITDIALOG:
         CheckDlgButton(dlg, IDC_SET_SHOWFAV, g_settings->showFavorites ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(dlg, IDC_SET_SHOWRATING, g_settings->showRatings ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(dlg, IDC_SET_TRAYICON, g_settings->trayIcon ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(dlg, IDC_SET_TRAYMIN, g_settings->trayMinimize ? BST_CHECKED : BST_UNCHECKED);
+        EnableWindow(GetDlgItem(dlg, IDC_SET_TRAYMIN), g_settings->trayIcon);
+        CheckDlgButton(dlg, IDC_SET_MEDIAKEYS, g_settings->mediaKeys ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(dlg, IDC_SET_LASTFM, g_settings->lastfmInfo ? BST_CHECKED : BST_UNCHECKED);
+        return TRUE;
+
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_SET_TRAYICON && HIWORD(wp) == BN_CLICKED)
+            EnableWindow(GetDlgItem(dlg, IDC_SET_TRAYMIN), IsDlgButtonChecked(dlg, IDC_SET_TRAYICON) == BST_CHECKED);
         return TRUE;
 
     case WM_NOTIFY:
         if (((NMHDR*)lp)->code == PSN_APPLY) {
             g_settings->showFavorites = IsDlgButtonChecked(dlg, IDC_SET_SHOWFAV) == BST_CHECKED;
             g_settings->showRatings = IsDlgButtonChecked(dlg, IDC_SET_SHOWRATING) == BST_CHECKED;
+            g_settings->trayIcon = IsDlgButtonChecked(dlg, IDC_SET_TRAYICON) == BST_CHECKED;
+            g_settings->trayMinimize = IsDlgButtonChecked(dlg, IDC_SET_TRAYMIN) == BST_CHECKED;
+            g_settings->mediaKeys = IsDlgButtonChecked(dlg, IDC_SET_MEDIAKEYS) == BST_CHECKED;
+            g_settings->lastfmInfo = IsDlgButtonChecked(dlg, IDC_SET_LASTFM) == BST_CHECKED;
             g_settings->displayChanged = true;
             SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_NOERROR);
             return TRUE;
@@ -3005,6 +4276,10 @@ static void ShowSettings()
     PlaybackLoad(g_app.iniPath, st.pb);
     st.showFavorites = g_app.showFavorites;
     st.showRatings = g_app.showRatings;
+    st.trayIcon = g_app.trayIcon;
+    st.trayMinimize = g_app.trayMinimize;
+    st.mediaKeys = g_app.mediaKeysGlobal;
+    st.lastfmInfo = g_app.lastfmInfo;
     st.serverChanged = st.playbackChanged = st.displayChanged = false;
     g_settings = &st;
 
@@ -3034,6 +4309,8 @@ static void ShowSettings()
     if (st.playbackChanged) {
         ApplyPlayback(st.pb);
         g_app.client.SetMaxBitRate(st.cfg.maxBitRate);
+        g_app.client.SetLossless(st.cfg.lossless);
+        UpdateGaplessNext();   // the next track's stream follows the new quality
         SetStatus(L"Playback settings saved; they apply from the next track or seek.");
     }
     if (st.displayChanged && (st.showFavorites != g_app.showFavorites || st.showRatings != g_app.showRatings)) {
@@ -3043,6 +4320,28 @@ static void ShowSettings()
         WritePrivateProfileStringW(L"View", L"ShowFavorites", g_app.showFavorites ? L"1" : L"0", ini);
         WritePrivateProfileStringW(L"View", L"ShowRatings", g_app.showRatings ? L"1" : L"0", ini);
         ApplyDisplay();
+    }
+    if (st.displayChanged && (st.trayIcon != g_app.trayIcon || st.trayMinimize != g_app.trayMinimize)) {
+        g_app.trayIcon = st.trayIcon;
+        g_app.trayMinimize = st.trayMinimize;
+        const wchar_t* ini = g_app.iniPath.c_str();
+        WritePrivateProfileStringW(L"View", L"TrayIcon", g_app.trayIcon ? L"1" : L"0", ini);
+        WritePrivateProfileStringW(L"View", L"MinimizeToTray", g_app.trayMinimize ? L"1" : L"0", ini);
+        if (g_app.trayIcon)
+            TrayAdd();
+        else
+            TrayRemove();
+    }
+    if (st.displayChanged && st.mediaKeys != g_app.mediaKeysGlobal) {
+        g_app.mediaKeysGlobal = st.mediaKeys;
+        WritePrivateProfileStringW(L"Player", L"GlobalMediaKeys", g_app.mediaKeysGlobal ? L"1" : L"0",
+                                   g_app.iniPath.c_str());
+        RegisterMediaKeys(g_app.mediaKeysGlobal);
+    }
+    if (st.displayChanged && st.lastfmInfo != g_app.lastfmInfo) {
+        g_app.lastfmInfo = st.lastfmInfo;
+        WritePrivateProfileStringW(L"View", L"LastFmInfo", g_app.lastfmInfo ? L"1" : L"0", g_app.iniPath.c_str());
+        RefreshShownInfo();
     }
     if (st.serverChanged)
         DoConnect();
@@ -3082,6 +4381,7 @@ static void OnCreate(HWND hwnd)
     g_app.treeArtists = TreeAdd(g_app.treeLibrary, L"Artists", TREE_ARTISTS, false);
     g_app.treeSongs = TreeAdd(g_app.treeLibrary, L"Songs", TREE_SONGS, false);
     g_app.treeFavorites = TreeAdd(g_app.treeLibrary, L"Favorites", TREE_FAVORITES, false);
+    g_app.treeQueue = TreeAdd(g_app.treeLibrary, L"Play Queue", TREE_QUEUE, false);
     g_app.treePlaylists = TreeAdd(TVI_ROOT, L"PLAYLISTS", TREE_PLAYLISTS, true);
     TreeView_Expand(g_app.tree, g_app.treeLibrary, TVE_EXPAND);
     g_app.treeUpdating = false;
@@ -3115,10 +4415,13 @@ static void OnCreate(HWND hwnd)
     AddColumn(g_app.songs, COL_ALBUM, L"Album", 170, LVCFMT_LEFT);
 
     // Transport bar.
+    g_app.btnPrev = MakeChild(hwnd, L"BUTTON", L"Previous", WS_TABSTOP | BS_OWNERDRAW, IDC_PREV);
     g_app.btnPlay = MakeChild(hwnd, L"BUTTON", L"Play", WS_TABSTOP | BS_OWNERDRAW, IDC_PLAY);
     g_app.btnPause = MakeChild(hwnd, L"BUTTON", L"Pause", WS_TABSTOP | BS_OWNERDRAW, IDC_PAUSE);
     g_app.btnStop = MakeChild(hwnd, L"BUTTON", L"Stop", WS_TABSTOP | BS_OWNERDRAW, IDC_STOP);
+    g_app.btnNext = MakeChild(hwnd, L"BUTTON", L"Next", WS_TABSTOP | BS_OWNERDRAW, IDC_NEXT);
     g_app.btnShuffle = MakeChild(hwnd, L"BUTTON", L"Shuffle", WS_TABSTOP | BS_OWNERDRAW, IDC_SHUFFLE);
+    g_app.btnRepeat = MakeChild(hwnd, L"BUTTON", L"Repeat", WS_TABSTOP | BS_OWNERDRAW, IDC_REPEAT);
     g_app.timeCur = MakeChild(hwnd, L"STATIC", L"0:00", SS_RIGHT, IDC_TIME_CUR);
     g_app.seek = MakeChild(hwnd, TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_BOTH, IDC_SEEK);
     SendMessageW(g_app.seek, TBM_SETPAGESIZE, 0, 10);
@@ -3130,12 +4433,25 @@ static void OnCreate(HWND hwnd)
     g_app.player.SetVolume((int)GetPrivateProfileIntW(L"Player", L"Volume", 100, g_app.iniPath.c_str()));
     SendMessageW(g_app.volume, TBM_SETPOS, TRUE, g_app.player.Volume());
     g_app.shuffle = GetPrivateProfileIntW(L"Player", L"Shuffle", 0, g_app.iniPath.c_str()) != 0;
+    g_app.repeat = (int)GetPrivateProfileIntW(L"Player", L"Repeat", REPEAT_OFF, g_app.iniPath.c_str());
+    if (g_app.repeat < REPEAT_OFF || g_app.repeat > REPEAT_ONE)
+        g_app.repeat = REPEAT_OFF;
+    g_app.songSortCol = g_app.albumSortCol = g_app.artistSortCol = -1;
+    g_app.headerArrows = CommonControls6();
+    g_app.mediaKeysGlobal = GetPrivateProfileIntW(L"Player", L"GlobalMediaKeys", 1, g_app.iniPath.c_str()) != 0;
+    RegisterMediaKeys(g_app.mediaKeysGlobal);
+    g_app.lastfmInfo = GetPrivateProfileIntW(L"View", L"LastFmInfo", 0, g_app.iniPath.c_str()) != 0;
     PlaybackSettings pb;
     PlaybackLoad(g_app.iniPath, pb);
     ApplyPlayback(pb);
     g_app.showFavorites = GetPrivateProfileIntW(L"View", L"ShowFavorites", 1, g_app.iniPath.c_str()) != 0;
     g_app.showRatings = GetPrivateProfileIntW(L"View", L"ShowRatings", 1, g_app.iniPath.c_str()) != 0;
     ApplyDisplay();
+    g_app.trayIcon = GetPrivateProfileIntW(L"View", L"TrayIcon", 1, g_app.iniPath.c_str()) != 0;
+    g_app.trayMinimize = GetPrivateProfileIntW(L"View", L"MinimizeToTray", 0, g_app.iniPath.c_str()) != 0;
+    g_app.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+    if (g_app.trayIcon)
+        TrayAdd();
 
     g_app.status = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
                                    0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_STATUS, GetModuleHandleW(NULL), NULL);
@@ -3143,10 +4459,13 @@ static void OnCreate(HWND hwnd)
     g_app.tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP,
                                     CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
                                     hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    AddTooltip(g_app.btnPrev, L"Previous (Ctrl+B)");
     AddTooltip(g_app.btnPlay, L"Play");
     AddTooltip(g_app.btnPause, L"Pause / Resume");
-    AddTooltip(g_app.btnStop, L"Stop");
-    AddTooltip(g_app.btnShuffle, L"Shuffle");
+    AddTooltip(g_app.btnStop, L"Stop (Ctrl+S)");
+    AddTooltip(g_app.btnNext, L"Next (Ctrl+N)");
+    AddTooltip(g_app.btnShuffle, L"Shuffle (Ctrl+H)");
+    AddTooltip(g_app.btnRepeat, L"Repeat: off, all, one (Ctrl+T)");
     AddTooltip(g_app.volume, L"Volume");
 
     SetView(VIEW_ALBUMS);
@@ -3196,7 +4515,11 @@ static LRESULT OnNotify(NMHDR* nm)
             OnSongsDispInfo((NMLVDISPINFOW*)nm);
             return 0;
         }
-        if (nm->code == NM_CLICK)
+        if (nm->code == LVN_COLUMNCLICK)
+            OnSongsColumnClick(((NMLISTVIEW*)nm)->iSubItem);
+        else if (nm->code == LVN_BEGINDRAG)
+            DragBegin(((NMLISTVIEW*)nm)->iItem);
+        else if (nm->code == NM_CLICK)
             OnSongsClick((NMITEMACTIVATE*)nm);
         else if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
             PlayFromSongList(SelectedIndex(g_app.songs));
@@ -3205,10 +4528,19 @@ static LRESULT OnNotify(NMHDR* nm)
         else if (nm->code == LVN_KEYDOWN) {
             WORD vk = ((NMLVKEYDOWN*)nm)->wVKey;
             int i = SelectedIndex(g_app.songs);
-            if (g_app.showRatings && vk >= '0' && vk <= '5')
+            if (g_app.dragging) {
+                if (vk == VK_ESCAPE)
+                    DragEnd(false);
+            } else if (g_app.showRatings && vk >= '0' && vk <= '5')
                 SetSongRating(i, vk - '0');
             else if (g_app.showRatings && vk >= VK_NUMPAD0 && vk <= VK_NUMPAD5)
                 SetSongRating(i, vk - VK_NUMPAD0);
+            else if (vk == VK_SPACE)
+                PlayPause();
+            else if (vk == VK_DELETE && g_app.songSource == SRC_QUEUE)
+                RemoveFromQueue(i);
+            else if (vk == VK_DELETE && g_app.songSource == SRC_PLAYLIST && SongsSorted())
+                SetStatus(L"The playlist is sorted: click # to restore its order, then remove the track.");
             else if (vk == VK_DELETE)
                 RemoveFromPlaylist(i);
             else if (vk == VK_BACK)
@@ -3217,14 +4549,18 @@ static LRESULT OnNotify(NMHDR* nm)
         break;
 
     case IDC_ALBUMS:
-        if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
+        if (nm->code == LVN_COLUMNCLICK)
+            OnAlbumsColumnClick(((NMLISTVIEW*)nm)->iSubItem);
+        else if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
             OpenSelectedAlbum();
         else if (nm->code == LVN_KEYDOWN && ((NMLVKEYDOWN*)nm)->wVKey == VK_BACK)
             GoBack();
         break;
 
     case IDC_ARTISTS:
-        if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
+        if (nm->code == LVN_COLUMNCLICK)
+            OnArtistsColumnClick(((NMLISTVIEW*)nm)->iSubItem);
+        else if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
             OpenSelectedArtist();
         break;
 
@@ -3240,6 +4576,8 @@ static LRESULT OnNotify(NMHDR* nm)
                 ShowSongsView();
             else if (data == TREE_FAVORITES)
                 ShowFavoritesView();
+            else if (data == TREE_QUEUE)
+                ShowQueueView();
             else if (data >= 0)
                 OpenPlaylist((int)data);
         } else if (nm->code == TVN_ITEMEXPANDINGW) {
@@ -3298,21 +4636,44 @@ static void OnCommand(int id)
     case IDM_FAVORITES:
         ShowFavoritesView();
         break;
+    case IDM_QUEUE:
+        ShowQueueView();
+        break;
+    case IDM_SHOW:
+        TrayRestore();
+        break;
+    case IDM_PLAYPAUSE:
+        PlayPause();
+        break;
+    case IDC_REPEAT:
+    case IDM_REPEAT_CYCLE:
+        SetRepeat((g_app.repeat + 1) % 3);
+        break;
+    case IDM_REPEAT_OFF:
+    case IDM_REPEAT_ALL:
+    case IDM_REPEAT_ONE:
+        SetRepeat(id - IDM_REPEAT_OFF);
+        break;
     case IDM_FIND:
         FocusSearch();
         break;
     case IDM_MINI:
         ToggleMini();
         break;
+    case IDC_PREV:
     case IDM_PREV:
         PlayPrevious();
         break;
+    case IDC_NEXT:
     case IDM_NEXT:
         PlayNext();
         break;
     case IDC_NEW_PLAYLIST:
     case IDM_NEW_PLAYLIST:
         NewPlaylist(std::vector<std::string>(), std::string(), L"New playlist");
+        break;
+    case IDM_EDIT_PLAYLIST:
+        EditShownPlaylist();
         break;
     case IDM_ABOUT: {
         std::wstring about = L"Navi2K Player " APP_VERSION L"\r\nNavidrome client for Windows 2000 / XP\r\n\r\n";
@@ -3322,6 +4683,36 @@ static void OnCommand(int id)
         break;
     }
     }
+}
+
+// Media keys (and keyboard/remote media buttons) while the player is focused. True if handled.
+static bool OnAppCommand(int cmd)
+{
+    switch (cmd) {
+    case APPCOMMAND_MEDIA_PLAY_PAUSE: PlayPause(); break;
+    case APPCOMMAND_MEDIA_PLAY:
+        if (!g_app.player.IsActive() || g_app.player.IsPaused())
+            PlayPause();
+        break;
+    case APPCOMMAND_MEDIA_PAUSE:
+        if (g_app.player.IsActive() && !g_app.player.IsPaused())
+            DoPause();
+        break;
+    case APPCOMMAND_MEDIA_STOP:           StopPlayback(); break;
+    case APPCOMMAND_MEDIA_PREVIOUSTRACK:  PlayPrevious(); break;
+    case APPCOMMAND_MEDIA_NEXTTRACK:      PlayNext(); break;
+    default:
+        return false;
+    }
+    RefreshTransport();
+    return true;
+}
+
+// Playback shortcuts work in the mini player as they are; the rest switch to the main window.
+static bool IsPlaybackCommand(int id)
+{
+    return id == IDM_PLAYPAUSE || id == IDM_STOP || id == IDM_PREV || id == IDM_NEXT || id == IDM_SHUFFLE ||
+           (id >= IDM_REPEAT_OFF && id <= IDM_REPEAT_CYCLE);
 }
 
 // --- Mini player ------------------------------------------------------------------------
@@ -3434,7 +4825,8 @@ static LRESULT CALLBACK MiniWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
         default:
             // Other shortcuts (F5, Ctrl+F) belong to the main window.
-            ToggleMini();
+            if (!IsPlaybackCommand(id))
+                ToggleMini();
             OnCommand(id);
             break;
         }
@@ -3442,8 +4834,18 @@ static LRESULT CALLBACK MiniWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_APPCOMMAND:
+        if (OnAppCommand(GET_APPCOMMAND_LPARAM(lp)))
+            return TRUE;
+        break;
+
     case WM_CLOSE:
         ToggleMini();   // closing the mini player goes back to the full window
+        return 0;
+
+    case WM_SIZE:
+        if (wp == SIZE_MINIMIZED)
+            TrayMinimize(hwnd);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -3577,7 +4979,59 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_SIZE:
+        if (wp == SIZE_MINIMIZED && TrayMinimize(hwnd))
+            return 0;
         Layout(hwnd);
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (g_app.dragging) {
+            POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+            MapWindowPoints(hwnd, g_app.songs, &pt, 1);
+            DragUpdate(pt);
+        }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        if (g_app.dragging && (HWND)lp != hwnd)
+            DragEnd(false);
+        return 0;
+
+    case WM_LBUTTONUP: {
+        POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+        if (g_app.dragging) {
+            MapWindowPoints(hwnd, g_app.songs, &pt, 1);
+            DragUpdate(pt);
+            DragEnd(true);
+            return 0;
+        }
+        if (g_app.noteCut && g_app.shown.has && PtInRect(&g_app.noteRect, pt)) {
+            std::wstring text = g_app.shown.note;
+            for (size_t at = text.find(L'\n'); at != std::wstring::npos; at = text.find(L'\n', at + 2))
+                text.replace(at, 1, L"\r\n");
+            MessageBoxW(hwnd, text.c_str(), g_app.shown.title.c_str(), MB_OK);
+        }
+        return 0;
+    }
+
+    case WM_SETCURSOR:
+        if ((HWND)wp == hwnd && LOWORD(lp) == HTCLIENT && g_app.noteCut) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            if (PtInRect(&g_app.noteRect, pt)) {
+                SetCursor(LoadCursor(NULL, IDC_HAND));
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_APP_TRAY:
+        // Left click: bring the player back (or to the front). Right click: controls.
+        if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK)
+            TrayRestore();
+        else if (lp == WM_RBUTTONUP)
+            TrayContextMenu();
         return 0;
 
     case WM_GETMINMAXINFO: {
@@ -3608,6 +5062,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             UpdatePosition();
         else if (wp == TIMER_SEARCH)
             ApplySearch();
+        else if (wp == TIMER_DRAGSCROLL)
+            DragScroll();
         return 0;
 
     case WM_CONTEXTMENU:
@@ -3643,14 +5099,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         RefreshTransport();
         return 0;
 
+    case WM_HOTKEY:
+        switch ((int)wp) {
+        case HOTKEY_PLAYPAUSE: PlayPause(); break;
+        case HOTKEY_STOP:      StopPlayback(); break;
+        case HOTKEY_PREV:      PlayPrevious(); break;
+        case HOTKEY_NEXT:      PlayNext(); break;
+        }
+        RefreshTransport();
+        return 0;
+
+    case WM_APPCOMMAND:
+        if (OnAppCommand(GET_APPCOMMAND_LPARAM(lp)))
+            return TRUE;
+        break;
+
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_POSITION);
+        RegisterMediaKeys(false);
+        TrayRemove();
         g_app.player.Stop();
         ClearArtCache();
         DeleteObject(g_app.fontBold);
         DeleteObject(g_app.fontTitle);
         DeleteObject(g_app.latchBrush);
         PostQuitMessage(0);
+        return 0;
+    }
+    if (msg == g_app.taskbarCreatedMsg && msg != 0) {
+        // Explorer restarted and lost the icon.
+        g_app.trayAdded = false;
+        if (g_app.trayIcon)
+            TrayAdd();
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -3721,6 +5201,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show)
         { FVIRTKEY, VK_F5, IDM_CONNECT },
         { FVIRTKEY | FCONTROL, 'F', IDM_FIND },
         { FVIRTKEY | FCONTROL, 'M', IDM_MINI },
+        { FVIRTKEY | FCONTROL, 'Q', IDM_QUEUE },
+        { FVIRTKEY | FCONTROL, 'P', IDM_PLAYPAUSE },
+        { FVIRTKEY | FCONTROL, 'S', IDM_STOP },
+        { FVIRTKEY | FCONTROL, 'B', IDM_PREV },
+        { FVIRTKEY | FCONTROL, 'N', IDM_NEXT },
+        { FVIRTKEY | FCONTROL, 'H', IDM_SHUFFLE },
+        { FVIRTKEY | FCONTROL, 'T', IDM_REPEAT_CYCLE },
     };
     HACCEL accelTable = CreateAcceleratorTableW(accel, sizeof(accel) / sizeof(accel[0]));
 

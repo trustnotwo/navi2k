@@ -35,7 +35,9 @@ static void WriteIniTemplate(const std::wstring& ini)
         L"; Replaced by Token/Salt on first connect; the password itself is not kept.\r\n"
         L"Password=\r\n"
         L"; Navidrome transcodes everything to MP3 at this bitrate (kbps).\r\n"
-        L"MaxBitRate=192\r\n";
+        L"MaxBitRate=192\r\n"
+        L"; 1 = play FLAC files as they are (about 1 Mbps); other formats still use MaxBitRate.\r\n"
+        L"Lossless=0\r\n";
     HANDLE f = CreateFileW(ini.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE)
         return;
@@ -82,6 +84,7 @@ void ConfigRead(const std::wstring& ini, SubsonicConfig& cfg)
     cfg.maxBitRate = IniGetInt(ini, L"MaxBitRate", 192);
     if (cfg.maxBitRate < 32 || cfg.maxBitRate > 320)
         cfg.maxBitRate = 192;
+    cfg.lossless = IniGetInt(ini, L"Lossless", 0) != 0;
     cfg.token = WideToUtf8(IniGet(ini, L"Token"));
     cfg.salt = WideToUtf8(IniGet(ini, L"Salt"));
 }
@@ -130,6 +133,7 @@ void PlaybackLoad(const std::wstring& ini, PlaybackSettings& s)
     s.device = buf;
     s.bufferCount = (int)GetPrivateProfileIntW(L"Player", L"Buffers", 12, ini.c_str());
     s.scrobble = GetPrivateProfileIntW(L"Player", L"Scrobble", 1, ini.c_str()) != 0;
+    s.gapless = GetPrivateProfileIntW(L"Player", L"Gapless", 1, ini.c_str()) != 0;
 }
 
 void PlaybackSave(const std::wstring& ini, const PlaybackSettings& s)
@@ -137,4 +141,5 @@ void PlaybackSave(const std::wstring& ini, const PlaybackSettings& s)
     WritePrivateProfileStringW(L"Player", L"OutputDevice", s.device.c_str(), ini.c_str());
     WritePrivateProfileStringW(L"Player", L"Buffers", Fmt(L"%d", s.bufferCount).c_str(), ini.c_str());
     WritePrivateProfileStringW(L"Player", L"Scrobble", s.scrobble ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"Player", L"Gapless", s.gapless ? L"1" : L"0", ini.c_str());
 }
