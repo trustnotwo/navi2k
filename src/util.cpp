@@ -1,4 +1,6 @@
 #include "util.h"
+#include <objbase.h>
+#include <shlobj.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -114,4 +116,26 @@ void LogF(const wchar_t* fmt, ...)
     DWORD written;
     WriteFile(g_logFile, line.data(), (DWORD)line.size(), &written, NULL);
     LeaveCriticalSection(&g_logLock);
+}
+
+bool BrowseForFolder(HWND owner, const wchar_t* title, std::wstring& path)
+{
+    CoInitialize(NULL);
+    BROWSEINFOW bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.hwndOwner = owner;
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS;
+    bool ok = false;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (pidl) {
+        wchar_t buf[MAX_PATH];
+        if (SHGetPathFromIDListW(pidl, buf)) {
+            path = buf;
+            ok = true;
+        }
+        CoTaskMemFree(pidl);
+    }
+    CoUninitialize();
+    return ok;
 }

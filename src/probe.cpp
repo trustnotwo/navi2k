@@ -10,6 +10,13 @@
 //       Fetch the album's cover, save the raw bytes as cover_test.jpg/.png, decode it.
 //   navi2k_probe rate [album=0] [track=0]
 //       Change the track's rating, clear it, then restore the original; verify each via getSong.
+//   navi2k_probe libraries
+//       Read-only: list the libraries, then count albums, artists, songs and favorites with
+//       no filter, with each library alone, and with all of them; checks the server filters.
+//   navi2k_probe libplaylist <0|1>
+//       For testing the player's library filter on playlists. 0: create a throwaway
+//       "Navi2K library test" playlist mixing tracks from the first two libraries that have
+//       albums. 1: print that playlist's order (with each track's library) and delete it.
 //   navi2k_probe playlist [album=0]
 //       Create a throwaway "Navi2K test" playlist and exercise rename/add/remove/reorder and a
 //       150-entry batched replace/create on it, verifying each step; always deletes it. Other
@@ -19,6 +26,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <algorithm>
 #include <stdlib.h>
 #include <string>
 #include <vector>
@@ -377,6 +385,8 @@ static bool StarAndVerify(SubsonicClient& client, const std::string& id, bool st
     return ok;
 }
 
+struct Counts { unsigned albums, artists, songs, favorites; };   // libraries mode
+
 static int ArgInt(int argc, wchar_t** argv, int i, int def)
 {
     return (i < argc) ? _wtoi(argv[i]) : def;
@@ -396,14 +406,17 @@ int main()
         g_seconds = ArgInt(argc, argv, a++, 15);
     else if (mode == L"seek" || mode == L"seek-client")
         seekSec = ArgInt(argc, argv, a++, 60);
+    else if (mode == L"libplaylist")
+        seekSec = ArgInt(argc, argv, a++, -1);   // the step
     else if (mode == L"setrating" || mode == L"setfav")
         seekSec = ArgInt(argc, argv, a++, -1);   // reused as the rating / starred value
     else if (mode == L"flac" || mode == L"flac-norange")
         seekSec = ArgInt(argc, argv, a++, 60);   // where to seek to
     else if (mode != L"art" && mode != L"rate" && mode != L"playlist" && mode != L"info" && mode != L"artists" &&
-             mode != L"songs" && mode != L"favorite" && mode != L"nowplaying") {
+             mode != L"songs" && mode != L"favorite" && mode != L"nowplaying" && mode != L"libraries" &&
+             mode != L"libplaylist") {
         Out(L"usage: navi2k_probe [play [sec] | seek <offsetSec> | seek-client <offsetSec> | art | rate | playlist |"
-            L" info | artists | songs | favorite | setfav <0|1> | nowplaying | flac [seekSec] | flac-norange [seekSec]]"
+            L" info | artists | songs | libraries | libplaylist <0|1> | favorite | setfav <0|1> | nowplaying | flac [seekSec] | flac-norange [seekSec]]"
             L" [album] [track]");
         return 2;
     }
@@ -428,7 +441,7 @@ int main()
         Out(L"CONFIG: " + err);
         return 2;
     }
-    if (!HttpInit(L"Navi2KPlayer/1.1 (probe)")) {
+    if (!HttpInit(L"Navi2KPlayer/1.2 (probe)")) {
         Out(L"WinINet init failed");
         return 2;
     }
@@ -452,6 +465,179 @@ int main()
     const SubsonicAlbum& album = albums[albumIndex];
     Out(Fmt(L"Connected to %ls: %u albums. Album [%d] %ls - %ls", cfg.url.c_str(),
             (unsigned)albums.size(), albumIndex, album.artist.c_str(), album.name.c_str()));
+
+    // --- libraries (read-only) ---
+    if (mode == L"libraries") {
+        std::vector<SubsonicLibrary> libs;
+        if (!client.GetLibraries(libs, err)) {
+            Out(L"getMusicFolders FAILED: " + err);
+            return 1;
+        }
+        Out(Fmt(L"%u libraries:", (unsigned)libs.size()));
+        for (size_t i = 0; i < libs.size(); ++i)
+            Out(Fmt(L"  id %hs: %ls", libs[i].id.c_str(), libs[i].name.c_str()));
+
+        std::vector<std::vector<std::string> > filters;
+        std::vector<std::wstring> labels;
+        filters.push_back(std::vector<std::string>());
+        labels.push_back(L"no filter");
+        std::vector<std::string> all;
+        for (size_t i = 0; i < libs.size(); ++i) {
+            filters.push_back(std::vector<std::string>(1, libs[i].id));
+            labels.push_back(L"only " + libs[i].name);
+            all.push_back(libs[i].id);
+        }
+        if (libs.size() > 1) {
+            filters.push_back(all);
+            labels.push_back(L"all, listed");
+        }
+        std::vector<Counts> counts;
+        for (size_t f = 0; f < filters.size(); ++f) {
+            client.SetLibraries(filters[f]);
+            std::vector<SubsonicAlbum> al;
+            std::vector<SubsonicArtist> ar;
+            std::vector<SubsonicSong> so, fav;
+            DWORD t0 = GetTickCount();
+            if (!client.GetAlbumList(al, err) || !client.GetArtists(ar, err) || !client.GetAllSongs(so, err) ||
+                !client.GetStarredSongs(fav, err)) {
+                Out(labels[f] + L": FAILED: " + err);
+                return 1;
+            }
+            Counts c = { (unsigned)al.size(), (unsigned)ar.size(), (unsigned)so.size(), (unsigned)fav.size() };
+            counts.push_back(c);
+            unsigned withAlbums = 0;
+            for (size_t i = 0; i < ar.size(); ++i)
+                withAlbums += ar[i].albumCount > 0 ? 1 : 0;
+            Out(Fmt(L"%-24ls %6u albums %5u artists (%u with albums) %7u songs %5u favorites (%lu ms)",
+                    labels[f].c_str(), c.albums, c.artists, withAlbums, c.songs, c.favorites, GetTickCount() - t0));
+        }
+        client.SetLibraries(std::vector<std::string>());
+        bool ok = true;
+        if (libs.size() > 1) {
+            // Each library alone must show less than everything, and listing them all must
+            // match no filter (otherwise the server ignores or mishandles the parameter).
+            unsigned albumSum = 0;
+            for (size_t i = 1; i <= libs.size(); ++i) {
+                albumSum += counts[i].albums;
+                if (counts[i].albums >= counts[0].albums) {
+                    Out(L"Filter ignored for " + labels[i]);
+                    ok = false;
+                }
+            }
+            const Counts& a = counts.back();
+            if (a.albums != counts[0].albums || a.songs != counts[0].songs || a.favorites != counts[0].favorites) {
+                Out(L"Listing every library does not match no filter.");
+                ok = false;
+            }
+            if (albumSum != counts[0].albums)
+                Out(Fmt(L"Note: albums per library add up to %u (some albums span libraries?)", albumSum));
+        } else {
+            Out(L"Only one library: nothing to filter (the player hides the setting).");
+        }
+        Out(ok ? L"RESULT: PASS" : L"RESULT: FAIL");
+        return ok ? 0 : 1;
+    }
+
+    // --- libplaylist: a throwaway playlist mixing two libraries ---
+    if (mode == L"libplaylist") {
+        static const wchar_t kName[] = L"Navi2K library test";
+        std::vector<SubsonicLibrary> libs;
+        if (!client.GetLibraries(libs, err)) {
+            Out(L"getMusicFolders FAILED: " + err);
+            return 1;
+        }
+        // Up to three tracks from each of the first two libraries with albums, and every
+        // album id per library (to label tracks).
+        std::vector<std::vector<SubsonicSong> > picks;
+        std::vector<std::wstring> names;
+        std::vector<std::vector<std::string> > albumIds;
+        for (size_t l = 0; l < libs.size() && picks.size() < 2; ++l) {
+            client.SetLibraries(std::vector<std::string>(1, libs[l].id));
+            std::vector<SubsonicAlbum> al;
+            if (!client.GetAlbumList(al, err) || al.empty())
+                continue;
+            std::vector<std::string> ids;
+            for (size_t i = 0; i < al.size(); ++i)
+                ids.push_back(al[i].id);
+            std::vector<SubsonicSong> songs, tracks;
+            for (size_t i = 0; i < al.size() && songs.size() < 3; ++i)
+                if (client.GetAlbum(al[i].id, tracks, err) && !tracks.empty())
+                    songs.push_back(tracks[0]);
+            picks.push_back(songs);
+            names.push_back(libs[l].name);
+            albumIds.push_back(ids);
+        }
+        client.SetLibraries(std::vector<std::string>());
+        if (picks.size() < 2) {
+            Out(L"Needs two libraries with albums.");
+            return 1;
+        }
+
+        std::vector<SubsonicPlaylist> pls;
+        if (!client.GetPlaylists(pls, err)) {
+            Out(L"getPlaylists FAILED: " + err);
+            return 1;
+        }
+        std::string existing;
+        for (size_t i = 0; i < pls.size(); ++i)
+            if (pls[i].name == kName)
+                existing = pls[i].id;
+
+        if (seekSec == 0) {
+            if (!existing.empty()) {
+                Out(L"A \"Navi2K library test\" playlist already exists; run step 1 first.");
+                return 1;
+            }
+            // A1 B1 A2 B2 A3 (A = first library, B = second).
+            std::vector<std::string> ids;
+            const std::vector<SubsonicSong>& a = picks[0];
+            const std::vector<SubsonicSong>& b = picks[1];
+            for (size_t i = 0; i < 3; ++i) {
+                if (i < a.size())
+                    ids.push_back(a[i].id);
+                if (i < b.size() && i < 2)
+                    ids.push_back(b[i].id);
+            }
+            std::string newId;
+            if (!client.CreatePlaylist(kName, ids, &newId, err)) {
+                Out(L"createPlaylist FAILED: " + err);
+                return 1;
+            }
+            Out(Fmt(L"Created \"%ls\" with %u tracks.", kName, (unsigned)ids.size()));
+        } else if (existing.empty()) {
+            Out(L"No \"Navi2K library test\" playlist.");
+            return 1;
+        }
+        std::string id = existing;
+        if (id.empty()) {
+            if (!client.GetPlaylists(pls, err))
+                return 1;
+            for (size_t i = 0; i < pls.size(); ++i)
+                if (pls[i].name == kName)
+                    id = pls[i].id;
+        }
+        std::vector<SubsonicSong> tracks;
+        if (!client.GetPlaylist(id, tracks, err)) {
+            Out(L"getPlaylist FAILED: " + err);
+            return 1;
+        }
+        for (size_t i = 0; i < tracks.size(); ++i) {
+            std::wstring lib = L"?";
+            for (size_t l = 0; l < albumIds.size(); ++l)
+                if (std::find(albumIds[l].begin(), albumIds[l].end(), tracks[i].albumId) != albumIds[l].end())
+                    lib = names[l];
+            Out(Fmt(L"  %u. [%ls] %ls - %ls", (unsigned)i + 1, lib.c_str(), tracks[i].artist.c_str(),
+                    tracks[i].title.c_str()));
+        }
+        if (seekSec == 1) {
+            if (!client.DeletePlaylist(id, err)) {
+                Out(L"deletePlaylist FAILED: " + err);
+                return 1;
+            }
+            Out(L"Deleted the test playlist.");
+        }
+        return 0;
+    }
 
     // --- songs (read-only): the whole library via search3 ---
     if (mode == L"songs") {

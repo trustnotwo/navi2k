@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2
+
+- **Offline listening**: right-click a track, album, or playlist and choose **Download for offline**. **Library > Downloads** lists what's saved. If the server can't be reached, the player opens with your downloads (downloaded playlists included), and plays heard offline are sent to Navidrome when it next connects. **File > Settings > Downloads** sets the folder, the download quality, and whether to play downloaded copies instead of streaming. Downloads from a different server still play from disk.
+- **Libraries**: if your server has more than one library, choose which ones to show under **File > Settings > Libraries**. Playlists show only those tracks too.
+- **Discover**: Recently Added, Recently Played, Most Played, and Random Albums lists.
+- **Select several tracks** (Ctrl-click, Shift-click, Ctrl+A) to play, queue, add to a playlist, download, or remove them together.
+- **File > Settings > Sidebar** chooses which sections show under Library. The Discover lists start hidden.
+
 ## 1.1
 
 - Lossless playback: choose **Lossless** under File > Settings > Playback > Quality to stream FLAC files untouched. Seeking uses HTTP range requests. Other formats, and hi-res or multichannel FLAC, still play as 320 kbps MP3.

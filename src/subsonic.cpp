@@ -93,6 +93,7 @@ static SubsonicSong ParseSong(cJSON* s)
     song.title = JStr(s, "title");
     song.artist = JStr(s, "artist");
     song.album = JStr(s, "album");
+    song.albumArtist = JStr(s, "displayAlbumArtist");
     song.albumId = JId(s, "albumId");
     song.artistId = JId(s, "artistId");
     song.suffix = JStr(s, "suffix");
@@ -116,6 +117,15 @@ static SubsonicAlbum ParseAlbum(cJSON* a)
     al.coverArt = JId(a, "coverArt");
     al.name = JStr(a, "name");
     al.artist = JStr(a, "artist");
+    std::string artistId = JId(a, "artistId");
+    if (!artistId.empty())
+        al.artistIds.push_back(artistId);
+    cJSON* ar;
+    cJSON_ArrayForEach(ar, JGet(a, "artists")) {
+        std::string id = JId(ar, "id");
+        if (!id.empty() && id != artistId)
+            al.artistIds.push_back(id);
+    }
     al.year = JInt(a, "year");
     al.songCount = JInt(a, "songCount");
     return al;
@@ -248,6 +258,35 @@ bool SubsonicClient::Connect(std::wstring& notice)
     return false;
 }
 
+// --- Libraries ----------------------------------------------------------------------
+
+bool SubsonicClient::GetLibraries(std::vector<SubsonicLibrary>& out, std::wstring& err)
+{
+    out.clear();
+    cJSON *root, *sr;
+    if (!Call("getMusicFolders", "", &root, &sr, NULL, err))
+        return false;
+    cJSON* f;
+    cJSON_ArrayForEach(f, JGet(JGet(sr, "musicFolders"), "musicFolder")) {
+        SubsonicLibrary lib;
+        lib.id = JId(f, "id");
+        lib.name = JStr(f, "name");
+        if (!lib.id.empty())
+            out.push_back(lib);
+    }
+    cJSON_Delete(root);
+    return true;
+}
+
+// Navidrome takes the parameter more than once to mean "any of these libraries".
+std::string SubsonicClient::LibraryParams() const
+{
+    std::string q;
+    for (size_t i = 0; i < m_cfg.libraries.size(); ++i)
+        q += "&musicFolderId=" + UrlEncode(m_cfg.libraries[i]);
+    return q;
+}
+
 bool SubsonicClient::GetAlbumList(std::vector<SubsonicAlbum>& out, std::wstring& err)
 {
     static const int kPage = 500;   // Subsonic maximum
@@ -258,7 +297,7 @@ bool SubsonicClient::GetAlbumList(std::vector<SubsonicAlbum>& out, std::wstring&
         extra[sizeof(extra) - 1] = 0;
 
         cJSON *root, *sr;
-        if (!Call("getAlbumList2", extra, &root, &sr, NULL, err))
+        if (!Call("getAlbumList2", extra + LibraryParams(), &root, &sr, NULL, err))
             return false;
 
         int n = 0;
@@ -271,6 +310,22 @@ bool SubsonicClient::GetAlbumList(std::vector<SubsonicAlbum>& out, std::wstring&
         if (n < kPage)
             break;
     }
+    return true;
+}
+
+bool SubsonicClient::GetAlbumListOf(const char* type, int size, std::vector<SubsonicAlbum>& out, std::wstring& err)
+{
+    out.clear();
+    char extra[96];
+    _snprintf(extra, sizeof(extra) - 1, "&type=%s&size=%d&offset=0", type, size);
+    extra[sizeof(extra) - 1] = 0;
+    cJSON *root, *sr;
+    if (!Call("getAlbumList2", extra + LibraryParams(), &root, &sr, NULL, err))
+        return false;
+    cJSON* a;
+    cJSON_ArrayForEach(a, JGet(JGet(sr, "albumList2"), "album"))
+        out.push_back(ParseAlbum(a));
+    cJSON_Delete(root);
     return true;
 }
 
@@ -326,7 +381,7 @@ bool SubsonicClient::GetAllSongs(std::vector<SubsonicSong>& out, std::wstring& e
                   kPage, offset);
         extra[sizeof(extra) - 1] = 0;
         cJSON *root, *sr;
-        if (!Call("search3", extra, &root, &sr, NULL, err))
+        if (!Call("search3", extra + LibraryParams(), &root, &sr, NULL, err))
             return false;
         int n = 0;
         cJSON* s;
@@ -348,7 +403,7 @@ bool SubsonicClient::GetArtists(std::vector<SubsonicArtist>& out, std::wstring& 
 {
     out.clear();
     cJSON *root, *sr;
-    if (!Call("getArtists", "", &root, &sr, NULL, err))
+    if (!Call("getArtists", LibraryParams(), &root, &sr, NULL, err))
         return false;
     // { "artists": { "index": [ { "name": "A", "artist": [ ... ] }, ... ] } }
     cJSON* index;
@@ -418,7 +473,7 @@ bool SubsonicClient::GetStarredSongs(std::vector<SubsonicSong>& out, std::wstrin
 {
     out.clear();
     cJSON *root, *sr;
-    if (!Call("getStarred2", "", &root, &sr, NULL, err))
+    if (!Call("getStarred2", LibraryParams(), &root, &sr, NULL, err))
         return false;
     cJSON* s;
     cJSON_ArrayForEach(s, JGet(JGet(sr, "starred2"), "song"))
@@ -429,10 +484,17 @@ bool SubsonicClient::GetStarredSongs(std::vector<SubsonicSong>& out, std::wstrin
 
 // --- Scrobbling ---------------------------------------------------------------------
 
-bool SubsonicClient::Scrobble(const std::string& songId, bool submission, std::wstring& err)
+bool SubsonicClient::Scrobble(const std::string& songId, bool submission, std::wstring& err,
+                              unsigned long long timeMs)
 {
-    return CallNoResult("scrobble",
-                        "&id=" + UrlEncode(songId) + (submission ? "&submission=true" : "&submission=false"), err);
+    std::string q = "&id=" + UrlEncode(songId) + (submission ? "&submission=true" : "&submission=false");
+    if (timeMs) {
+        char t[40];
+        _snprintf(t, sizeof(t) - 1, "&time=%I64u", timeMs);
+        t[sizeof(t) - 1] = 0;
+        q += t;
+    }
+    return CallNoResult("scrobble", q, err);
 }
 
 bool SubsonicClient::GetNowPlayingIds(std::vector<std::string>& ids, std::wstring& err)
@@ -700,10 +762,10 @@ bool SubsonicClient::CanEdit(const SubsonicPlaylist& pl) const
     return !pl.readOnly && WideToUtf8(pl.owner) == m_cfg.user;
 }
 
-std::wstring SubsonicClient::StreamUrl(const std::string& songId, int timeOffsetSec) const
+std::wstring SubsonicClient::StreamUrl(const std::string& songId, int timeOffsetSec, int maxBitRate) const
 {
     char extra[96];
-    _snprintf(extra, sizeof(extra) - 1, "&format=mp3&maxBitRate=%d", m_cfg.maxBitRate);
+    _snprintf(extra, sizeof(extra) - 1, "&format=mp3&maxBitRate=%d", maxBitRate > 0 ? maxBitRate : m_cfg.maxBitRate);
     extra[sizeof(extra) - 1] = 0;
     std::string q = "&id=" + UrlEncode(songId) + extra;
     if (timeOffsetSec > 0) {
@@ -715,10 +777,15 @@ std::wstring SubsonicClient::StreamUrl(const std::string& songId, int timeOffset
 
 bool SubsonicClient::StreamsLossless(const SubsonicSong& song) const
 {
+    return m_cfg.lossless && CanPlayFlac(song);
+}
+
+bool SubsonicClient::CanPlayFlac(const SubsonicSong& song) const
+{
     // Hi-res and multichannel files would need resampling or downmixing, which old sound
     // cards and CPUs can't take; Navidrome's MP3 transcode handles those instead.
-    return m_cfg.lossless && _wcsicmp(song.suffix.c_str(), L"flac") == 0 && song.samplingRate <= 48000 &&
-           song.channelCount <= 2 && song.bitDepth <= 24;
+    return _wcsicmp(song.suffix.c_str(), L"flac") == 0 && song.samplingRate <= 48000 && song.channelCount <= 2 &&
+           song.bitDepth <= 24;
 }
 
 std::wstring SubsonicClient::OriginalUrl(const std::string& songId) const
@@ -730,6 +797,14 @@ bool SubsonicClient::ServerTranscodes(const SubsonicSong& song) const
 {
     bool mp3 = _wcsicmp(song.suffix.c_str(), L"mp3") == 0;
     return !(mp3 && song.bitRate > 0 && song.bitRate <= m_cfg.maxBitRate);
+}
+
+std::wstring SubsonicClient::CoverArtUrl(const std::string& coverArtId, int size) const
+{
+    char extra[32];
+    _snprintf(extra, sizeof(extra) - 1, "&size=%d", size);
+    extra[sizeof(extra) - 1] = 0;
+    return BuildUrl("getCoverArt", "&id=" + UrlEncode(coverArtId) + extra);
 }
 
 bool SubsonicClient::GetCoverArt(const std::string& coverArtId, int size, std::string& bytes, std::wstring& err)

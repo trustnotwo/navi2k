@@ -17,6 +17,7 @@ struct SubsonicConfig {
     std::string salt;
     int maxBitRate;              // kbps for server-side MP3 transcoding
     bool lossless;               // stream FLAC originals untouched (others still as MP3)
+    std::vector<std::string> libraries;   // music folder ids to show; empty = all of them
     SubsonicConfig() : allowHttpFallback(false), allowUntrustedCert(false), maxBitRate(192), lossless(false) {}
 };
 
@@ -24,6 +25,7 @@ struct SubsonicAlbum {
     std::string id;
     std::string coverArt;        // id for getCoverArt; empty if the album has none
     std::wstring name, artist;
+    std::vector<std::string> artistIds;   // album artist ids (artistId plus OpenSubsonic "artists")
     int year, songCount;
 };
 
@@ -32,6 +34,7 @@ struct SubsonicSong {
     std::string coverArt;           // the track's album cover, for the now-playing panel
     std::string albumId, artistId;  // for Go to album / Go to artist; may be empty
     std::wstring title, artist, album, suffix;
+    std::wstring albumArtist;       // OpenSubsonic displayAlbumArtist; may be empty
     int track, disc, duration, bitRate;   // duration in s, bitRate in kbps (0 = unknown)
     int bitDepth, samplingRate, channelCount;   // of the original file; 0 = not reported
     int userRating;                 // 0 = unrated, 1..5
@@ -43,6 +46,11 @@ struct SubsonicArtist {
     std::string coverArt;        // artist image id for getCoverArt; may be empty
     std::wstring name;
     int albumCount;
+};
+
+struct SubsonicLibrary {        // a Navidrome library (Subsonic "music folder")
+    std::string id;
+    std::wstring name;
 };
 
 struct SubsonicPlaylist {
@@ -63,12 +71,20 @@ public:
     // Streaming quality for the next track, without reconnecting.
     void SetMaxBitRate(int kbps) { m_cfg.maxBitRate = kbps; }
     void SetLossless(bool on) { m_cfg.lossless = on; }
+    // Limits albums, artists, songs and favorites to these libraries; empty = all.
+    void SetLibraries(const std::vector<std::string>& ids) { m_cfg.libraries = ids; }
+    const std::vector<std::string>& Libraries() const { return m_cfg.libraries; }
+
+    // The libraries this user can see (getMusicFolders).
+    bool GetLibraries(std::vector<SubsonicLibrary>& out, std::wstring& err);
 
     // Pings the primary URL; on a TLS failure, falls back to lanUrl if allowed.
     // On success 'notice' may describe the fallback that was taken.
     bool Connect(std::wstring& notice);
 
     bool GetAlbumList(std::vector<SubsonicAlbum>& out, std::wstring& err);
+    // One page of a getAlbumList2 list: "newest", "recent", "frequent", "random"...
+    bool GetAlbumListOf(const char* type, int size, std::vector<SubsonicAlbum>& out, std::wstring& err);
     bool GetAlbum(const std::string& albumId, std::vector<SubsonicSong>& out, std::wstring& err);
 
     // Every song in the library, via search3 with an empty query, 500 per request.
@@ -81,11 +97,13 @@ public:
 
     // Always asks for MP3: the decoder is libmad only, so Navidrome transcodes FLAC/M4A/OGG.
     // timeOffsetSec starts the transcode partway in (honoured only when the server transcodes).
-    std::wstring StreamUrl(const std::string& songId, int timeOffsetSec = 0) const;
+    // maxBitRate: 0 = the configured streaming quality.
+    std::wstring StreamUrl(const std::string& songId, int timeOffsetSec = 0, int maxBitRate = 0) const;
 
     // With the lossless option: true for FLAC originals this player can output (stereo or
     // mono, up to 48 kHz, up to 24-bit). Those are fetched with OriginalUrl and decoded locally.
     bool StreamsLossless(const SubsonicSong& song) const;
+    bool CanPlayFlac(const SubsonicSong& song) const;   // the same test without the lossless option
     std::wstring OriginalUrl(const std::string& songId) const;   // format=raw
 
     // False when Navidrome will send the original file untouched (already MP3 within
@@ -94,6 +112,7 @@ public:
 
     // Raw image bytes (JPEG/PNG) scaled by the server to fit 'size' pixels.
     bool GetCoverArt(const std::string& coverArtId, int size, std::string& bytes, std::wstring& err);
+    std::wstring CoverArtUrl(const std::string& coverArtId, int size) const;   // for the download thread
 
     // --- Ratings ---
     bool GetSong(const std::string& songId, SubsonicSong& out, std::wstring& err);
@@ -105,7 +124,8 @@ public:
 
     // --- Scrobbling ---
     // submission=false: "now playing"; true: a completed play (play count, Last.fm if linked).
-    bool Scrobble(const std::string& songId, bool submission, std::wstring& err);
+    // timeMs: when it was played (ms since 1970), for plays sent later; 0 = now.
+    bool Scrobble(const std::string& songId, bool submission, std::wstring& err, unsigned long long timeMs = 0);
     bool GetNowPlayingIds(std::vector<std::string>& ids, std::wstring& err);
 
     // --- Playlists ---
@@ -136,6 +156,7 @@ public:
 
 private:
     std::wstring BuildUrl(const char* method, const std::string& extraQuery) const;
+    std::string LibraryParams() const;   // "&musicFolderId=..." for each chosen library
     bool Call(const char* method, const std::string& extraQuery, cJSON** root, cJSON** response,
               HttpResult* httpResult, std::wstring& err);
     bool CallNoResult(const char* method, const std::string& params, std::wstring& err);

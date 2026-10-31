@@ -85,6 +85,16 @@ void ConfigRead(const std::wstring& ini, SubsonicConfig& cfg)
     if (cfg.maxBitRate < 32 || cfg.maxBitRate > 320)
         cfg.maxBitRate = 192;
     cfg.lossless = IniGetInt(ini, L"Lossless", 0) != 0;
+    cfg.libraries.clear();
+    std::string libs = WideToUtf8(IniGet(ini, L"Libraries"));   // comma-separated ids
+    for (size_t pos = 0; pos < libs.size();) {
+        size_t comma = libs.find(',', pos);
+        if (comma == std::string::npos)
+            comma = libs.size();
+        if (comma > pos)
+            cfg.libraries.push_back(libs.substr(pos, comma - pos));
+        pos = comma + 1;
+    }
     cfg.token = WideToUtf8(IniGet(ini, L"Token"));
     cfg.salt = WideToUtf8(IniGet(ini, L"Salt"));
 }
@@ -124,6 +134,16 @@ bool ConfigSaveServer(const std::wstring& ini, const SubsonicConfig& cfg, const 
     if (!newPassword.empty())
         return StorePassword(ini, newPassword, err);
     return true;
+}
+
+void ConfigSaveLibraries(const std::wstring& ini, const std::vector<std::string>& ids)
+{
+    std::string libs;
+    for (size_t i = 0; i < ids.size(); ++i)
+        libs += (i ? "," : "") + ids[i];
+    // An empty list removes the key: every library is shown.
+    WritePrivateProfileStringW(L"Server", L"Libraries", libs.empty() ? NULL : Utf8ToWide(libs).c_str(),
+                               ini.c_str());
 }
 
 void PlaybackLoad(const std::wstring& ini, PlaybackSettings& s)

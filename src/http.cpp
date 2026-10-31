@@ -76,8 +76,43 @@ static HttpResult Classify(DWORD err, bool https)
 }
 
 HttpRequest::HttpRequest()
-    : m_conn(NULL), m_req(NULL), m_aborted(0), m_status(0), m_lastError(0), m_contentLength(0), m_https(false)
+    : m_conn(NULL), m_req(NULL), m_file(INVALID_HANDLE_VALUE), m_aborted(0), m_status(0), m_lastError(0),
+      m_contentLength(0), m_https(false)
 {
+}
+
+bool HttpIsLocalPath(const std::wstring& url)
+{
+    if (url.size() >= 3 && url[1] == L':' && (url[2] == L'\\' || url[2] == L'/'))
+        return true;
+    return url.size() >= 2 && url[0] == L'\\' && url[1] == L'\\';
+}
+
+HttpResult HttpRequest::OpenFile(const std::wstring& path, DWORD rangeStart)
+{
+    // Delete sharing: a downloaded track can be removed while it plays.
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                           FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        m_lastError = GetLastError();
+        m_status = 404;
+        return HTTP_ERR_STATUS;
+    }
+    DWORD high = 0;
+    const DWORD size = GetFileSize(f, &high);
+    if (high || rangeStart > size || SetFilePointer(f, (LONG)rangeStart, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER) {
+        CloseHandle(f);
+        m_status = 416;   // as a server would answer a range past the end
+        return HTTP_ERR_STATUS;
+    }
+    m_file = f;
+    if (m_aborted) {
+        CloseHandles();
+        return HTTP_ERR_CANCELLED;
+    }
+    m_status = rangeStart > 0 ? 206 : 200;
+    m_contentLength = size - rangeStart;
+    return HTTP_OK;
 }
 
 HttpRequest::~HttpRequest()
@@ -89,10 +124,13 @@ void HttpRequest::CloseHandles()
 {
     HINTERNET req  = (HINTERNET)InterlockedExchangePointer((PVOID volatile*)&m_req, NULL);
     HINTERNET conn = (HINTERNET)InterlockedExchangePointer((PVOID volatile*)&m_conn, NULL);
+    HANDLE file = (HANDLE)InterlockedExchangePointer((PVOID volatile*)&m_file, INVALID_HANDLE_VALUE);
     if (req)
         InternetCloseHandle(req);
     if (conn)
         InternetCloseHandle(conn);
+    if (file != INVALID_HANDLE_VALUE)
+        CloseHandle(file);
 }
 
 void HttpRequest::Abort()
@@ -108,6 +146,9 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts, D
     m_status = 0;
     m_lastError = 0;
     m_contentLength = 0;
+    m_https = false;
+    if (HttpIsLocalPath(url))
+        return OpenFile(url, rangeStart);
     if (!g_session)
         return HTTP_ERR_OTHER;
 
@@ -197,6 +238,15 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts, D
 
 int HttpRequest::Read(void* buf, int len)
 {
+    HANDLE file = m_file;
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD got = 0;
+        if (!ReadFile(file, buf, (DWORD)len, &got, NULL)) {
+            m_lastError = GetLastError();
+            return -1;
+        }
+        return (int)got;
+    }
     HINTERNET req = m_req;
     if (!req)
         return -1;

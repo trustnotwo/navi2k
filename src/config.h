@@ -3,6 +3,7 @@
 
 #include "subsonic.h"
 #include <string>
+#include <vector>
 
 // Settings live in Navi2KPlayer.ini next to the exe; File > Settings edits them.
 
@@ -17,6 +18,9 @@ bool ConfigLoad(const std::wstring& iniPath, SubsonicConfig& cfg, std::wstring& 
 // Writes [Server]. A non-empty newPassword replaces the saved token/salt (it isn't stored).
 bool ConfigSaveServer(const std::wstring& iniPath, const SubsonicConfig& cfg, const std::wstring& newPassword,
                       std::wstring& err);
+
+// Writes [Server] Libraries (the ids to show; empty = all).
+void ConfigSaveLibraries(const std::wstring& iniPath, const std::vector<std::string>& ids);
 
 struct PlaybackSettings {
     std::wstring device;    // waveOut device name; empty = system default

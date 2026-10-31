@@ -34,7 +34,7 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 193, 111, 50, 14
 END
 
-// File > Settings: two property-sheet pages.
+// File > Settings: the property-sheet pages.
 IDD_SET_SERVER DIALOGEX 0, 0, 262, 212
 STYLE DS_SHELLFONT | WS_CHILD | WS_CAPTION
 CAPTION "Server"
@@ -55,6 +55,28 @@ BEGIN
     AUTOCHECKBOX    "Accept un&trusted certificates (only on networks you trust)", IDC_SET_UNTRUSTED, 14, 155, 236, 10
     PUSHBUTTON      "T&est Connection", IDC_SET_TEST, 7, 180, 66, 14
     LTEXT           "", IDC_SET_TESTRESULT, 80, 178, 175, 30
+END
+
+IDD_SET_LIBRARIES DIALOGEX 0, 0, 262, 212
+STYLE DS_SHELLFONT | WS_CHILD | WS_CAPTION
+CAPTION "Libraries"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    GROUPBOX        "Libraries to show", -1, 7, 7, 248, 198
+    LTEXT           "Tick the libraries to show in Artists, Albums, Songs, Favorites and playlists. At least one must stay ticked.", -1, 14, 21, 236, 18
+    CONTROL         "", IDC_SET_LIBLIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 14, 43, 234, 100
+    LTEXT           "", IDC_SET_LIBNOTE, 14, 150, 236, 50
+END
+
+IDD_SET_SIDEBAR DIALOGEX 0, 0, 262, 258
+STYLE DS_SHELLFONT | WS_CHILD | WS_CAPTION
+CAPTION "Sidebar"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    GROUPBOX        "Library sections", -1, 7, 7, 248, 218
+    LTEXT           "Tick the sections to show under LIBRARY in the sidebar. Hidden ones can still be opened from the View menu.", -1, 14, 21, 236, 18
+    CONTROL         "", IDC_SET_SIDELIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 14, 43, 234, 140
+    LTEXT           "Recently Added, Recently Played, Most Played and Random Albums come from Navidrome and follow your library choice. Favorites also needs Show favorites on the Display tab.", -1, 14, 190, 236, 30
 END
 
 IDD_SET_PLAYBACK DIALOGEX 0, 0, 262, 258
@@ -80,6 +102,28 @@ BEGIN
     LTEXT           "The next track starts loading a few seconds early. MP3s can keep a few milliseconds of silence from the encoder.", -1, 26, 222, 224, 18
 END
 
+IDD_SET_DOWNLOADS DIALOGEX 0, 0, 262, 258
+STYLE DS_SHELLFONT | WS_CHILD | WS_CAPTION
+CAPTION "Downloads"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    GROUPBOX        "Downloads for offline listening", -1, 7, 7, 248, 104
+    LTEXT           "Right-click a track, album or playlist and choose Download for offline.", -1, 14, 20, 236, 10
+    LTEXT           "&Folder:", -1, 14, 36, 52, 8
+    EDITTEXT        IDC_SET_DLFOLDER, 70, 34, 122, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "&Browse...", IDC_SET_DLBROWSE, 196, 34, 52, 14
+    LTEXT           "&Quality:", -1, 14, 56, 52, 8
+    COMBOBOX        IDC_SET_DLQUALITY, 70, 54, 178, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "For new downloads. Lossless keeps FLAC files as they are (about 30 MB a track); MP3 is far smaller.", -1, 70, 70, 178, 18
+    LTEXT           "", IDC_SET_DLINFO, 14, 93, 140, 10
+    PUSHBUTTON      "&Delete All...", IDC_SET_DLDELETE, 178, 91, 70, 14
+    GROUPBOX        "Playing downloaded tracks", -1, 7, 117, 248, 58
+    AUTOCHECKBOX    "&Play downloaded copies instead of streaming", IDC_SET_DLPLAYLOCAL, 14, 130, 236, 10
+    LTEXT           "Off: while connected, tracks stream at your Playback quality and downloads are only used offline. On: downloaded tracks always play from disk, at the quality they were downloaded in.", -1, 26, 142, 224, 28
+    GROUPBOX        "Offline", -1, 7, 181, 248, 52
+    LTEXT           "If the server can't be reached, the player opens with your downloads. Plays are saved and sent to Navidrome, with the time you played them, the next time it connects.", -1, 14, 194, 236, 34
+END
+
 IDD_SET_DISPLAY DIALOGEX 0, 0, 262, 258
 STYLE DS_SHELLFONT | WS_CHILD | WS_CAPTION
 CAPTION "Display"
@@ -102,8 +146,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,1,0,0
-PRODUCTVERSION  1,1,0,0
+FILEVERSION     1,2,0,0
+PRODUCTVERSION  1,2,0,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -112,9 +156,9 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription", "Navi2K Player - Navidrome client\0"
-            VALUE "FileVersion", "1.1.0\0"
+            VALUE "FileVersion", "1.2.0\0"
             VALUE "ProductName", "Navi2K Player\0"
-            VALUE "ProductVersion", "1.1.0\0"
+            VALUE "ProductVersion", "1.2.0\0"
         END
     END
     BLOCK "VarFileInfo"

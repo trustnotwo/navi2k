@@ -10,6 +10,8 @@ std::string  UrlEncode(const std::string& s);       // RFC 3986 unreserved set k
 std::wstring Fmt(const wchar_t* fmt, ...);          // msvcrt rules: %ls = wide, %hs = narrow
 std::wstring ExeDirectory();
 bool         EndsWithNoCase(const std::wstring& s, const wchar_t* suffix);
+// The shell's folder picker (works on Windows 2000). False if cancelled.
+bool         BrowseForFolder(HWND owner, const wchar_t* title, std::wstring& path);
 
 // Appends to a UTF-8 log next to the exe (and OutputDebugString). Never logs tokens.
 void LogInit(const std::wstring& path);

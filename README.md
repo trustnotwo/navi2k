@@ -1,29 +1,20 @@
 # Navi2K Player
 
-A native music player for [Navidrome](https://www.navidrome.org/) on Windows 2000 SP4 and XP SP3. It runs on CPUs without SSE2 and requires no extra runtimes.
+A native music player for [Navidrome](https://www.navidrome.org/) on Windows 2000 and up. It runs on CPUs without SSE2 and requires no extra runtimes.
 
 ## Features
 
-- Browse by album, artist, or song, and search within each view
-- Album and artist art (artists without a photo get a collage of their album covers)
-- Right-click any track to go to its album or artist
-- Optional album and artist descriptions from Last.fm (off by default; File > Settings > Display)
-- Playlists: create, rename, delete, add tracks, and reorder (drag and drop), plus a description shown under the playlist's title
-- Star ratings and favorites (♥), synced to Navidrome, with a Favorites section in the library
-- Scrobbling: plays count in Navidrome (and Last.fm, if linked there)
-- Play queue (**Ctrl+Q**): Play next, Add to queue (tracks, albums, playlists), reorder (drag and drop), and remove
-- Mini player (**Ctrl+M**) with cover art, seek bar, and transport controls
-- Notification-area icon with playback controls, and optional minimize-to-tray
-- Shuffle, repeat (all / one), seeking, and an app-only volume control
-- Gapless playback: the next track starts with no pause between them
-- Keyboard shortcuts and media keys (see below)
-- Sort any list by clicking a column header
-- Optional lossless playback: FLAC files stream untouched and are decoded on your PC
-- The title bar shows the current song and artist
-- A Settings dialog for the server, playback, and display options
+- Browse albums, artists, and songs, with search, cover art, and Discover lists
+- Playlists you can create, edit, and reorder, plus a play queue
+- Download tracks, albums, and playlists for offline listening
+- Star ratings, favorites, and scrobbling, synced with Navidrome
+- Optional lossless FLAC playback, and gapless playback
+- Choose which libraries and sidebar sections to show
+- Mini player, tray icon, keyboard shortcuts, and media keys
 
 ## Requirements
 
+- Windows 2000 and up
 - An i686-class CPU (Pentium Pro or newer)
 - A Navidrome server with ffmpeg available (it is by default). Navidrome converts tracks to MP3 for the player, except FLAC files when Lossless is on.
 
@@ -47,12 +38,14 @@ Everything below can be changed in **File > Settings**, or by editing the ini di
 | `[Server] AllowHttpFallback` | `0` | Set to `1` to use `LanUrl` when HTTPS fails. Only works for local addresses. |
 | `[Server] AllowUntrustedCert` | `0` | Set to `1` to accept self-signed certificates |
 | `[Server] MaxBitRate` | `192` | Streaming quality in kbps (96–320) |
+| `[Server] Libraries` | all | Comma-separated ids of the libraries to show (File > Settings > Libraries lists them by name). Empty or missing shows every library. |
 | `[Server] Lossless` | `0` | Set to `1` to play FLAC files as they are (about 1 Mbps). Other formats, and FLAC above 48 kHz or with more than 2 channels, still stream as MP3. |
 | `[Player] OutputDevice` | system default | Sound device to play through |
 | `[Player] Buffers` | `12` | Audio buffer size: 8 (about 0.4 s) to 32 (about 1.5 s). Raise it on a slow network. |
 | `[Player] Gapless` | `1` | Plays the next track with no pause between them. The next track starts loading 8 seconds before the current one ends. |
 | `[Player] Scrobble` | `1` | Reports plays to Navidrome. A play counts after half the track or 4 minutes. |
 | `[View] ShowFavorites` | `1` | Shows the ♥ column and the Favorites section |
+| `[View] HiddenSections` | `added,played,frequent,random` | Sidebar sections to hide, comma-separated (empty shows them all): `albums`, `artists`, `songs`, `favorites`, `added`, `played`, `frequent`, `random`, `queue`, `downloads` |
 | `[View] ShowRatings` | `1` | Shows the star rating column |
 | `[View] LastFmInfo` | `0` | Set to `1` to show album and artist descriptions from Last.fm. Navidrome fetches them, so Last.fm must be turned on there. |
 | `[View] TrayIcon` | `1` | Shows an icon in the notification area |
@@ -60,6 +53,9 @@ Everything below can be changed in **File > Settings**, or by editing the ini di
 | `[Player] GlobalMediaKeys` | `1` | Media keys control the player even when it's in the background. Set to `0` to leave them for other programs. |
 | `[Player] Shuffle` | `0` | Remembers the shuffle setting |
 | `[Player] Repeat` | `0` | Remembers repeat: `0` off, `1` all, `2` one |
+| `[Downloads] Quality` | `0` | Quality of new downloads: `0` the streaming quality, `1` Lossless (FLAC as is), or an MP3 bitrate in kbps (96–320) |
+| `[Downloads] PlayDownloaded` | `0` | Set to `1` to play downloaded copies even while connected. Otherwise tracks stream at the Playback quality and downloads are used only offline. |
+| `[Downloads] Folder` | `Downloads` next to the exe | Where downloaded tracks are kept, as `Artist\Album\01 Title.mp3` (or `.flac`), with `downloads.json` listing them and their covers in `art\`. Each folder keeps its own downloads. |
 | `[Player] Volume` | `100` | Remembers the volume level |
 
 ## Keyboard shortcuts

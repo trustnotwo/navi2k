@@ -11,6 +11,9 @@
 #define IDD_SET_SERVER      300
 #define IDD_SET_PLAYBACK    301
 #define IDD_SET_DISPLAY     302
+#define IDD_SET_LIBRARIES   303
+#define IDD_SET_DOWNLOADS   304
+#define IDD_SET_SIDEBAR     305
 #define IDC_SET_URL         310
 #define IDC_SET_USER        311
 #define IDC_SET_PASSWORD    312
@@ -31,5 +34,14 @@
 #define IDC_SET_TRAYMIN     333
 #define IDC_SET_MEDIAKEYS   334
 #define IDC_SET_LASTFM      335
+#define IDC_SET_LIBLIST     340
+#define IDC_SET_LIBNOTE     341
+#define IDC_SET_DLFOLDER    350
+#define IDC_SET_DLBROWSE    351
+#define IDC_SET_DLINFO      352
+#define IDC_SET_DLDELETE    353
+#define IDC_SET_DLQUALITY   354
+#define IDC_SET_DLPLAYLOCAL 355
+#define IDC_SET_SIDELIST    360
 
 #endif

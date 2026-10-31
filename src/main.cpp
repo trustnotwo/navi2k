@@ -16,12 +16,14 @@
 #include <stdlib.h>
 #include <algorithm>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "art.h"
 #include "config.h"
 #include "cpu.h"
+#include "downloads.h"
 #include "http.h"
 #include "pcm.h"
 #include "player.h"
@@ -30,7 +32,7 @@
 #include "util.h"
 
 #define APP_TITLE   L"Navi2K Player"
-#define APP_VERSION L"1.1"
+#define APP_VERSION L"1.2"
 
 enum {
     IDC_PLAY = 102, IDC_PAUSE, IDC_STOP,
@@ -49,7 +51,8 @@ enum {
     IDM_CONNECT = 40001, IDM_EXIT, IDM_PLAY, IDM_PAUSE, IDM_STOP, IDM_SHUFFLE,
     IDM_ALBUMS, IDM_NEW_PLAYLIST, IDM_ABOUT, IDM_ARTISTS, IDM_SONGS, IDM_FIND,
     IDM_MINI, IDM_PREV, IDM_NEXT, IDM_SETTINGS, IDM_FAVORITES, IDM_QUEUE, IDM_SHOW, IDM_PLAYPAUSE,
-    IDM_REPEAT_OFF, IDM_REPEAT_ALL, IDM_REPEAT_ONE, IDM_REPEAT_CYCLE, IDM_EDIT_PLAYLIST
+    IDM_REPEAT_OFF, IDM_REPEAT_ALL, IDM_REPEAT_ONE, IDM_REPEAT_CYCLE, IDM_EDIT_PLAYLIST, IDM_DOWNLOADS,
+    IDM_DISCOVER   // + DiscoverKind: View > Discover
 };
 
 enum RepeatMode { REPEAT_OFF, REPEAT_ALL, REPEAT_ONE };
@@ -69,22 +72,36 @@ enum { HOTKEY_PLAYPAUSE = 1, HOTKEY_STOP, HOTKEY_PREV, HOTKEY_NEXT };
 enum {
     CMD_PLAY = 1001, CMD_MOVE_UP, CMD_MOVE_DOWN, CMD_REMOVE,
     CMD_PL_PLAY, CMD_PL_NEW, CMD_PL_RENAME, CMD_PL_DELETE, CMD_FAV,
-    CMD_PLAY_NEXT, CMD_ADD_QUEUE, CMD_CLEAR_UPCOMING, CMD_GO_ALBUM, CMD_GO_ARTIST,
+    CMD_PLAY_NEXT, CMD_ADD_QUEUE, CMD_CLEAR_UPCOMING, CMD_GO_ALBUM, CMD_GO_ARTIST, CMD_DOWNLOAD, CMD_DL_REMOVE,
+    CMD_DL_CANCEL,
     CMD_ADD_NEW = 1050,
     CMD_RATE_BASE = 1100,       // + 0..5
     CMD_ADD_BASE = 2000         // + playlist index
 };
 
-enum { TIMER_POSITION = 1, TIMER_SEARCH = 2, TIMER_DRAGSCROLL = 3 };
-enum { COL_NUM = 0, COL_TITLE, COL_ARTIST, COL_FAV, COL_RATING, COL_LENGTH, COL_ALBUM };
+enum { TIMER_POSITION = 1, TIMER_SEARCH = 2, TIMER_DRAGSCROLL = 3, TIMER_RELOAD = 4 };
+// COL_DL is created last but shown right after #: the arrow marking downloaded tracks.
+enum { COL_NUM = 0, COL_TITLE, COL_ARTIST, COL_FAV, COL_RATING, COL_LENGTH, COL_ALBUM, COL_DL };
 
 // Sidebar tree item data (playlists use their index, >= 0).
 enum { TREE_LIBRARY = -1, TREE_ALBUMS = -2, TREE_PLAYLISTS = -3, TREE_ARTISTS = -4, TREE_SONGS = -5,
-       TREE_FAVORITES = -6, TREE_QUEUE = -7 };
+       TREE_FAVORITES = -6, TREE_QUEUE = -7, TREE_DOWNLOADS = -8,
+       TREE_DISCOVER = -9 };   // -9 - DiscoverKind: the Discover lists
+
+// Discover lists (getAlbumList2 types), in sidebar order.
+enum DiscoverKind { DISCOVER_ADDED, DISCOVER_PLAYED, DISCOVER_FREQUENT, DISCOVER_RANDOM, DISCOVER_COUNT };
+static const char* const kDiscoverTypes[DISCOVER_COUNT] = { "newest", "recent", "frequent", "random" };
+static const wchar_t* const kDiscoverTitles[DISCOVER_COUNT] = { L"Recently Added", L"Recently Played",
+                                                                L"Most Played", L"Random Albums" };
+static const int kDiscoverSize = 100;
+
+// What the album list control shows.
+enum { ALBUMS_ALL, ALBUMS_ARTIST, ALBUMS_DISCOVER };
 
 #define WM_APP_JOB_DONE (WM_APP + 10)
 #define WM_APP_TEST_DONE (WM_APP + 11)   // Settings > Test Connection finished (to the page)
 #define WM_APP_TRAY (WM_APP + 12)        // notification-area icon mouse messages
+#define WM_APP_DOWNLOAD (WM_APP + 13)    // a DownloadEvent from the download thread
 static const UINT kTrayId = 1;
 
 static const int kArtSize = 160;        // requested from the server and drawn 1:1
@@ -98,7 +115,7 @@ static const int kSidebarW = kArtSize + 12;
 // removal is by index.
 
 enum JobKind { JOB_CONNECT, JOB_ALBUM, JOB_PLAYLIST, JOB_RATE, JOB_PLEDIT, JOB_ART, JOB_ARTIST, JOB_SONGS,
-               JOB_FAVORITES, JOB_STAR, JOB_SCROBBLE, JOB_QUEUE_FETCH, JOB_INFO };
+               JOB_FAVORITES, JOB_STAR, JOB_SCROBBLE, JOB_QUEUE_FETCH, JOB_INFO, JOB_DL_FETCH, JOB_DISCOVER };
 enum PlEdit { PL_CREATE, PL_RENAME, PL_ADD, PL_REMOVE, PL_SETSONGS, PL_DELETE };
 
 static bool IsLoadJob(JobKind k)
@@ -123,6 +140,8 @@ struct Job {
     std::vector<SubsonicAlbum> albums;
     std::vector<SubsonicSong> songs;
     std::vector<SubsonicPlaylist> playlists;
+    std::vector<SubsonicLibrary> libraries;   // connect: every library on the server
+    std::set<std::string> shownAlbums;        // artist: albums in the chosen libraries (empty = all)
 
     // rating
     std::string songId;
@@ -140,14 +159,24 @@ struct Job {
     std::string reloadId;       // playlist on screen, re-read after the edit
     bool reloaded;
     int selectAfter;
+
+    // scrobbles sent later: songIds with the time each was played (ms since 1970)
+    std::vector<unsigned long long> times;
+    std::string artBytes;       // download: the playlist's cover, saved with it
+
+    // connect: downloads tagged with another server address -> a few of their song ids; the
+    // tags whose songs this server has (the same server at another address)
+    std::map<std::string, std::vector<std::string> > dlSamples;
+    std::vector<std::string> dlSameServer;
 };
 
-enum SongSource { SRC_NONE, SRC_ALBUM, SRC_PLAYLIST, SRC_LIBRARY, SRC_FAVORITES, SRC_QUEUE };
+enum SongSource { SRC_NONE, SRC_ALBUM, SRC_PLAYLIST, SRC_LIBRARY, SRC_FAVORITES, SRC_QUEUE, SRC_DOWNLOADS };
 // VIEW_ALBUMS: all albums. VIEW_ARTISTS: all artists. VIEW_ARTIST: one artist's albums
 // (same list control as VIEW_ALBUMS). VIEW_TRACKS: an album's or playlist's tracks.
 // VIEW_SONGS: every song in the library; VIEW_FAVORITES: starred songs; VIEW_QUEUE: the play
 // queue (all use the same list control as VIEW_TRACKS).
-enum MainView { VIEW_ALBUMS, VIEW_TRACKS, VIEW_ARTISTS, VIEW_ARTIST, VIEW_SONGS, VIEW_FAVORITES, VIEW_QUEUE };
+enum MainView { VIEW_ALBUMS, VIEW_TRACKS, VIEW_ARTISTS, VIEW_ARTIST, VIEW_SONGS, VIEW_FAVORITES, VIEW_QUEUE,
+                VIEW_DOWNLOADS, VIEW_DISCOVER };
 
 struct Shown {                  // what the header describes
     bool has;
@@ -178,15 +207,30 @@ struct App {
     Player player;
     std::vector<SubsonicAlbum> albumData;
     std::vector<SubsonicArtist> artistData;
+    std::vector<SubsonicLibrary> libraries;  // on the server (File > Settings > Libraries)
+    std::set<std::string> libraryAlbums;     // albums in the chosen libraries (filled only when filtering)
+
+    // Offline listening (Library > Downloads).
+    Downloads downloads;
+    bool offline;                            // the server couldn't be reached: only downloads work
+    int dlSaved, dlFailed;                   // since the download queue last emptied
+    int dlQuality;                           // [Downloads] Quality: 0 = as streaming, 1 = lossless, else kbps
+    bool playLocal;                          // [Downloads] PlayDownloaded: use the copies even online
+    std::wstring dlLastError;
     std::vector<SubsonicAlbum> artistAlbums; // albums of shownArtist
-    bool albumListIsArtist;                  // album list control shows artistAlbums
+    int albumListMode;                       // ALBUMS_*: what the album list control shows (-1: refill)
+    std::vector<SubsonicAlbum> discoverAlbums;   // the Discover list on screen
+    int discoverKind;
+    bool discoverLoaded, discoverFailed;
+    bool sectionHidden[16];                  // Settings > Sidebar, by kSections index
     SubsonicArtist shownArtist;
     SubsonicAlbum shownAlbum;               // valid when songSource == SRC_ALBUM
     std::string shownArtistCover;            // artist image, or a collage of their album covers
     std::vector<SubsonicSong> allSongs;      // the whole library, loaded on first visit to Songs
     bool allSongsLoaded;
     bool pendingSongs;
-    HTREEITEM treeFavorites, treeQueue;
+    HTREEITEM treeFavorites, treeQueue, treeDownloads;
+    HTREEITEM treeDiscover[DISCOVER_COUNT];
     bool favoritesLoaded;
     bool pendingFavorites;
 
@@ -208,6 +252,10 @@ struct App {
     std::vector<SubsonicSong> songData;     // tracks of the album/playlist being shown
     SongSource songSource;
     SubsonicPlaylist shownPlaylist;         // valid when songSource == SRC_PLAYLIST
+    // The shown playlist in full: songData holds only the tracks in the chosen libraries, so
+    // moves and removals are mapped back through playlistRows (shown row -> full position).
+    std::vector<std::string> playlistIds;
+    std::vector<int> playlistRows;
 
     // Playback queue: queueSource is the list as it was when playback started; queue is the
     // play order (shuffled or not) and queueSrcIdx maps each queue entry back to the source.
@@ -294,7 +342,8 @@ static void FetchArt(Job* job)
         return;
     std::string bytes;
     std::wstring artErr;
-    if (g_app.client.GetCoverArt(job->artId, kArtSize, bytes, artErr))
+    // A downloaded album's cover is on disk (the only way to get it offline).
+    if (g_app.downloads.LoadArt(job->artId, bytes) || g_app.client.GetCoverArt(job->artId, kArtSize, bytes, artErr))
         job->art = ArtDecode(bytes, kArtSize, GetSysColor(COLOR_BTNFACE), artErr);
     if (!job->art)
         LogF(L"Cover art: %ls", artErr.c_str());
@@ -374,6 +423,40 @@ static void RunPlaylistEdit(Job* job)
         job->reloaded = c.GetPlaylist(job->reloadId, job->songs, err);
 }
 
+// The saved library choice, checked against the server's libraries: unknown ids are dropped,
+// and an empty result or every library means no filter.
+static std::vector<std::string> ChosenLibraries(const std::vector<std::string>& saved,
+                                                const std::vector<SubsonicLibrary>& libs)
+{
+    std::vector<std::string> kept;
+    for (size_t i = 0; i < libs.size(); ++i)
+        if (std::find(saved.begin(), saved.end(), libs[i].id) != saved.end())
+            kept.push_back(libs[i].id);
+    if (kept.size() == libs.size())
+        kept.clear();
+    return kept;
+}
+
+// Navidrome's filtered artist list can include artists with nothing in the chosen libraries,
+// and its album counts cover every library; keep the album artists of the shown albums, with
+// those albums counted.
+static void KeepArtistsWithAlbums(std::vector<SubsonicArtist>& artists, const std::vector<SubsonicAlbum>& albums)
+{
+    std::map<std::string, int> counts;
+    for (size_t i = 0; i < albums.size(); ++i)
+        for (size_t k = 0; k < albums[i].artistIds.size(); ++k)
+            ++counts[albums[i].artistIds[k]];
+    std::vector<SubsonicArtist> kept;
+    for (size_t i = 0; i < artists.size(); ++i) {
+        std::map<std::string, int>::const_iterator it = counts.find(artists[i].id);
+        if (it != counts.end()) {
+            kept.push_back(artists[i]);
+            kept.back().albumCount = it->second;
+        }
+    }
+    artists.swap(kept);
+}
+
 static unsigned __stdcall JobThread(void* p)
 {
     Job* job = (Job*)p;
@@ -383,6 +466,9 @@ static unsigned __stdcall JobThread(void* p)
         job->ok = c.Connect(job->message);
         if (job->ok) {
             std::wstring err;
+            if (!c.GetLibraries(job->libraries, err))
+                LogF(L"getMusicFolders: %ls", err.c_str());   // not fatal: show everything
+            c.SetLibraries(ChosenLibraries(c.Libraries(), job->libraries));
             if (!c.GetAlbumList(job->albums, err)) {
                 job->ok = false;
                 job->message = err;
@@ -391,8 +477,21 @@ static unsigned __stdcall JobThread(void* p)
                     LogF(L"getPlaylists: %ls", err.c_str());   // not fatal
                 if (!c.GetArtists(job->artists, err))
                     LogF(L"getArtists: %ls", err.c_str());     // not fatal
+                if (!c.Libraries().empty())
+                    KeepArtistsWithAlbums(job->artists, job->albums);
             }
         }
+        if (job->ok)
+            for (std::map<std::string, std::vector<std::string> >::const_iterator g = job->dlSamples.begin();
+                 g != job->dlSamples.end(); ++g)
+                for (size_t k = 0; k < g->second.size(); ++k) {
+                    SubsonicSong s;
+                    std::wstring err;
+                    if (c.GetSong(g->second[k], s, err)) {
+                        job->dlSameServer.push_back(g->first);
+                        break;
+                    }
+                }
         break;
     case JOB_SONGS:
         job->ok = c.GetAllSongs(job->songs, job->message);
@@ -404,14 +503,48 @@ static unsigned __stdcall JobThread(void* p)
         job->ok = c.SetStarred(job->songId, job->flag, job->message);
         break;
     case JOB_SCROBBLE:
-        job->ok = c.Scrobble(job->songId, job->flag, job->message);
+        if (!job->songIds.empty()) {   // plays saved while offline; the ones that fail stay
+            std::vector<std::string> ids;
+            std::vector<unsigned long long> times;
+            for (size_t i = 0; i < job->songIds.size(); ++i)
+                if (!c.Scrobble(job->songIds[i], true, job->message, job->times[i])) {
+                    ids.push_back(job->songIds[i]);
+                    times.push_back(job->times[i]);
+                }
+            job->ok = ids.empty();
+            job->index = (int)(job->songIds.size() - ids.size());   // sent
+            job->songIds.swap(ids);
+            job->times.swap(times);
+        } else {
+            job->ok = c.Scrobble(job->songId, job->flag, job->message);
+        }
         break;
+    case JOB_DISCOVER:
+        job->ok = c.GetAlbumListOf(kDiscoverTypes[job->index], kDiscoverSize, job->albums, job->message);
+        break;
+    case JOB_DL_FETCH:      // an album's or playlist's tracks, to download
+        if (!job->playlist.coverArt.empty()) {
+            std::wstring artErr;
+            if (!c.GetCoverArt(job->playlist.coverArt, kArtSize, job->artBytes, artErr))
+                job->artBytes.clear();
+        }
+        // fall through
     case JOB_QUEUE_FETCH:   // an album's or playlist's tracks, for Play next / Add to queue
         job->ok = !job->addAlbumId.empty() ? c.GetAlbum(job->addAlbumId, job->songs, job->message)
                                            : c.GetPlaylist(job->plId, job->songs, job->message);
         break;
     case JOB_ARTIST:
         job->ok = c.GetArtist(job->artist.id, job->albums, job->message);
+        // getArtist ignores the library choice. Keep it unless that would leave nothing
+        // (Go to artist from a playlist track in a hidden library).
+        if (job->ok && !job->shownAlbums.empty()) {
+            std::vector<SubsonicAlbum> kept;
+            for (size_t i = 0; i < job->albums.size(); ++i)
+                if (job->shownAlbums.count(job->albums[i].id))
+                    kept.push_back(job->albums[i]);
+            if (!kept.empty())
+                job->albums.swap(kept);
+        }
         // Navidrome sends a WebP placeholder when it has no artist photo, which we can't
         // decode, or a "no photo" silhouette from an online source; fall back to the
         // artist's album covers.
@@ -573,13 +706,43 @@ static int TotalDuration(const std::vector<SubsonicSong>& songs)
     return total;
 }
 
+// False for a track whose album is outside the chosen libraries (File > Settings > Libraries).
+static bool InChosenLibraries(const SubsonicSong& s)
+{
+    return g_app.client.Libraries().empty() || s.albumId.empty() || g_app.libraryAlbums.count(s.albumId) > 0;
+}
+
+// songData has just been loaded with a whole playlist: keep its full order for edits and
+// show only the tracks in the chosen libraries.
+static void FilterShownPlaylist()
+{
+    std::vector<SubsonicSong> shown;
+    g_app.playlistIds.clear();
+    g_app.playlistRows.clear();
+    for (size_t i = 0; i < g_app.songData.size(); ++i) {
+        g_app.playlistIds.push_back(g_app.songData[i].id);
+        if (InChosenLibraries(g_app.songData[i])) {
+            g_app.playlistRows.push_back((int)i);
+            shown.push_back(g_app.songData[i]);
+        }
+    }
+    g_app.songData.swap(shown);
+}
+
 static void ShowPlaylistInfo(const SubsonicPlaylist& pl)
 {
     std::wstring by = L"Playlist by " + pl.owner;
     if (!g_app.client.CanEdit(pl))
         by += L"  (read-only)";
-    ShowInfo(pl.id, pl.coverArt, pl.name, by,
-             Fmt(L"%d tracks  \x00B7  %ls", pl.songCount, FormatTime(pl.duration).c_str()), pl.comment);
+    std::wstring counts = Fmt(L"%d tracks  \x00B7  %ls", pl.songCount, FormatTime(pl.duration).c_str());
+    const int shown = (int)g_app.playlistRows.size(), total = (int)g_app.playlistIds.size();
+    if (shown < total) {   // some are in libraries that aren't shown
+        int sec = 0;
+        for (size_t i = 0; i < g_app.songData.size(); ++i)
+            sec += g_app.songData[i].duration;
+        counts = Fmt(L"%d of %d tracks shown  \x00B7  %ls", shown, total, FormatTime(sec).c_str());
+    }
+    ShowInfo(pl.id, pl.coverArt, pl.name, by, counts, pl.comment);
 }
 
 // --- Last.fm descriptions (Settings > Display, off by default) -----------------------------
@@ -801,10 +964,19 @@ static int SelectedIndex(HWND lv)
     return ListView_GetNextItem(lv, -1, LVNI_SELECTED);
 }
 
+static std::vector<int> SelectedRows(HWND lv)
+{
+    std::vector<int> rows;
+    for (int i = ListView_GetNextItem(lv, -1, LVNI_SELECTED); i >= 0; i = ListView_GetNextItem(lv, i, LVNI_SELECTED))
+        rows.push_back(i);
+    return rows;
+}
+
 static void SelectRow(HWND lv, int i)
 {
     if (i < 0 || i >= ListView_GetItemCount(lv))
         return;
+    ListView_SetItemState(lv, -1, 0, LVIS_SELECTED);   // just this row (the track list selects several)
     ListView_SetItemState(lv, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_EnsureVisible(lv, i, FALSE);
 }
@@ -987,6 +1159,9 @@ struct SongLess {
         case COL_FAV:    c = CmpInt(a.starred ? 1 : 0, b.starred ? 1 : 0); break;
         case COL_RATING: c = CmpInt(a.userRating, b.userRating); break;
         case COL_LENGTH: c = CmpInt(a.duration, b.duration); break;
+        case COL_DL:
+            c = CmpInt(g_app.downloads.Find(a.id) ? 1 : 0, g_app.downloads.Find(b.id) ? 1 : 0);
+            break;
         }
         return c < 0;
     }
@@ -1016,11 +1191,13 @@ static void SortList(std::vector<T>& v, int col, bool desc)
 // Rebuilds the album list from every album (filtered by the Albums search) or the open artist.
 static void RebuildAlbumList()
 {
-    if (g_app.albumListIsArtist)
+    if (g_app.albumListMode == ALBUMS_ARTIST)
         g_app.albumList = g_app.artistAlbums;
+    else if (g_app.albumListMode == ALBUMS_DISCOVER)
+        g_app.albumList = g_app.discoverAlbums;   // in the server's order (newest, most played...)
     else
         FilterInto(g_app.albumData, g_app.albumKeys, g_app.queryAlbums, g_app.albumList);
-    if (g_app.albumSortCol >= 0)
+    if (g_app.albumSortCol >= 0 && g_app.albumListMode != ALBUMS_DISCOVER)
         SortList<SubsonicAlbum, AlbumLess>(g_app.albumList, g_app.albumSortCol, g_app.albumSortDesc);
     FillAlbums();
 }
@@ -1050,6 +1227,7 @@ static std::string SongListKey()
     case SRC_PLAYLIST:  return "p:" + g_app.shown.id;
     case SRC_LIBRARY:   return "library";
     case SRC_FAVORITES: return "favorites";
+    case SRC_DOWNLOADS: return "downloads";
     default:            return std::string();   // the queue (its order is the play order) and nothing
     }
 }
@@ -1086,7 +1264,8 @@ static void FillSongs()
     InvalidateRect(lv, NULL, TRUE);
 }
 
-static const wchar_t* const kSongColNames[] = { L"#", L"Track", L"Artist", L"Favorites", L"Rating", L"Time", L"Album" };
+static const wchar_t* const kSongColNames[] = { L"#", L"Track", L"Artist", L"Favorites", L"Rating", L"Time", L"Album",
+                                                L"Downloaded" };
 
 // Header click on the track table. Rating and favorites sort highest first.
 static void OnSongsColumnClick(int col)
@@ -1095,7 +1274,8 @@ static void OnSongsColumnClick(int col)
         SetStatus(L"The queue plays in the order shown: right-click a track to move it.");
         return;
     }
-    if (SongListKey().empty() || (col == COL_FAV && !g_app.showFavorites) || (col == COL_RATING && !g_app.showRatings))
+    if (SongListKey().empty() || (col == COL_FAV && !g_app.showFavorites) || (col == COL_RATING && !g_app.showRatings) ||
+        (col == COL_DL && g_app.downloads.Tracks().empty()))
         return;
     const int sel = SelectedIndex(g_app.songs);
     const std::string selId = sel >= 0 && sel < (int)g_app.songData.size() ? g_app.songData[sel].id : std::string();
@@ -1135,6 +1315,10 @@ static void OnSongsColumnClick(int col)
 
 static void OnAlbumsColumnClick(int col)
 {
+    if (g_app.mainView == VIEW_DISCOVER) {
+        SetStatus(L"This list keeps the server's order.");
+        return;
+    }
     const int sel = SelectedIndex(g_app.albums);
     const std::string selId = sel >= 0 && sel < (int)g_app.albumList.size() ? g_app.albumList[sel].id : std::string();
     g_app.albumSortDesc = col == g_app.albumSortCol ? !g_app.albumSortDesc : false;
@@ -1225,6 +1409,116 @@ static void TreeSelectQuietly(HTREEITEM item)
     g_app.treeUpdating = false;
 }
 
+// Library sections in sidebar order; Settings > Sidebar hides any of them.
+struct SidebarSection {
+    const wchar_t* key;    // in [View] HiddenSections
+    const wchar_t* label;
+    LPARAM data;
+};
+static const SidebarSection kSections[] = {
+    { L"albums",    L"Albums",          TREE_ALBUMS },
+    { L"artists",   L"Artists",         TREE_ARTISTS },
+    { L"songs",     L"Songs",           TREE_SONGS },
+    { L"favorites", L"Favorites",       TREE_FAVORITES },
+    { L"added",     L"Recently Added",  TREE_DISCOVER - DISCOVER_ADDED },
+    { L"played",    L"Recently Played", TREE_DISCOVER - DISCOVER_PLAYED },
+    { L"frequent",  L"Most Played",     TREE_DISCOVER - DISCOVER_FREQUENT },
+    { L"random",    L"Random Albums",   TREE_DISCOVER - DISCOVER_RANDOM },
+    { L"queue",     L"Play Queue",      TREE_QUEUE },
+    { L"downloads", L"Downloads",       TREE_DOWNLOADS },
+};
+static const int kSectionCount = (int)(sizeof(kSections) / sizeof(kSections[0]));
+
+static HTREEITEM* SectionItem(LPARAM data)
+{
+    switch (data) {
+    case TREE_ALBUMS:    return &g_app.treeAlbums;
+    case TREE_ARTISTS:   return &g_app.treeArtists;
+    case TREE_SONGS:     return &g_app.treeSongs;
+    case TREE_FAVORITES: return &g_app.treeFavorites;
+    case TREE_QUEUE:     return &g_app.treeQueue;
+    case TREE_DOWNLOADS: return &g_app.treeDownloads;
+    default:             return &g_app.treeDiscover[TREE_DISCOVER - data];
+    }
+}
+
+// The sidebar item of the view on screen, or NULL (an album or playlist page).
+static HTREEITEM ItemForView()
+{
+    switch (g_app.mainView) {
+    case VIEW_ALBUMS:    return g_app.treeAlbums;
+    case VIEW_ARTISTS:   return g_app.treeArtists;
+    case VIEW_SONGS:     return g_app.treeSongs;
+    case VIEW_FAVORITES: return g_app.treeFavorites;
+    case VIEW_QUEUE:     return g_app.treeQueue;
+    case VIEW_DOWNLOADS: return g_app.treeDownloads;
+    case VIEW_DISCOVER:  return g_app.treeDiscover[g_app.discoverKind];
+    default:             return NULL;
+    }
+}
+
+// Re-adds the LIBRARY items that are turned on (and Favorites only while favorites are shown).
+static void RebuildLibraryTree()
+{
+    g_app.treeUpdating = true;
+    HTREEITEM child;
+    while ((child = TreeView_GetChild(g_app.tree, g_app.treeLibrary)) != NULL)
+        TreeView_DeleteItem(g_app.tree, child);
+    for (int i = 0; i < kSectionCount; ++i) {
+        HTREEITEM* item = SectionItem(kSections[i].data);
+        *item = NULL;
+        if (g_app.sectionHidden[i] || (kSections[i].data == TREE_FAVORITES && !g_app.showFavorites))
+            continue;
+        *item = TreeAdd(g_app.treeLibrary, kSections[i].label, kSections[i].data, false);
+    }
+    TreeView_Expand(g_app.tree, g_app.treeLibrary, TVE_EXPAND);
+    if (HTREEITEM h = ItemForView())
+        TreeView_SelectItem(g_app.tree, h);
+    g_app.treeUpdating = false;
+}
+
+static void ShowArtistsView();
+static void ShowSongsView();
+static void ShowFavoritesView();
+static void ShowQueueView();
+static void ShowDownloadsView();
+static void ShowAlbumsView();
+static void ShowDiscoverView(int kind, bool reload);
+
+// Opens a LIBRARY section by its tree data.
+static void ShowSection(LPARAM data)
+{
+    if (data == TREE_ALBUMS)
+        ShowAlbumsView();
+    else if (data == TREE_ARTISTS)
+        ShowArtistsView();
+    else if (data == TREE_SONGS)
+        ShowSongsView();
+    else if (data == TREE_FAVORITES)
+        ShowFavoritesView();
+    else if (data == TREE_QUEUE)
+        ShowQueueView();
+    else if (data == TREE_DOWNLOADS)
+        ShowDownloadsView();
+    else if (data <= TREE_DISCOVER && data > TREE_DISCOVER - DISCOVER_COUNT)
+        ShowDiscoverView((int)(TREE_DISCOVER - data), true);
+}
+
+// After connecting: Albums, or the first section shown if Albums is hidden.
+static void ShowStartView()
+{
+    if (!g_app.sectionHidden[0]) {
+        ShowAlbumsView();
+        return;
+    }
+    for (int i = 1; i < kSectionCount; ++i)
+        if (*SectionItem(kSections[i].data)) {
+            ShowSection(kSections[i].data);
+            return;
+        }
+    ShowAlbumsView();
+}
+
 static void RebuildPlaylistTree()
 {
     g_app.treeUpdating = true;
@@ -1241,16 +1535,8 @@ static void RebuildPlaylistTree()
     TreeView_Expand(g_app.tree, g_app.treePlaylists, TVE_EXPAND);
     if (select)
         TreeView_SelectItem(g_app.tree, select);
-    else if (g_app.mainView == VIEW_ALBUMS)
-        TreeView_SelectItem(g_app.tree, g_app.treeAlbums);
-    else if (g_app.mainView == VIEW_ARTISTS)
-        TreeView_SelectItem(g_app.tree, g_app.treeArtists);
-    else if (g_app.mainView == VIEW_SONGS)
-        TreeView_SelectItem(g_app.tree, g_app.treeSongs);
-    else if (g_app.mainView == VIEW_FAVORITES)
-        TreeView_SelectItem(g_app.tree, g_app.treeFavorites);
-    else if (g_app.mainView == VIEW_QUEUE)
-        TreeView_SelectItem(g_app.tree, g_app.treeQueue);
+    else if (HTREEITEM h = ItemForView())
+        TreeView_SelectItem(g_app.tree, h);
     g_app.treeUpdating = false;
 }
 
@@ -1323,6 +1609,20 @@ static void DrawRowExtras(HDC dc, int item)
     const COLORREF empty = GetSysColor(highlighted ? COLOR_HIGHLIGHTTEXT : COLOR_GRAYTEXT);
 
     RECT cell;
+    // Downloaded: a small arrow in its own column.
+    if (g_app.downloads.Find(song.id) && ListView_GetSubItemRect(g_app.songs, item, COL_DL, LVIR_BOUNDS, &cell) &&
+        cell.right - cell.left >= 12) {
+        const int x = (cell.left + cell.right) / 2, cy = (cell.top + cell.bottom) / 2;
+        HBRUSH b = CreateSolidBrush(GetSysColor(highlighted ? COLOR_HIGHLIGHTTEXT : COLOR_HOTLIGHT));
+        HGDIOBJ oldBrush = SelectObject(dc, b);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        POINT arrow[7] = { { x - 2, cy - 5 }, { x + 2, cy - 5 }, { x + 2, cy }, { x + 5, cy },
+                           { x, cy + 5 }, { x - 5, cy }, { x - 2, cy } };
+        Polygon(dc, arrow, 7);
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        DeleteObject(b);
+    }
     if (g_app.showFavorites && ListView_GetSubItemRect(g_app.songs, item, COL_FAV, LVIR_BOUNDS, &cell))
         DrawHeart(dc, (cell.left + cell.right) / 2, (cell.top + cell.bottom) / 2, song.starred, empty);
 
@@ -1405,11 +1705,34 @@ static void ApplyRatingLocal(const std::string& songId, int rating)
         }
 }
 
+// A download from a server other than the connected one: its song id means nothing here, so
+// it plays from disk and can't be rated, starred, opened on the server or scrobbled.
+static bool OnOtherServer(const std::string& songId)
+{
+    return !g_app.offline && g_app.downloads.FromOtherServer(songId);
+}
+
+static bool RefuseOtherServer(const std::vector<std::string>& ids)
+{
+    for (size_t i = 0; i < ids.size(); ++i)
+        if (OnOtherServer(ids[i])) {
+            SetStatus(L"That download is from another server, which this one doesn't know; it can only be played.");
+            return true;
+        }
+    return false;
+}
+
 static void SetSongRating(int i, int rating)
 {
     if (i < 0 || i >= (int)g_app.songData.size() || rating < 0 || rating > 5)
         return;
+    if (g_app.offline) {
+        SetStatus(L"Offline: only Downloads can be used. File > Connect tries again.");
+        return;
+    }
     SubsonicSong& s = g_app.songData[i];
+    if (RefuseOtherServer(std::vector<std::string>(1, s.id)))
+        return;
     if (s.userRating == rating)
         return;
     Job* job = NewJob(JOB_RATE);
@@ -1451,7 +1774,13 @@ static void ToggleFavorite(int i)
 {
     if (i < 0 || i >= (int)g_app.songData.size())
         return;
+    if (g_app.offline) {
+        SetStatus(L"Offline: only Downloads can be used. File > Connect tries again.");
+        return;
+    }
     const SubsonicSong& s = g_app.songData[i];
+    if (RefuseOtherServer(std::vector<std::string>(1, s.id)))
+        return;
     Job* job = NewJob(JOB_STAR);
     job->songId = s.id;
     job->flag = !s.starred;
@@ -1528,8 +1857,108 @@ static void ResetSeekBar(int durationSec)
 // "Now playing" when a track starts; a play is submitted once half the track (or 4 minutes)
 // has actually been listened to, as Last.fm counts it. Tracks under 30 s are never submitted.
 
+// --- Plays heard offline -------------------------------------------------------------------
+// Kept in Navi2KPlayer-scrobbles.txt next to the ini ("songid<TAB>ms since 1970" per line) and
+// sent with their time once the server can be reached, so play counts and Last.fm stay right.
+
+static unsigned long long NowMs()
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER t;
+    t.LowPart = ft.dwLowDateTime;
+    t.HighPart = ft.dwHighDateTime;
+    return (t.QuadPart - 116444736000000000ULL) / 10000;   // 100 ns since 1601 -> ms since 1970
+}
+
+static std::wstring ScrobbleFile()
+{
+    const size_t slash = g_app.iniPath.find_last_of(L'\\');
+    return (slash == std::wstring::npos ? std::wstring() : g_app.iniPath.substr(0, slash + 1)) +
+           L"Navi2KPlayer-scrobbles.txt";
+}
+
+static void SaveScrobblesForLater(const std::vector<std::string>& ids, const std::vector<unsigned long long>& times)
+{
+    if (ids.empty())
+        return;
+    HANDLE f = CreateFileW(ScrobbleFile().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        LogF(L"Could not save %u play(s) for later (error %lu)", (unsigned)ids.size(), GetLastError());
+        return;
+    }
+    for (size_t i = 0; i < ids.size(); ++i) {
+        char line[160];
+        _snprintf(line, sizeof(line) - 1, "%s\t%I64u\r\n", ids[i].c_str(), times[i]);
+        line[sizeof(line) - 1] = 0;
+        DWORD put;
+        WriteFile(f, line, (DWORD)strlen(line), &put, NULL);
+    }
+    CloseHandle(f);
+    LogF(L"Saved %u play(s) to send when the server can be reached", (unsigned)ids.size());
+}
+
+// After connecting: sends the saved plays (the file is emptied; failures are saved again).
+static void SendSavedScrobbles()
+{
+    const std::wstring path = ScrobbleFile();
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE)
+        return;
+    std::string text;
+    char buf[4096];
+    DWORD got;
+    while (ReadFile(f, buf, sizeof(buf), &got, NULL) && got)
+        text.append(buf, got);
+    CloseHandle(f);
+    DeleteFileW(path.c_str());
+    Job* job = NewJob(JOB_SCROBBLE);
+    job->flag = true;
+    std::vector<std::string> heldIds;   // plays of another server's downloads
+    std::vector<unsigned long long> heldTimes;
+    for (size_t pos = 0; pos < text.size();) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos)
+            end = text.size();
+        std::string line = text.substr(pos, end - pos);
+        pos = end + 1;
+        size_t tab = line.find('\t');
+        if (tab == std::string::npos || tab == 0)
+            continue;
+        const std::string id = line.substr(0, tab);
+        const unsigned long long t = _strtoui64(line.c_str() + tab + 1, NULL, 10);
+        if (OnOtherServer(id)) {
+            heldIds.push_back(id);
+            heldTimes.push_back(t);
+        } else {
+            job->songIds.push_back(id);
+            job->times.push_back(t);
+        }
+    }
+    if (!heldIds.empty()) {
+        LogF(L"Keeping %u saved play(s) of downloads from another server for that server", (unsigned)heldIds.size());
+        SaveScrobblesForLater(heldIds, heldTimes);
+    }
+    if (job->songIds.empty()) {
+        delete job;
+        return;
+    }
+    LogF(L"Sending %u play(s) saved while offline", (unsigned)job->songIds.size());
+    LaunchJob(job);
+}
+
 static void SendScrobble(const std::string& songId, bool submission)
 {
+    // Offline, or a download from another server: keep the play for when its server is
+    // connected; "now playing" has no use then.
+    if (g_app.offline || OnOtherServer(songId)) {
+        if (submission) {
+            unsigned long long started = NowMs() - g_app.player.PositionMs();
+            SaveScrobblesForLater(std::vector<std::string>(1, songId), std::vector<unsigned long long>(1, started));
+        }
+        return;
+    }
     Job* job = NewJob(JOB_SCROBBLE);
     job->songId = songId;
     job->flag = submission;
@@ -1611,11 +2040,27 @@ static void RefreshTransport()
     CheckMenuRadioItem(g_app.menu, IDM_REPEAT_OFF, IDM_REPEAT_ONE, IDM_REPEAT_OFF + g_app.repeat, MF_BYCOMMAND);
 }
 
+// The downloaded copy to play instead of streaming: always offline or for another server's
+// download, and otherwise only when Settings > Downloads says so (it may be at a different
+// quality).
+static const DownloadedTrack* PlayableCopy(const SubsonicSong& s)
+{
+    return (g_app.offline || g_app.playLocal || OnOtherServer(s.id)) ? g_app.downloads.Find(s.id) : NULL;
+}
+
 // The stream for a queue entry. Transcoded streams seek on the server (timeOffset, whole
 // seconds); original MP3s that Navidrome passes through untouched are skipped client-side by
 // frame headers; FLAC originals (lossless option) seek client-side with HTTP Range requests.
 static std::wstring TrackUrl(const SubsonicSong& s, DWORD startMs, DWORD& start, DWORD& skip, bool& flac)
 {
+    // A downloaded track plays from its file: seeking is a file seek (FLAC) or a skip by frame
+    // headers (MP3), both done locally.
+    if (const DownloadedTrack* d = PlayableCopy(s)) {
+        flac = d->flac;
+        start = startMs;
+        skip = startMs;
+        return g_app.downloads.PathOf(*d);
+    }
     flac = g_app.client.StreamsLossless(s);
     const bool serverSide = !flac && g_app.client.ServerTranscodes(s);
     const int offsetSec = (int)(startMs / 1000);
@@ -1795,7 +2240,8 @@ static void AdoptNextTrack(const wchar_t* tag)
     const SubsonicSong& s = g_app.queue[i];
     g_app.queueIndex = i;
     g_app.queueFinished = false;
-    g_app.playingFlac = g_app.client.StreamsLossless(s);
+    const DownloadedTrack* dl = PlayableCopy(s);
+    g_app.playingFlac = dl ? dl->flac : g_app.client.StreamsLossless(s);
     ResetSeekBar(s.duration);
     ShowTrackRow(i);
     ScrobbleTrackStarted(s.id, 0);
@@ -1849,9 +2295,23 @@ static void QueueSongs(const std::vector<SubsonicSong>& songs, bool next)
 }
 
 // Fetches an album's or playlist's tracks in the background, then queues them (OnJobDone).
+static void QueueSongs(const std::vector<SubsonicSong>& songs, bool next);
+
 static void QueueFetched(const std::string& albumId, const std::string& playlistId, const std::wstring& name,
                          bool next)
 {
+    if (g_app.offline) {   // a downloaded playlist: its tracks are on disk
+        const DownloadedPlaylist* pl = g_app.downloads.FindPlaylist(playlistId);
+        std::vector<SubsonicSong> songs;
+        for (size_t k = 0; pl && k < pl->songIds.size(); ++k)
+            if (const DownloadedTrack* d = g_app.downloads.Find(pl->songIds[k]))
+                songs.push_back(d->song);
+        if (songs.empty())
+            SetStatus(L"Offline: only Downloads can be used. File > Connect tries again.");
+        else
+            QueueSongs(songs, next);
+        return;
+    }
     Job* job = NewJob(JOB_QUEUE_FETCH);
     job->addAlbumId = albumId;
     job->plId = playlistId;
@@ -1860,18 +2320,6 @@ static void QueueFetched(const std::string& albumId, const std::string& playlist
     LaunchJob(job);
 }
 
-static void RemoveFromQueue(int i)
-{
-    // The playing track stays; skip it with Next instead.
-    if (i < 0 || i >= (int)g_app.queue.size() || i == g_app.queueIndex)
-        return;
-    const std::wstring title = g_app.queue[i].title;
-    g_app.queue.erase(g_app.queue.begin() + i);
-    if (i < g_app.queueIndex)
-        --g_app.queueIndex;
-    QueueEdited(i);
-    SetStatus(L"Removed from the queue: \"" + title + L"\"");
-}
 
 // Moves queue entry 'from' so it ends up at 'to'; the playing track keeps playing.
 static void MoveQueueEntry(int from, int to)
@@ -1962,7 +2410,7 @@ static void DoPlay()
         return;
     }
     if ((g_app.mainView == VIEW_TRACKS || g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_FAVORITES ||
-         g_app.mainView == VIEW_QUEUE) && !g_app.songData.empty()) {
+         g_app.mainView == VIEW_QUEUE || g_app.mainView == VIEW_DOWNLOADS) && !g_app.songData.empty()) {
         int sel = SelectedIndex(g_app.songs);
         PlayFromSongList(sel >= 0 ? sel : (g_app.shuffle ? RandomBelow((int)g_app.songData.size()) : 0));
     } else if (QueueValid()) {
@@ -2030,6 +2478,7 @@ static HWND CurrentList()
     case VIEW_TRACKS:
     case VIEW_SONGS:
     case VIEW_FAVORITES:
+    case VIEW_DOWNLOADS:
     case VIEW_QUEUE:   return g_app.songs;
     default:           return g_app.albums;
     }
@@ -2040,8 +2489,8 @@ static void SetView(MainView v)
     g_app.mainView = v;
     if (v != VIEW_QUEUE && g_app.songSource == SRC_QUEUE)
         g_app.songSource = SRC_NONE;   // the hidden list no longer follows the queue
-    const bool albumList = v == VIEW_ALBUMS || v == VIEW_ARTIST;
-    const bool trackList = v == VIEW_TRACKS || v == VIEW_SONGS || v == VIEW_FAVORITES;
+    const bool albumList = v == VIEW_ALBUMS || v == VIEW_ARTIST || v == VIEW_DISCOVER;
+    const bool trackList = v == VIEW_TRACKS || v == VIEW_SONGS || v == VIEW_FAVORITES || v == VIEW_DOWNLOADS;
     ShowWindow(g_app.albums, albumList ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.artists, v == VIEW_ARTISTS ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.songs, trackList || v == VIEW_QUEUE ? SW_SHOW : SW_HIDE);
@@ -2060,11 +2509,12 @@ static void SetView(MainView v)
     InvalidateHeader();
 }
 
-// Puts every album (or the open artist's albums) into the album list, if it isn't already.
-static void ShowAlbumList(bool artist)
+// Puts every album (or the open artist's albums, or a Discover list) into the album list, if
+// it isn't already.
+static void ShowAlbumList(int mode)
 {
-    if (g_app.albumListIsArtist != artist) {
-        g_app.albumListIsArtist = artist;
+    if (g_app.albumListMode != mode) {
+        g_app.albumListMode = mode;
         RebuildAlbumList();
         SelectRow(g_app.albums, 0);
     }
@@ -2072,7 +2522,7 @@ static void ShowAlbumList(bool artist)
 
 static void ShowAlbumsView()
 {
-    ShowAlbumList(false);
+    ShowAlbumList(ALBUMS_ALL);
     SetView(VIEW_ALBUMS);
     TreeSelectQuietly(g_app.treeAlbums);
     SetFocus(g_app.albums);
@@ -2080,6 +2530,10 @@ static void ShowAlbumsView()
 
 static void LoadAllSongs()
 {
+    if (g_app.offline) {
+        SetStatus(L"Offline: only Downloads can be used. File > Connect tries again.");
+        return;
+    }
     if (!TryBeginLoad()) {
         g_app.pendingSongs = true;   // retried when the running load finishes
         return;
@@ -2107,6 +2561,10 @@ static void ShowSongsView()
 
 static void LoadFavorites()
 {
+    if (g_app.offline) {
+        SetStatus(L"Offline: only Downloads can be used. File > Connect tries again.");
+        return;
+    }
     if (!TryBeginLoad()) {
         g_app.pendingFavorites = true;   // retried when the running load finishes
         return;
@@ -2141,6 +2599,269 @@ static void ShowQueueView()
     TreeSelectQuietly(g_app.treeQueue);
     SelectRow(g_app.songs, QueueValid() ? g_app.queueIndex : 0);
     SetFocus(g_app.songs);
+}
+
+// --- Discover (Recently Added, Recently Played, Most Played, Random Albums) -------------------
+
+// reload: fetch the list again (each visit); false shows the one already loaded (Back).
+static void ShowDiscoverView(int kind, bool reload)
+{
+    if (kind < 0 || kind >= DISCOVER_COUNT)
+        return;
+    if (g_app.offline) {
+        SetStatus(L"Offline: only Downloads can be used. File > Connect tries again.");
+        return;
+    }
+    if (reload || kind != g_app.discoverKind) {
+        g_app.discoverAlbums.clear();
+        g_app.discoverLoaded = g_app.discoverFailed = false;
+        Job* job = NewJob(JOB_DISCOVER);
+        job->index = kind;
+        LaunchJob(job);
+        reload = true;
+    }
+    g_app.discoverKind = kind;
+    g_app.albumListMode = -1;
+    ShowAlbumList(ALBUMS_DISCOVER);
+    SetView(VIEW_DISCOVER);
+    TreeSelectQuietly(g_app.treeDiscover[kind]);
+    SetFocus(g_app.albums);
+    if (reload)
+        SetStatus(Fmt(L"Loading %ls...", kDiscoverTitles[kind]));
+}
+
+// --- Downloads (offline listening) ----------------------------------------------------------
+
+namespace {
+const wchar_t* SortText(const std::wstring& s)
+{
+    const wchar_t* p = s.c_str();
+    while (*p == L' ' || *p == L'\t')
+        ++p;
+    return p;
+}
+
+struct DownloadOrder {   // artist, album, disc, track
+    bool operator()(const SubsonicSong& a, const SubsonicSong& b) const
+    {
+        int c = _wcsicmp(SortText(a.artist), SortText(b.artist));
+        if (c)
+            return c < 0;
+        c = _wcsicmp(SortText(a.album), SortText(b.album));
+        if (c)
+            return c < 0;
+        if (a.disc != b.disc)
+            return a.disc < b.disc;
+        return a.track < b.track;
+    }
+};
+}
+
+static void FillDownloadsList()
+{
+    const std::vector<DownloadedTrack>& t = g_app.downloads.Tracks();
+    std::vector<SubsonicSong> songs;
+    for (size_t i = 0; i < t.size(); ++i)
+        songs.push_back(t[i].song);
+    std::stable_sort(songs.begin(), songs.end(), DownloadOrder());
+    g_app.songData.swap(songs);
+}
+
+// Library > Downloads: every downloaded track, by artist and album.
+static std::wstring DefaultDownloadsFolder()
+{
+    return ExeDirectory() + L"\\Downloads";
+}
+
+// [Downloads] Folder, or the Downloads folder next to the exe.
+static std::wstring DownloadsFolderSetting()
+{
+    wchar_t buf[MAX_PATH] = L"";
+    GetPrivateProfileStringW(L"Downloads", L"Folder", L"", buf, MAX_PATH, g_app.iniPath.c_str());
+    return buf[0] ? std::wstring(buf) : DefaultDownloadsFolder();
+}
+
+static void ShowDiscoverView(int kind, bool reload);
+
+static void ShowDownloadsView()
+{
+    g_app.songSource = SRC_DOWNLOADS;
+    FillDownloadsList();
+    FillSongs();
+    SetView(VIEW_DOWNLOADS);
+    TreeSelectQuietly(g_app.treeDownloads);
+    SelectRow(g_app.songs, 0);
+    SetFocus(g_app.songs);
+    unsigned other = 0;
+    for (size_t i = 0; i < g_app.songData.size(); ++i)
+        if (OnOtherServer(g_app.songData[i].id))
+            ++other;
+    if (other)
+        SetStatus(Fmt(L"%u of these downloads are from another server: they play from disk, but can't be "
+                      L"rated, starred or added to this server's playlists.", other));
+}
+
+// The downloads changed: refresh the Downloads page if it's showing, and the marks elsewhere.
+static void DownloadsChanged()
+{
+    static bool hadAny = false;
+    const bool any = !g_app.downloads.Tracks().empty();
+    if (any != hadAny) {   // show or hide the arrow column
+        hadAny = any;
+        Layout(g_app.wnd);
+    }
+    if (g_app.mainView == VIEW_DOWNLOADS && g_app.songSource == SRC_DOWNLOADS) {
+        int sel = SelectedIndex(g_app.songs);
+        FillDownloadsList();
+        FillSongs();
+        if (sel >= (int)g_app.songData.size())
+            sel = (int)g_app.songData.size() - 1;
+        SelectRow(g_app.songs, sel < 0 ? 0 : sel);
+    }
+    InvalidateRect(g_app.songs, NULL, FALSE);
+    InvalidateHeader();
+}
+
+static std::wstring SizeText(unsigned long long bytes)
+{
+    if (bytes >= 1024ULL * 1024 * 1024)
+        return Fmt(L"%I64u.%I64u GB", bytes / (1024ULL * 1024 * 1024), bytes * 10 / (1024ULL * 1024 * 1024) % 10);
+    return Fmt(L"%I64u MB", (bytes + 512 * 1024) / (1024 * 1024));
+}
+
+// Queues tracks to download, at the download quality (Settings > Downloads): as they would
+// stream, FLAC originals (Lossless; other formats as 320 kbps MP3), or MP3 at a bitrate.
+static void DownloadSongs(const std::vector<SubsonicSong>& songs)
+{
+    if (g_app.offline) {
+        SetStatus(L"Offline: downloading needs the server. File > Connect tries again.");
+        return;
+    }
+    std::wstring err;
+    if (!g_app.downloads.EnsureFolder(err)) {
+        MessageBoxW(g_app.wnd, err.c_str(), APP_TITLE, MB_ICONERROR);
+        return;
+    }
+    std::vector<DownloadItem> items;
+    for (size_t i = 0; i < songs.size(); ++i) {
+        DownloadItem it;
+        it.song = songs[i];
+        if (it.song.albumArtist.empty())   // the album's artist names the folder
+            for (size_t k = 0; k < g_app.albumData.size(); ++k)
+                if (g_app.albumData[k].id == it.song.albumId) {
+                    it.song.albumArtist = g_app.albumData[k].artist;
+                    break;
+                }
+        const int q = g_app.dlQuality;
+        it.flac = q == 0 ? g_app.client.StreamsLossless(songs[i]) : q == 1 && g_app.client.CanPlayFlac(songs[i]);
+        it.url = it.flac ? g_app.client.OriginalUrl(songs[i].id)
+                         : g_app.client.StreamUrl(songs[i].id, 0, q == 0 ? 0 : (q == 1 ? 320 : q));
+        if (!songs[i].coverArt.empty())
+            it.artUrl = g_app.client.CoverArtUrl(songs[i].coverArt, kArtSize);
+        it.opts = g_app.client.Options();
+        it.server = g_app.downloads.Server();
+        items.push_back(it);
+    }
+    const int added = g_app.downloads.Enqueue(items);
+    if (added == 0)
+        SetStatus(songs.size() == 1 ? L"Already downloaded." : L"Those tracks are already downloaded.");
+    else
+        SetStatus(Fmt(L"Downloading %d track%ls...", added, added == 1 ? L"" : L"s"));
+    InvalidateHeader();
+}
+
+// An album or a playlist; a playlist is also saved, so it shows under Playlists offline.
+static void DownloadFetched(const std::string& albumId, const SubsonicPlaylist* playlist, const std::wstring& name)
+{
+    if (g_app.offline) {
+        SetStatus(L"Offline: downloading needs the server. File > Connect tries again.");
+        return;
+    }
+    Job* job = NewJob(JOB_DL_FETCH);
+    job->addAlbumId = albumId;
+    if (playlist) {
+        job->plId = playlist->id;
+        job->playlist = *playlist;
+    }
+    SetStatus(L"Getting the tracks of \"" + name + L"\" to download...");
+    LaunchJob(job);
+}
+
+// Offline, the sidebar's playlists are the downloaded ones (playlistData is filled from them).
+static void ShowOfflinePlaylists()
+{
+    g_app.playlistData.clear();
+    const std::vector<DownloadedPlaylist>& pls = g_app.downloads.Playlists();
+    for (size_t i = 0; i < pls.size(); ++i)
+        g_app.playlistData.push_back(pls[i].info);
+    RebuildPlaylistTree();
+}
+
+// A downloaded playlist, offline: its downloaded tracks in its saved order. Tracks that
+// weren't downloaded are left out, and the header says how many are shown.
+static void OpenOfflinePlaylist(int i)
+{
+    const DownloadedPlaylist* pl = g_app.downloads.FindPlaylist(g_app.playlistData[i].id);
+    if (!pl)
+        return;
+    g_app.songData.clear();
+    g_app.playlistIds = pl->songIds;
+    g_app.playlistRows.clear();
+    for (size_t k = 0; k < pl->songIds.size(); ++k)
+        if (const DownloadedTrack* d = g_app.downloads.Find(pl->songIds[k])) {
+            g_app.playlistRows.push_back((int)k);
+            g_app.songData.push_back(d->song);
+        }
+    g_app.songSource = SRC_PLAYLIST;
+    g_app.shownPlaylist = pl->info;
+    ShowPlaylistInfo(pl->info);
+    g_app.shownArt = CachedArt(pl->info.coverArt);
+    if (!g_app.shownArt && NeedArt(pl->info.coverArt)) {   // from the downloads folder
+        Job* art = NewJob(JOB_ART);
+        art->artId = pl->info.coverArt;
+        art->needArt = true;
+        LaunchJob(art);
+    }
+    FillSongs();
+    SetView(VIEW_TRACKS);
+    SelectRow(g_app.songs, 0);
+    SetStatus(Fmt(L"%ls: %u downloaded tracks.", pl->info.name.c_str(), (unsigned)g_app.songData.size()));
+}
+
+
+static void OnDownloadEvent(DownloadEvent* e)
+{
+    switch (e->kind) {
+    case DL_STARTED:
+        SetStatus(e->remaining ? Fmt(L"Downloading \"%ls\" (%d more waiting)...", e->title.c_str(), e->remaining)
+                               : L"Downloading \"" + e->title + L"\"...");
+        InvalidateHeader();
+        break;
+    case DL_DONE:
+        g_app.downloads.Add(e->track);
+        ++g_app.dlSaved;
+        DownloadsChanged();
+        break;
+    case DL_FAILED:
+        ++g_app.dlFailed;
+        g_app.dlLastError = e->error;
+        LogF(L"Download of \"%ls\" failed: %ls", e->title.c_str(), e->error.c_str());
+        break;
+    case DL_IDLE: {
+        std::wstring msg = Fmt(L"Downloads finished: %d saved", g_app.dlSaved);
+        if (g_app.dlFailed) {
+            std::wstring first = g_app.dlLastError.substr(0, g_app.dlLastError.find(L'\r'));
+            msg += Fmt(L", %d failed (%ls)", g_app.dlFailed, first.c_str());
+        }
+        if (g_app.dlSaved || g_app.dlFailed)
+            SetStatus(msg + L".");
+        g_app.dlSaved = g_app.dlFailed = 0;
+        g_app.dlLastError.clear();
+        InvalidateHeader();
+        break;
+    }
+    }
+    delete e;
 }
 
 static void ShowArtistsView()
@@ -2233,7 +2954,7 @@ static void RefreshShownInfo()
 // Back to the artist page from one of their albums (its list is still loaded).
 static void ShowArtistPage()
 {
-    ShowAlbumList(true);
+    ShowAlbumList(ALBUMS_ARTIST);
     ShowArtistInfo();
     SetView(VIEW_ARTIST);
     TreeSelectQuietly(NULL);
@@ -2246,6 +2967,8 @@ static void GoBack()
     if (g_app.mainView == VIEW_TRACKS && g_app.songSource == SRC_ALBUM) {
         if (g_app.albumOrigin == VIEW_ARTIST)
             ShowArtistPage();
+        else if (g_app.albumOrigin == VIEW_DISCOVER)
+            ShowDiscoverView(g_app.discoverKind, false);
         else
             ShowAlbumsView();
     } else if (g_app.mainView == VIEW_ARTIST) {
@@ -2263,8 +2986,30 @@ static void ClearSongs()
     InvalidateHeader();
 }
 
-static void DoConnect()
+// keepPlayback: reload the library (after choosing libraries) without stopping the music.
+// What downloads are tagged with: the primary address, lowercase, without a trailing slash.
+// The LAN address and other names for the same server are matched by asking it (see
+// Downloads::OtherServerSamples).
+static std::string ServerKey(const SubsonicConfig& cfg)
 {
+    std::wstring url = cfg.url.empty() ? cfg.lanUrl : cfg.url;
+    while (!url.empty() && url[url.size() - 1] == L'/')
+        url.erase(url.size() - 1);
+    if (!url.empty())
+        CharLowerBuffW(&url[0], (DWORD)url.size());
+    return WideToUtf8(url);
+}
+
+static void DoConnect(bool keepPlayback = false)
+{
+    // A library reload waits for whatever is running (often a now-playing report) and
+    // retries on its own; reconnecting by hand would stop the music.
+    if (keepPlayback && (g_app.loadBusy || g_app.jobsRunning > 0)) {
+        SetStatus(L"Loading the chosen libraries in a moment...");
+        SetTimer(g_app.wnd, TIMER_RELOAD, 500, NULL);
+        return;
+    }
+    KillTimer(g_app.wnd, TIMER_RELOAD);
     if (!TryBeginLoad())
         return;
     if (g_app.jobsRunning > 0) {     // a rating/playlist edit is still talking to the server
@@ -2283,12 +3028,13 @@ static void DoConnect()
         return;
     }
 
-    g_app.player.Stop();
+    if (!keepPlayback)
+        g_app.player.Stop();
     g_app.albumData.clear();
     g_app.playlistData.clear();
     g_app.artistData.clear();
     g_app.artistAlbums.clear();
-    g_app.albumListIsArtist = false;
+    g_app.albumListMode = ALBUMS_ALL;
     g_app.allSongs.clear();
     g_app.allSongsLoaded = false;
     g_app.pendingSongs = false;
@@ -2301,26 +3047,34 @@ static void DoConnect()
     g_app.queryArtists.clear();
     g_app.querySongs.clear();
     FillArtists();
-    g_app.queue.clear();
-    g_app.queueSource.clear();
-    g_app.queueSrcIdx.clear();
-    g_app.queueIndex = -1;
-    g_app.queueFinished = false;
-    g_app.nowCoverPending.clear();
-    g_app.infoCache.clear();
-    g_app.infoPending.clear();
-    ClearArtCache();
+    if (!keepPlayback) {
+        g_app.queue.clear();
+        g_app.queueSource.clear();
+        g_app.queueSrcIdx.clear();
+        g_app.queueIndex = -1;
+        g_app.queueFinished = false;
+        g_app.nowCoverPending.clear();
+        g_app.infoCache.clear();
+        g_app.infoPending.clear();
+        ClearArtCache();
+    }
     ClearSongs();
     RebuildAlbumList();
     RebuildPlaylistTree();
-    ResetSeekBar(0);
-    UpdateNowPlaying();
+    if (!keepPlayback) {
+        ResetSeekBar(0);
+        UpdateNowPlaying();
+    }
     ShowAlbumsView();
     g_app.client.Configure(cfg);
     g_app.serverUrl = cfg.url;
+    g_app.downloads.SetServer(ServerKey(cfg));
 
-    SetStatus(L"Connecting to " + cfg.url + L"...");
-    LaunchJob(NewJob(JOB_CONNECT));
+    SetStatus(keepPlayback ? std::wstring(L"Loading the chosen libraries...") : L"Connecting to " + cfg.url + L"...");
+    Job* job = NewJob(JOB_CONNECT);
+    job->flag = keepPlayback;   // no repeat of the connection notice
+    job->dlSamples = g_app.downloads.OtherServerSamples(5);
+    LaunchJob(job);
 }
 
 static void OpenArtist(const SubsonicArtist& ar)
@@ -2329,6 +3083,7 @@ static void OpenArtist(const SubsonicArtist& ar)
     job->artist = ar;
     job->artId = ar.coverArt;
     job->needArt = !ar.coverArt.empty();   // always try: a cached miss still allows the album fallback
+    job->shownAlbums = g_app.libraryAlbums;
     SetStatus(L"Loading " + ar.name + L"...");
     LaunchJob(job);
 }
@@ -2363,14 +3118,14 @@ static void OpenSelectedAlbum()
         g_app.pendingPlaylist = -1;
         return;
     }
-    OpenAlbum(list[i], g_app.mainView == VIEW_ARTIST ? VIEW_ARTIST : VIEW_ALBUMS);
+    OpenAlbum(list[i], g_app.mainView == VIEW_ARTIST || g_app.mainView == VIEW_DISCOVER ? g_app.mainView : VIEW_ALBUMS);
 }
 
 // Right-click a track > Go to album / Go to artist. Uses the library lists loaded at connect;
 // a newer album or artist falls back to what the track itself says.
 static void GoToAlbum(const SubsonicSong& s)
 {
-    if (s.albumId.empty())
+    if (s.albumId.empty() || RefuseOtherServer(std::vector<std::string>(1, s.id)))
         return;
     if (!TryBeginLoad()) {
         SetStatus(L"Still loading; try again in a moment.");
@@ -2392,7 +3147,7 @@ static void GoToAlbum(const SubsonicSong& s)
 
 static void GoToArtist(const SubsonicSong& s)
 {
-    if (s.artistId.empty())
+    if (s.artistId.empty() || RefuseOtherServer(std::vector<std::string>(1, s.id)))
         return;
     if (!TryBeginLoad()) {
         SetStatus(L"Still loading; try again in a moment.");
@@ -2410,10 +3165,16 @@ static void GoToArtist(const SubsonicSong& s)
     OpenArtist(ar);
 }
 
+static void OpenOfflinePlaylist(int i);
+
 static void OpenPlaylist(int i)
 {
     if (i < 0 || i >= (int)g_app.playlistData.size())
         return;
+    if (g_app.offline) {
+        OpenOfflinePlaylist(i);
+        return;
+    }
     if (!TryBeginLoad()) {
         g_app.pendingLoad = true;
         g_app.pendingPlaylist = i;
@@ -2500,12 +3261,15 @@ static void StartEdit(Job* job, const std::wstring& status)
 // Moving and removing go by position, so they need the playlist's own order (not sorted).
 static bool ShownPlaylistEditable()
 {
-    return g_app.songSource == SRC_PLAYLIST && g_app.client.CanEdit(g_app.shownPlaylist) && !SongsSorted();
+    return g_app.songSource == SRC_PLAYLIST && !g_app.offline && g_app.client.CanEdit(g_app.shownPlaylist) &&
+           !SongsSorted();
 }
 
 static void NewPlaylist(const std::vector<std::string>& songIds, const std::string& albumId,
                         const std::wstring& suggested)
 {
+    if (RefuseOtherServer(songIds))
+        return;
     std::wstring name = suggested;
     if (!AskName(L"New playlist", name))
         return;
@@ -2519,7 +3283,7 @@ static void NewPlaylist(const std::vector<std::string>& songIds, const std::stri
 
 static void AddToPlaylist(int plIndex, const std::vector<std::string>& songIds, const std::string& albumId)
 {
-    if (plIndex < 0 || plIndex >= (int)g_app.playlistData.size())
+    if (plIndex < 0 || plIndex >= (int)g_app.playlistData.size() || RefuseOtherServer(songIds))
         return;
     Job* job = NewJob(JOB_PLEDIT);
     job->edit = PL_ADD;
@@ -2529,20 +3293,24 @@ static void AddToPlaylist(int plIndex, const std::vector<std::string>& songIds, 
     StartEdit(job, L"Adding to \"" + g_app.playlistData[plIndex].name + L"\"...");
 }
 
-// Moves track 'from' of the playlist on screen so it ends up at 'to'.
+// Moves shown track 'from' of the playlist on screen so it ends up at shown row 'to'. The
+// server gets the whole playlist, hidden tracks included and left where they were.
 static void MovePlaylistEntry(int from, int to)
 {
     const int n = (int)g_app.songData.size();
-    if (!ShownPlaylistEditable() || from < 0 || to < 0 || from >= n || to >= n || from == to)
+    if (!ShownPlaylistEditable() || from < 0 || to < 0 || from >= n || to >= n || from == to ||
+        n != (int)g_app.playlistRows.size())
         return;
     Job* job = NewJob(JOB_PLEDIT);
     job->edit = PL_SETSONGS;
     job->plId = g_app.shownPlaylist.id;
-    for (int k = 0; k < n; ++k)
-        job->songIds.push_back(g_app.songData[k].id);
-    const std::string id = job->songIds[from];
-    job->songIds.erase(job->songIds.begin() + from);
-    job->songIds.insert(job->songIds.begin() + to, id);
+    job->songIds = g_app.playlistIds;
+    const int fullFrom = g_app.playlistRows[from];
+    const std::string id = job->songIds[fullFrom];
+    job->songIds.erase(job->songIds.begin() + fullFrom);
+    // Moving up it goes before shown row 'to'; moving down, after it. Either way that is
+    // playlistRows[to] once the track has been taken out.
+    job->songIds.insert(job->songIds.begin() + g_app.playlistRows[to], id);
     job->selectAfter = to;
     StartEdit(job, L"Moving \"" + g_app.songData[from].title + L"\"...");
 }
@@ -2556,6 +3324,10 @@ static void MoveInPlaylist(int i, int delta)
 
 static void DragBegin(int row)
 {
+    if (ListView_GetSelectedCount(g_app.songs) > 1) {
+        SetStatus(L"Drag one track at a time; right-click to move or remove several.");
+        return;
+    }
     if (g_app.songSource == SRC_PLAYLIST && SongsSorted()) {
         SetStatus(L"The playlist is sorted: click # to restore its order, then drag tracks.");
         return;
@@ -2653,12 +3425,13 @@ static void DragEnd(bool drop)
 
 static void RemoveFromPlaylist(int i)
 {
-    if (!ShownPlaylistEditable() || i < 0 || i >= (int)g_app.songData.size())
+    if (!ShownPlaylistEditable() || i < 0 || i >= (int)g_app.songData.size() ||
+        g_app.songData.size() != g_app.playlistRows.size())
         return;
     Job* job = NewJob(JOB_PLEDIT);
     job->edit = PL_REMOVE;
     job->plId = g_app.shownPlaylist.id;
-    job->index = i;
+    job->index = g_app.playlistRows[i];   // position in the full playlist
     job->selectAfter = (i + 1 < (int)g_app.songData.size()) ? i : i - 1;
     StartEdit(job, L"Removing \"" + g_app.songData[i].title + L"\"...");
 }
@@ -2792,6 +3565,7 @@ static void OnPlaylistEditDone(Job* job)
     }
     if (job->reloaded && g_app.songSource == SRC_PLAYLIST && g_app.shownPlaylist.id == job->reloadId) {
         g_app.songData.swap(job->songs);
+        FilterShownPlaylist();
         FillSongs();
         SelectRow(g_app.songs, job->selectAfter);
         for (size_t i = 0; i < g_app.playlistData.size(); ++i)
@@ -2844,6 +3618,25 @@ static void OnJobDone(Job* job)
             g_app.albumData.swap(job->albums);
             g_app.playlistData.swap(job->playlists);
             g_app.artistData.swap(job->artists);
+            g_app.libraries.swap(job->libraries);
+            if (g_app.offline)
+                SetStatus(L"Back online.");
+            g_app.offline = false;
+            for (size_t k = 0; k < job->dlSameServer.size(); ++k)
+                LogF(L"%d download(s) recognised as this server's", g_app.downloads.Adopt(job->dlSameServer[k]));
+            SendSavedScrobbles();
+            {   // downloads from older versions move into Artist\Album folders
+                std::map<std::string, std::wstring> albumArtists;
+                for (size_t i = 0; i < g_app.albumData.size(); ++i)
+                    albumArtists[g_app.albumData[i].id] = g_app.albumData[i].artist;
+                const int moved = g_app.downloads.Organize(albumArtists);
+                if (moved)
+                    LogF(L"Moved %d downloaded track(s) into artist and album folders", moved);
+            }
+            g_app.libraryAlbums.clear();
+            if (!g_app.client.Libraries().empty())
+                for (size_t i = 0; i < g_app.albumData.size(); ++i)
+                    g_app.libraryAlbums.insert(g_app.albumData[i].id);
             BuildAlbumKeys();
             BuildArtistKeys();
             RebuildAlbumList();
@@ -2853,10 +3646,18 @@ static void OnJobDone(Job* job)
             SetStatus(Fmt(L"%u albums, %u playlist%ls. %ls", (unsigned)g_app.albumData.size(),
                           (unsigned)g_app.playlistData.size(), g_app.playlistData.size() == 1 ? L"" : L"s",
                           g_app.cpuSummary.c_str()));
-            if (!job->message.empty())
+            if (!job->message.empty() && !job->flag)
                 MessageBoxW(g_app.wnd, job->message.c_str(), APP_TITLE, MB_ICONWARNING);
             SelectRow(g_app.albums, 0);
-            ShowAlbumsView();
+            ShowStartView();
+        } else if (!g_app.downloads.Tracks().empty()) {
+            // No server, but there is music on disk: open with that instead of an error.
+            g_app.offline = true;
+            LogF(L"Could not connect; offline with %u downloads: %ls", (unsigned)g_app.downloads.Tracks().size(),
+                 job->message.c_str());
+            ShowOfflinePlaylists();
+            ShowDownloadsView();
+            SetStatus(L"Offline: the server can't be reached, so your downloads are shown. File > Connect tries again.");
         } else {
             SetStatus(L"Not connected.");
             MessageBoxW(g_app.wnd, job->message.c_str(), APP_TITLE L" - connection failed", MB_ICONERROR);
@@ -2875,6 +3676,14 @@ static void OnJobDone(Job* job)
             } else {
                 g_app.songSource = SRC_PLAYLIST;
                 g_app.shownPlaylist = job->playlist;
+                if (g_app.downloads.FindPlaylist(job->playlist.id)) {   // keep its offline copy current
+                    std::vector<std::string> ids;
+                    for (size_t k = 0; k < g_app.songData.size(); ++k)
+                        if (InChosenLibraries(g_app.songData[k]))
+                            ids.push_back(g_app.songData[k].id);
+                    g_app.downloads.SavePlaylist(job->playlist, ids);
+                }
+                FilterShownPlaylist();
                 ShowPlaylistInfo(job->playlist);
             }
             FillSongs();
@@ -2912,10 +3721,35 @@ static void OnJobDone(Job* job)
         }
         break;
 
+    case JOB_DISCOVER:
+        if (g_app.discoverKind != job->index || g_app.discoverLoaded)
+            break;   // another list was opened meanwhile
+        g_app.discoverLoaded = true;
+        g_app.discoverFailed = !job->ok;
+        g_app.discoverAlbums.swap(job->albums);
+        if (g_app.mainView == VIEW_DISCOVER) {
+            g_app.albumListMode = -1;
+            ShowAlbumList(ALBUMS_DISCOVER);
+            InvalidateHeader();
+            SetStatus(job->ok ? Fmt(L"%ls: %u albums.", kDiscoverTitles[job->index], (unsigned)g_app.discoverAlbums.size())
+                              : L"Could not load the list: " + job->message.substr(0, job->message.find(L'\r')));
+        }
+        break;
+
     case JOB_SCROBBLE:
-        // Best effort: a failed scrobble is logged, not worth interrupting playback for.
-        if (!job->ok)
+        // Best effort: a failed scrobble is logged, not worth interrupting playback for. A
+        // failed play is kept and sent with its time after the next connect.
+        if (job->index > 0)
+            LogF(L"Sent %d play(s) saved while offline", job->index);
+        if (!job->songIds.empty()) {
+            LogF(L"Saved plays could not be sent yet: %ls", job->message.c_str());
+            SaveScrobblesForLater(job->songIds, job->times);
+        } else if (!job->ok) {
             LogF(L"Scrobble (%ls) failed: %ls", job->flag ? L"play" : L"now playing", job->message.c_str());
+            if (job->flag)
+                SaveScrobblesForLater(std::vector<std::string>(1, job->songId),
+                                      std::vector<unsigned long long>(1, NowMs()));
+        }
         break;
 
     case JOB_RATE:
@@ -2930,8 +3764,26 @@ static void OnJobDone(Job* job)
         OnPlaylistEditDone(job);
         break;
 
+    case JOB_DL_FETCH:
     case JOB_QUEUE_FETCH:
-        if (job->ok && !job->songs.empty()) {
+        if (job->ok && job->addAlbumId.empty()) {   // a playlist: only the shown libraries
+            std::vector<SubsonicSong> kept;
+            for (size_t i = 0; i < job->songs.size(); ++i)
+                if (InChosenLibraries(job->songs[i]))
+                    kept.push_back(job->songs[i]);
+            job->songs.swap(kept);
+        }
+        // (The folder may not exist yet when a playlist is the first download.)
+        if (job->ok && job->kind == JOB_DL_FETCH && !job->plId.empty() && g_app.downloads.EnsureFolder(job->message)) {
+            std::vector<std::string> ids;
+            for (size_t i = 0; i < job->songs.size(); ++i)
+                ids.push_back(job->songs[i].id);
+            g_app.downloads.SavePlaylist(job->playlist, ids);
+            g_app.downloads.SaveArt(job->playlist.coverArt, job->artBytes);
+        }
+        if (job->ok && !job->songs.empty() && job->kind == JOB_DL_FETCH) {
+            DownloadSongs(job->songs);
+        } else if (job->ok && !job->songs.empty()) {
             QueueSongs(job->songs, job->flag);
         } else if (job->ok) {
             SetStatus(L"Nothing to add: the list is empty.");
@@ -2964,7 +3816,7 @@ static void OnJobDone(Job* job)
             g_app.shownArtist = job->artist;
             g_app.shownArtistCover = job->art ? job->artId : std::string();
             g_app.artistAlbums.swap(job->albums);
-            g_app.albumListIsArtist = false;   // force a refill
+            g_app.albumListMode = -1;   // force a refill
             ShowArtistPage();
             SetStatus(Fmt(L"%ls: %u album%ls.", job->artist.name.c_str(), (unsigned)g_app.artistAlbums.size(),
                           g_app.artistAlbums.size() == 1 ? L"" : L"s"));
@@ -3099,6 +3951,83 @@ static POINT ListMenuPoint(HWND lv, LPARAM lp, int item)
     return MenuPointAt(lv, lp, has ? &r : NULL);
 }
 
+// --- Several selected tracks ----------------------------------------------------------------
+
+static std::vector<SubsonicSong> SongsAt(const std::vector<int>& rows)
+{
+    std::vector<SubsonicSong> songs;
+    for (size_t k = 0; k < rows.size(); ++k)
+        if (rows[k] >= 0 && rows[k] < (int)g_app.songData.size())
+            songs.push_back(g_app.songData[rows[k]]);
+    return songs;
+}
+
+// Plays just these tracks (Play on a selection).
+static void PlaySongs(const std::vector<SubsonicSong>& songs)
+{
+    if (songs.empty())
+        return;
+    g_app.queueSource = songs;
+    BuildQueue(0);
+    StartQueue(g_app.queueIndex, 0);
+}
+
+static void RemoveDownloads(const std::vector<SubsonicSong>& songs)
+{
+    int n = 0;
+    for (size_t k = 0; k < songs.size(); ++k)
+        if (g_app.downloads.Remove(songs[k].id))
+            ++n;
+    if (!n)
+        return;
+    DownloadsChanged();
+    SetStatus(n == 1 ? L"Removed the download of \"" + songs[0].title + L"\"."
+                     : Fmt(L"Removed %d downloads.", n));
+}
+
+static void RemoveQueueRows(std::vector<int> rows)
+{
+    std::sort(rows.begin(), rows.end());
+    int removed = 0;
+    for (int k = (int)rows.size() - 1; k >= 0; --k) {
+        const int r = rows[k];
+        if (r < 0 || r >= (int)g_app.queue.size() || r == g_app.queueIndex)
+            continue;   // the playing track stays
+        g_app.queue.erase(g_app.queue.begin() + r);
+        if (r < g_app.queueIndex)
+            --g_app.queueIndex;
+        ++removed;
+    }
+    if (!removed)
+        return;
+    QueueEdited(rows.empty() ? -1 : (std::min)(rows[0], (int)g_app.queue.size() - 1));
+    SetStatus(Fmt(L"Removed %d track%ls from the queue.", removed, removed == 1 ? L"" : L"s"));
+}
+
+// Several rows of the playlist on screen: the server gets the whole list without them
+// (hidden tracks from other libraries stay).
+static void RemovePlaylistRows(const std::vector<int>& rows)
+{
+    if (rows.size() == 1) {
+        RemoveFromPlaylist(rows[0]);
+        return;
+    }
+    if (!ShownPlaylistEditable() || rows.empty() || g_app.songData.size() != g_app.playlistRows.size())
+        return;
+    std::vector<bool> drop(g_app.playlistIds.size(), false);
+    for (size_t k = 0; k < rows.size(); ++k)
+        if (rows[k] >= 0 && rows[k] < (int)g_app.playlistRows.size())
+            drop[g_app.playlistRows[rows[k]]] = true;
+    Job* job = NewJob(JOB_PLEDIT);
+    job->edit = PL_SETSONGS;
+    job->plId = g_app.shownPlaylist.id;
+    for (size_t k = 0; k < g_app.playlistIds.size(); ++k)
+        if (!drop[k])
+            job->songIds.push_back(g_app.playlistIds[k]);
+    job->selectAfter = rows[0];
+    StartEdit(job, Fmt(L"Removing %u tracks from the playlist...", (unsigned)rows.size()));
+}
+
 static void SongsContextMenu(LPARAM lp)
 {
     int i = SelectedIndex(g_app.songs);
@@ -3106,6 +4035,19 @@ static void SongsContextMenu(LPARAM lp)
         return;
     const SubsonicSong& s = g_app.songData[i];
     const bool editable = ShownPlaylistEditable();
+    // A right-click on a selected row acts on the whole selection.
+    std::vector<int> rows = SelectedRows(g_app.songs);
+    if (rows.empty())
+        rows.push_back(i);
+    const bool many = rows.size() > 1;
+    const UINT one = many ? MF_GRAYED : 0;   // actions for a single track
+    const std::vector<SubsonicSong> sel = SongsAt(rows);
+    std::vector<SubsonicSong> toDownload, toRemove;
+    bool anyOther = false;   // another server's download: only playing and removing work
+    for (size_t k = 0; k < sel.size(); ++k) {
+        (g_app.downloads.Find(sel[k].id) ? toRemove : toDownload).push_back(sel[k]);
+        anyOther = anyOther || OnOtherServer(sel[k].id);
+    }
 
     HMENU rate = CreatePopupMenu();
     static const wchar_t* kRate[] = { L"&5 stars", L"&4 stars", L"&3 stars", L"&2 stars", L"&1 star" };
@@ -3115,38 +4057,57 @@ static void SongsContextMenu(LPARAM lp)
     AppendMenuW(rate, MF_STRING | (s.userRating ? 0 : MF_GRAYED), CMD_RATE_BASE, L"&Clear rating");
 
     const bool inQueue = g_app.songSource == SRC_QUEUE;
+    const UINT net = g_app.offline ? MF_GRAYED : 0;   // needs the server
+    const UINT netOne = OnOtherServer(s.id) ? MF_GRAYED : net;   // ... and must be this server's song
+    const UINT netSel = anyOther ? MF_GRAYED : net;
+    const bool downloaded = g_app.downloads.Find(s.id) != NULL;
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, CMD_PLAY, L"&Play");
+    AppendMenuW(m, MF_STRING, CMD_PLAY, many ? Fmt(L"&Play these %u tracks", (unsigned)rows.size()).c_str() : L"&Play");
     if (!inQueue) {
         AppendMenuW(m, MF_STRING, CMD_PLAY_NEXT, L"Play &next");
         AppendMenuW(m, MF_STRING, CMD_ADD_QUEUE, L"Add to &queue");
     }
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     const bool onAlbum = g_app.songSource == SRC_ALBUM && g_app.shownAlbum.id == s.albumId;
-    AppendMenuW(m, MF_STRING | (!s.albumId.empty() && !onAlbum ? 0 : MF_GRAYED), CMD_GO_ALBUM, L"Go to a&lbum");
-    AppendMenuW(m, MF_STRING | (!s.artistId.empty() ? 0 : MF_GRAYED), CMD_GO_ARTIST, L"Go to ar&tist");
+    AppendMenuW(m, MF_STRING | one | (!s.albumId.empty() && !onAlbum ? netOne : MF_GRAYED), CMD_GO_ALBUM, L"Go to a&lbum");
+    AppendMenuW(m, MF_STRING | one | (!s.artistId.empty() ? netOne : MF_GRAYED), CMD_GO_ARTIST, L"Go to ar&tist");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     if (g_app.showRatings)
-        AppendMenuW(m, MF_POPUP, (UINT_PTR)rate, L"&Rate");
+        AppendMenuW(m, MF_POPUP | netOne | one, (UINT_PTR)rate, L"&Rate");
     else
         DestroyMenu(rate);
     if (g_app.showFavorites)
-        AppendMenuW(m, MF_STRING, CMD_FAV, s.starred ? L"Remove from &Favorites" : L"Add to &Favorites");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)BuildAddToMenu(), L"&Add to playlist");
+        AppendMenuW(m, MF_STRING | netOne | one, CMD_FAV, s.starred ? L"Remove from &Favorites" : L"Add to &Favorites");
+    AppendMenuW(m, MF_POPUP | netSel, (UINT_PTR)BuildAddToMenu(), many ? L"&Add these to playlist" : L"&Add to playlist");
+    if (many) {
+        if (!toDownload.empty())
+            AppendMenuW(m, MF_STRING | net, CMD_DOWNLOAD,
+                        Fmt(L"Do&wnload %u for offline", (unsigned)toDownload.size()).c_str());
+        if (!toRemove.empty())
+            AppendMenuW(m, MF_STRING, CMD_DL_REMOVE, Fmt(L"Remove %u do&wnloads", (unsigned)toRemove.size()).c_str());
+    } else if (downloaded) {
+        AppendMenuW(m, MF_STRING, CMD_DL_REMOVE, L"Remove do&wnload");
+    } else if (g_app.downloads.IsQueued(s.id)) {
+        AppendMenuW(m, MF_STRING | MF_GRAYED, CMD_DOWNLOAD, L"Do&wnloading...");
+    } else {
+        AppendMenuW(m, MF_STRING | net, CMD_DOWNLOAD, L"Do&wnload for offline");
+    }
     if (g_app.songSource == SRC_PLAYLIST) {
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(m, MF_STRING | (editable && i > 0 ? 0 : MF_GRAYED), CMD_MOVE_UP, L"Move &up");
-        AppendMenuW(m, MF_STRING | (editable && i + 1 < (int)g_app.songData.size() ? 0 : MF_GRAYED),
+        AppendMenuW(m, MF_STRING | one | (editable && i > 0 ? 0 : MF_GRAYED), CMD_MOVE_UP, L"Move &up");
+        AppendMenuW(m, MF_STRING | one | (editable && i + 1 < (int)g_app.songData.size() ? 0 : MF_GRAYED),
                     CMD_MOVE_DOWN, L"Move &down");
         AppendMenuW(m, MF_STRING | (editable ? 0 : MF_GRAYED), CMD_REMOVE,
-                    SongsSorted() ? L"Remo&ve from playlist (click # to unsort first)" : L"Remo&ve from playlist\tDel");
+                    SongsSorted() ? L"Remo&ve from playlist (click # to unsort first)"
+                    : many ? Fmt(L"Remo&ve %u from playlist\tDel", (unsigned)rows.size()).c_str()
+                           : L"Remo&ve from playlist\tDel");
     } else if (inQueue) {
         const int n = (int)g_app.queue.size();
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(m, MF_STRING | (i > 0 ? 0 : MF_GRAYED), CMD_MOVE_UP, L"Move &up");
-        AppendMenuW(m, MF_STRING | (i + 1 < n ? 0 : MF_GRAYED), CMD_MOVE_DOWN, L"Move &down");
-        AppendMenuW(m, MF_STRING | (i != g_app.queueIndex ? 0 : MF_GRAYED), CMD_REMOVE,
-                    L"Remo&ve from queue\tDel");
+        AppendMenuW(m, MF_STRING | one | (i > 0 ? 0 : MF_GRAYED), CMD_MOVE_UP, L"Move &up");
+        AppendMenuW(m, MF_STRING | one | (i + 1 < n ? 0 : MF_GRAYED), CMD_MOVE_DOWN, L"Move &down");
+        AppendMenuW(m, MF_STRING | (many || i != g_app.queueIndex ? 0 : MF_GRAYED), CMD_REMOVE,
+                    many ? Fmt(L"Remo&ve %u from queue\tDel", (unsigned)rows.size()).c_str() : L"Remo&ve from queue\tDel");
         AppendMenuW(m, MF_STRING | (QueueValid() && g_app.queueIndex + 1 < n ? 0 : MF_GRAYED),
                     CMD_CLEAR_UPCOMING, L"&Clear upcoming tracks");
     }
@@ -3155,21 +4116,29 @@ static void SongsContextMenu(LPARAM lp)
     UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_app.wnd, NULL);
     DestroyMenu(m);   // destroys the submenus too
 
-    std::vector<std::string> one(1, s.id);
-    if (cmd == CMD_PLAY)
+    std::vector<std::string> ids;
+    for (size_t k = 0; k < sel.size(); ++k)
+        ids.push_back(sel[k].id);
+    if (cmd == CMD_PLAY && many)
+        PlaySongs(sel);
+    else if (cmd == CMD_PLAY)
         PlayFromSongList(i);
     else if (cmd == CMD_GO_ALBUM)
         GoToAlbum(s);
     else if (cmd == CMD_GO_ARTIST)
         GoToArtist(s);
+    else if (cmd == CMD_DOWNLOAD)
+        DownloadSongs(toDownload);
+    else if (cmd == CMD_DL_REMOVE)
+        RemoveDownloads(toRemove);
     else if (cmd == CMD_PLAY_NEXT || cmd == CMD_ADD_QUEUE)
-        QueueSongs(std::vector<SubsonicSong>(1, s), cmd == CMD_PLAY_NEXT);
+        QueueSongs(sel, cmd == CMD_PLAY_NEXT);
     else if (inQueue && cmd == CMD_MOVE_UP)
         MoveInQueue(i, -1);
     else if (inQueue && cmd == CMD_MOVE_DOWN)
         MoveInQueue(i, +1);
     else if (inQueue && cmd == CMD_REMOVE)
-        RemoveFromQueue(i);
+        RemoveQueueRows(rows);
     else if (cmd == CMD_CLEAR_UPCOMING)
         ClearUpcoming();
     else if (cmd == CMD_FAV)
@@ -3177,15 +4146,15 @@ static void SongsContextMenu(LPARAM lp)
     else if (cmd >= CMD_RATE_BASE && cmd <= CMD_RATE_BASE + 5)
         SetSongRating(i, cmd - CMD_RATE_BASE);
     else if (cmd == CMD_ADD_NEW)
-        NewPlaylist(one, std::string(), L"New playlist");
+        NewPlaylist(ids, std::string(), L"New playlist");
     else if (cmd >= CMD_ADD_BASE)
-        AddToPlaylist(cmd - CMD_ADD_BASE, one, std::string());
+        AddToPlaylist(cmd - CMD_ADD_BASE, ids, std::string());
     else if (cmd == CMD_MOVE_UP)
         MoveInPlaylist(i, -1);
     else if (cmd == CMD_MOVE_DOWN)
         MoveInPlaylist(i, +1);
     else if (cmd == CMD_REMOVE)
-        RemoveFromPlaylist(i);
+        RemovePlaylistRows(rows);
 }
 
 static void AlbumsContextMenu(LPARAM lp)
@@ -3200,6 +4169,7 @@ static void AlbumsContextMenu(LPARAM lp)
     AppendMenuW(m, MF_STRING, CMD_ADD_QUEUE, L"Add to &queue");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)BuildAddToMenu(), L"&Add album to playlist");
+    AppendMenuW(m, MF_STRING, CMD_DOWNLOAD, L"Do&wnload album for offline");
     POINT pt = ListMenuPoint(g_app.albums, lp, i);
     UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_app.wnd, NULL);
     DestroyMenu(m);
@@ -3210,6 +4180,8 @@ static void AlbumsContextMenu(LPARAM lp)
         OpenSelectedAlbum();
     else if (cmd == CMD_PLAY_NEXT || cmd == CMD_ADD_QUEUE)
         QueueFetched(albumId, std::string(), albumName, cmd == CMD_PLAY_NEXT);
+    else if (cmd == CMD_DOWNLOAD)
+        DownloadFetched(albumId, NULL, albumName);
     else if (cmd == CMD_ADD_NEW)
         NewPlaylist(std::vector<std::string>(), albumId, albumName);
     else if (cmd >= CMD_ADD_BASE)
@@ -3273,16 +4245,36 @@ static void TreeContextMenu(LPARAM lp)
     const LPARAM data = TreeData(item);
     const int pl = (int)data;
     const bool isPlaylist = data >= 0 && pl < (int)g_app.playlistData.size();
-    const UINT g = (isPlaylist && g_app.client.CanEdit(g_app.playlistData[pl])) ? 0 : MF_GRAYED;
+    const UINT g = (isPlaylist && !g_app.offline && g_app.client.CanEdit(g_app.playlistData[pl])) ? 0 : MF_GRAYED;
+    const UINT net = g_app.offline ? MF_GRAYED : 0;
+    const bool savedOffline = isPlaylist && g_app.downloads.FindPlaylist(g_app.playlistData[pl].id) != NULL;
 
     HMENU m = CreatePopupMenu();
+    if (data == TREE_DOWNLOADS) {   // the Downloads item has its own small menu
+        AppendMenuW(m, MF_STRING | (g_app.downloads.Pending() ? 0 : MF_GRAYED), CMD_DL_CANCEL,
+                    L"&Cancel waiting downloads");
+        RECT r;
+        bool has = item && TreeView_GetItemRect(g_app.tree, item, &r, TRUE);
+        POINT pt = MenuPointAt(g_app.tree, lp, has ? &r : NULL);
+        UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_app.wnd, NULL);
+        DestroyMenu(m);
+        if (cmd == CMD_DL_CANCEL) {
+            g_app.downloads.Cancel();
+            SetStatus(L"Downloads cancelled.");
+        }
+        return;
+    }
     if (isPlaylist) {
         AppendMenuW(m, MF_STRING, CMD_PL_PLAY, L"&Play");
         AppendMenuW(m, MF_STRING, CMD_PLAY_NEXT, L"Play ne&xt");
         AppendMenuW(m, MF_STRING, CMD_ADD_QUEUE, L"Add to &queue");
+        AppendMenuW(m, MF_STRING | net, CMD_DOWNLOAD,
+                    savedOffline ? L"Do&wnload again (new tracks)" : L"Do&wnload for offline");
+        if (savedOffline)
+            AppendMenuW(m, MF_STRING, CMD_DL_REMOVE, L"Remove downloaded p&laylist");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     }
-    AppendMenuW(m, MF_STRING, CMD_PL_NEW, L"&New playlist...");
+    AppendMenuW(m, MF_STRING | net, CMD_PL_NEW, L"&New playlist...");
     if (isPlaylist) {
         AppendMenuW(m, MF_STRING | g, CMD_PL_RENAME, L"&Edit name and description...");
         AppendMenuW(m, MF_STRING | g, CMD_PL_DELETE, L"&Delete...");
@@ -3300,6 +4292,19 @@ static void TreeContextMenu(LPARAM lp)
             OpenPlaylist(pl);
     } else if (cmd == CMD_PLAY_NEXT || cmd == CMD_ADD_QUEUE) {
         QueueFetched(std::string(), g_app.playlistData[pl].id, g_app.playlistData[pl].name, cmd == CMD_PLAY_NEXT);
+    } else if (cmd == CMD_DOWNLOAD) {
+        DownloadFetched(std::string(), &g_app.playlistData[pl], g_app.playlistData[pl].name);
+    } else if (cmd == CMD_DL_REMOVE) {
+        const std::wstring name = g_app.playlistData[pl].name;
+        if (MessageBoxW(g_app.wnd, (L"Remove the download of \"" + name + L"\"? Its tracks are deleted from this "
+                                    L"computer unless another downloaded playlist has them.").c_str(),
+                        APP_TITLE, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+            g_app.downloads.RemovePlaylist(g_app.playlistData[pl].id);
+            if (g_app.offline)
+                ShowOfflinePlaylists();
+            DownloadsChanged();
+            SetStatus(L"Removed the download of \"" + name + L"\".");
+        }
     } else if (cmd == CMD_PL_NEW) {
         NewPlaylist(std::vector<std::string>(), std::string(), L"New playlist");
     } else if (cmd == CMD_PL_RENAME) {
@@ -3609,6 +4614,29 @@ static void PaintHeader(HDC dc)
         else
             line2 = Fmt(L"%u song%ls  \x00B7  %ls", (unsigned)g_app.songData.size(),
                         g_app.songData.size() == 1 ? L"" : L"s", FormatTime(TotalDuration(g_app.songData)).c_str());
+    } else if (g_app.mainView == VIEW_DISCOVER) {
+        const int k = g_app.discoverKind;
+        title = kDiscoverTitles[k];
+        if (!g_app.discoverLoaded)
+            line2 = L"Loading...";
+        else if (g_app.discoverFailed)
+            line2 = L"Could not load the list. Open it again to retry.";
+        else if (g_app.discoverAlbums.empty())
+            line2 = k == DISCOVER_PLAYED || k == DISCOVER_FREQUENT ? L"Nothing played yet." : L"No albums.";
+        else
+            line2 = Fmt(L"%u albums%ls", (unsigned)g_app.discoverAlbums.size(),
+                        k == DISCOVER_RANDOM ? L"  \x00B7  a new pick each time you open it" : L"");
+    } else if (g_app.mainView == VIEW_DOWNLOADS) {
+        title = L"Downloads";
+        const int waiting = g_app.downloads.Pending();
+        const std::vector<DownloadedTrack>& t = g_app.downloads.Tracks();
+        if (t.empty() && !waiting)
+            line2 = L"Nothing downloaded yet: right-click a track, album or playlist and choose Download.";
+        else
+            line2 = Fmt(L"%u song%ls  \x00B7  %ls  \x00B7  %ls", (unsigned)t.size(), t.size() == 1 ? L"" : L"s",
+                        FormatTime(TotalDuration(g_app.songData)).c_str(), SizeText(g_app.downloads.TotalBytes()).c_str());
+        if (waiting)
+            line2 += Fmt(L"  \x00B7  %d waiting to download (right-click Downloads to cancel)", waiting);
     } else if (g_app.mainView == VIEW_QUEUE) {
         title = L"Play Queue";
         if (g_app.queue.empty())
@@ -3628,7 +4656,8 @@ static void PaintHeader(HDC dc)
     // Section headers (Albums/Artists/Songs) are compact: title at the top, count right under it.
     const bool compact = !g_app.shown.has || g_app.mainView == VIEW_ALBUMS || g_app.mainView == VIEW_ARTISTS ||
                          g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_FAVORITES ||
-                         g_app.mainView == VIEW_QUEUE;
+                         g_app.mainView == VIEW_QUEUE || g_app.mainView == VIEW_DOWNLOADS ||
+                         g_app.mainView == VIEW_DISCOVER;
     RECT t = { textX, h.top + (compact ? 0 : 6), h.right, h.top + (compact ? 32 : 40) };
     SetTextColor(dc, text);
     SelectObject(dc, g_app.fontTitle);
@@ -3698,7 +4727,7 @@ struct ColSpec {
 static const ColSpec kAlbumCols[]  = { { 0, 5, 120 }, { 0, 4, 100 }, { 50, 0, 0 }, { 55, 0, 0 } };
 static const ColSpec kArtistCols[] = { { 0, 1, 150 }, { 60, 0, 0 } };
 static const ColSpec kSongCols[]   = { { 32, 0, 0 }, { 0, 5, 120 }, { 0, 3, 90 }, { 24, 0, 0 }, { 80, 0, 0 },
-                                       { 48, 0, 0 }, { 0, 4, 90 } };
+                                       { 48, 0, 0 }, { 0, 4, 90 }, { 20, 0, 0 } };
 
 static void FitColumns(HWND lv, const ColSpec* cols, int n)
 {
@@ -3823,6 +4852,8 @@ static void Layout(HWND hwnd)
         songCols[COL_FAV] = hidden;
     if (!g_app.showRatings)
         songCols[COL_RATING] = hidden;
+    if (g_app.downloads.Tracks().empty())
+        songCols[COL_DL] = hidden;
     FitColumns(g_app.songs, songCols, sizeof(songCols) / sizeof(songCols[0]));
     InvalidateRect(hwnd, NULL, TRUE);
 }
@@ -3835,10 +4866,11 @@ static HWND MakeChild(HWND parent, const wchar_t* cls, const wchar_t* text, DWOR
     return c;
 }
 
-static HWND MakeList(HWND parent, int id, DWORD extraStyle = 0)
+static HWND MakeList(HWND parent, int id, DWORD extraStyle = 0, bool multiSelect = false)
 {
     HWND lv = MakeChild(parent, WC_LISTVIEWW, L"",
-                        WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | extraStyle, id, WS_EX_CLIENTEDGE);
+                        WS_TABSTOP | LVS_REPORT | (multiSelect ? 0 : LVS_SINGLESEL) | LVS_SHOWSELALWAYS | extraStyle, id,
+                        WS_EX_CLIENTEDGE);
     ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT);
     return lv;
 }
@@ -3869,6 +4901,11 @@ static HMENU BuildMenuBar()
     AppendMenuW(view, MF_STRING, IDM_SONGS, L"&Songs");
     AppendMenuW(view, MF_STRING, IDM_FAVORITES, L"Fa&vorites");
     AppendMenuW(view, MF_STRING, IDM_QUEUE, L"Play &Queue\tCtrl+Q");
+    AppendMenuW(view, MF_STRING, IDM_DOWNLOADS, L"&Downloads");
+    HMENU discover = CreatePopupMenu();
+    for (int k = 0; k < DISCOVER_COUNT; ++k)
+        AppendMenuW(discover, MF_STRING, IDM_DISCOVER + k, kDiscoverTitles[k]);
+    AppendMenuW(view, MF_POPUP, (UINT_PTR)discover, L"Disco&ver");
     AppendMenuW(view, MF_SEPARATOR, 0, NULL);
     AppendMenuW(view, MF_STRING, IDM_FIND, L"&Find\tCtrl+F");
     AppendMenuW(view, MF_STRING, IDM_MINI, L"&Mini Player\tCtrl+M");
@@ -3904,7 +4941,7 @@ static HMENU BuildMenuBar()
 }
 
 // --- Settings (File > Settings) -----------------------------------------------------------
-// A two-page property sheet. Pages are created when first shown, so only the pages the user
+// A property sheet. Pages are created when first shown, so only the pages the user
 // visited get PSN_APPLY; each saves its own settings.
 
 struct SettingsState {
@@ -3915,6 +4952,12 @@ struct SettingsState {
     bool mediaKeys;
     bool lastfmInfo;
     bool serverChanged;      // reconnect afterwards
+    bool librariesChanged;   // reload the library afterwards
+    std::wstring dlFolder;   // Downloads page: the folder chosen (empty = not visited)
+    int dlQuality;           // as App::dlQuality
+    bool dlPlayLocal;
+    bool sectionHidden[16];  // Sidebar page
+    bool sidebarChanged;
     bool playbackChanged;    // apply to the player afterwards
     bool displayChanged;
 };
@@ -4115,11 +5158,207 @@ static INT_PTR CALLBACK ServerPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
             }
             SecureZeroMemory(&password[0], password.size() * sizeof(wchar_t));
             g_settings->serverChanged = changed;
+            if (cfg.url != old.url || cfg.user != old.user) {   // library ids belong to that server
+                ConfigSaveLibraries(g_app.iniPath, std::vector<std::string>());
+                g_settings->cfg.libraries.clear();
+            }
             SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_NOERROR);
             return TRUE;
         }
         break;
     }
+    return FALSE;
+}
+
+// Libraries: a checkbox per library on the server, as of the last connect.
+static INT_PTR CALLBACK LibrariesPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    HWND list = GetDlgItem(dlg, IDC_SET_LIBLIST);
+    switch (msg) {
+    case WM_INITDIALOG: {
+        ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
+        RECT rc;
+        GetClientRect(list, &rc);
+        LVCOLUMNW col;
+        ZeroMemory(&col, sizeof(col));
+        col.mask = LVCF_WIDTH;
+        col.cx = rc.right - GetSystemMetrics(SM_CXVSCROLL);
+        SendMessageW(list, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
+
+        const std::vector<SubsonicLibrary>& libs = g_app.libraries;
+        const std::vector<std::string>& chosen = g_app.client.Libraries();   // empty = all
+        for (size_t i = 0; i < libs.size(); ++i) {
+            LVITEMW it;
+            ZeroMemory(&it, sizeof(it));
+            it.mask = LVIF_TEXT;
+            it.iItem = (int)i;
+            it.pszText = (LPWSTR)libs[i].name.c_str();
+            int row = (int)SendMessageW(list, LVM_INSERTITEMW, 0, (LPARAM)&it);
+            bool on = chosen.empty() || std::find(chosen.begin(), chosen.end(), libs[i].id) != chosen.end();
+            ListView_SetCheckState(list, row, on);
+        }
+        const wchar_t* note;
+        if (libs.empty())
+            note = L"Connect to your server to choose its libraries.";
+        else if (libs.size() == 1)
+            note = L"Your server has one library, so there is nothing to choose.";
+        else
+            note = L"Playlists show only their tracks from these libraries; the others stay in the playlist "
+                   L"on the server. This only changes what this computer shows.";
+        SetDlgItemTextW(dlg, IDC_SET_LIBNOTE, note);
+        EnableWindow(list, libs.size() > 1);
+        return TRUE;
+    }
+
+    case WM_NOTIFY:
+        if (((NMHDR*)lp)->code == PSN_APPLY) {
+            const std::vector<SubsonicLibrary>& libs = g_app.libraries;
+            if (libs.size() < 2 || g_settings->serverChanged) {   // nothing to choose, or a new server
+                SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_NOERROR);
+                return TRUE;
+            }
+            std::vector<std::string> ids;
+            for (size_t i = 0; i < libs.size(); ++i)
+                if (ListView_GetCheckState(list, (int)i))
+                    ids.push_back(libs[i].id);
+            if (ids.empty()) {
+                MessageBoxW(dlg, L"Tick at least one library.", L"Settings", MB_ICONEXCLAMATION);
+                SetFocus(list);
+                SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_INVALID_NOCHANGEPAGE);
+                return TRUE;
+            }
+            if (ids.size() == libs.size())
+                ids.clear();   // all of them: no filter, so new libraries show up too
+            if (ids != g_app.client.Libraries()) {
+                ConfigSaveLibraries(g_app.iniPath, ids);
+                g_settings->librariesChanged = true;
+            }
+            SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_NOERROR);
+            return TRUE;
+        }
+        break;
+    }
+    (void)wp;
+    return FALSE;
+}
+
+static void ShowDownloadsInfo(HWND dlg)
+{
+    const size_t n = g_app.downloads.Tracks().size();
+    SetDlgItemTextW(dlg, IDC_SET_DLINFO,
+                    n ? Fmt(L"%u track%ls downloaded, using %ls.", (unsigned)n, n == 1 ? L"" : L"s",
+                            SizeText(g_app.downloads.TotalBytes()).c_str()).c_str()
+                      : L"Nothing downloaded yet.");
+    EnableWindow(GetDlgItem(dlg, IDC_SET_DLDELETE), n > 0);
+}
+
+static INT_PTR CALLBACK DownloadsPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_INITDIALOG:
+        SendDlgItemMessageW(dlg, IDC_SET_DLFOLDER, EM_LIMITTEXT, MAX_PATH - 20, 0);
+        SetDlgItemTextW(dlg, IDC_SET_DLFOLDER, g_app.downloads.Folder().c_str());
+        ShowDownloadsInfo(dlg);
+        {
+            HWND q = GetDlgItem(dlg, IDC_SET_DLQUALITY);
+            SendMessageW(q, CB_ADDSTRING, 0, (LPARAM)L"Same as the streaming quality");
+            SendMessageW(q, CB_ADDSTRING, 0, (LPARAM)L"Lossless (FLAC files as they are)");
+            int sel = g_settings->dlQuality == 1 ? 1 : 0;
+            for (int i = 0; i < (int)(sizeof(kQualities) / sizeof(kQualities[0])); ++i) {
+                SendMessageW(q, CB_ADDSTRING, 0, (LPARAM)Fmt(L"%d kbps MP3", kQualities[i]).c_str());
+                if (kQualities[i] == g_settings->dlQuality)
+                    sel = 2 + i;
+            }
+            SendMessageW(q, CB_SETCURSEL, sel, 0);
+        }
+        CheckDlgButton(dlg, IDC_SET_DLPLAYLOCAL, g_settings->dlPlayLocal ? BST_CHECKED : BST_UNCHECKED);
+        return TRUE;
+
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_SET_DLBROWSE && HIWORD(wp) == BN_CLICKED) {
+            std::wstring path;
+            if (BrowseForFolder(dlg, L"Choose the folder for downloaded music:", path))
+                SetDlgItemTextW(dlg, IDC_SET_DLFOLDER, path.c_str());
+        } else if (LOWORD(wp) == IDC_SET_DLDELETE && HIWORD(wp) == BN_CLICKED) {
+            const std::wstring q = Fmt(L"Delete all %u downloaded tracks (%ls) from %ls?",
+                                       (unsigned)g_app.downloads.Tracks().size(),
+                                       SizeText(g_app.downloads.TotalBytes()).c_str(), g_app.downloads.Folder().c_str());
+            if (MessageBoxW(dlg, q.c_str(), L"Delete Downloads", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+                g_app.downloads.RemoveAll();
+                ShowDownloadsInfo(dlg);
+                DownloadsChanged();
+            }
+        }
+        return TRUE;
+
+    case WM_NOTIFY:
+        if (((NMHDR*)lp)->code == PSN_APPLY) {
+            std::wstring folder = DlgText(dlg, IDC_SET_DLFOLDER);
+            if (folder.empty())
+                folder = DefaultDownloadsFolder();
+            g_settings->dlFolder = folder;
+            const int q = (int)SendDlgItemMessageW(dlg, IDC_SET_DLQUALITY, CB_GETCURSEL, 0, 0);
+            g_settings->dlQuality = q <= 0 ? 0 : (q == 1 ? 1 : kQualities[q - 2]);
+            g_settings->dlPlayLocal = IsDlgButtonChecked(dlg, IDC_SET_DLPLAYLOCAL) == BST_CHECKED;
+            SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_NOERROR);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+// Sidebar: which LIBRARY sections to show.
+static INT_PTR CALLBACK SidebarPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    HWND list = GetDlgItem(dlg, IDC_SET_SIDELIST);
+    switch (msg) {
+    case WM_INITDIALOG: {
+        ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
+        RECT rc;
+        GetClientRect(list, &rc);
+        LVCOLUMNW col;
+        ZeroMemory(&col, sizeof(col));
+        col.mask = LVCF_WIDTH;
+        col.cx = rc.right - GetSystemMetrics(SM_CXVSCROLL);
+        SendMessageW(list, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
+        for (int i = 0; i < kSectionCount; ++i) {
+            LVITEMW it;
+            ZeroMemory(&it, sizeof(it));
+            it.mask = LVIF_TEXT;
+            it.iItem = i;
+            it.pszText = (LPWSTR)kSections[i].label;
+            int row = (int)SendMessageW(list, LVM_INSERTITEMW, 0, (LPARAM)&it);
+            ListView_SetCheckState(list, row, !g_settings->sectionHidden[i]);
+        }
+        return TRUE;
+    }
+
+    case WM_NOTIFY:
+        if (((NMHDR*)lp)->code == PSN_APPLY) {
+            bool hidden[16];
+            int shown = 0;
+            for (int i = 0; i < kSectionCount; ++i) {
+                hidden[i] = !ListView_GetCheckState(list, i);
+                shown += hidden[i] ? 0 : 1;
+            }
+            if (!shown) {
+                MessageBoxW(dlg, L"Tick at least one section.", L"Settings", MB_ICONEXCLAMATION);
+                SetFocus(list);
+                SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_INVALID_NOCHANGEPAGE);
+                return TRUE;
+            }
+            for (int i = 0; i < kSectionCount; ++i)
+                if (hidden[i] != g_settings->sectionHidden[i]) {
+                    g_settings->sectionHidden[i] = hidden[i];
+                    g_settings->sidebarChanged = true;
+                }
+            SetWindowLongPtrW(dlg, DWLP_MSGRESULT, PSNRET_NOERROR);
+            return TRUE;
+        }
+        break;
+    }
+    (void)wp;
     return FALSE;
 }
 
@@ -4241,15 +5480,7 @@ static INT_PTR CALLBACK DisplayPageProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp
 // and View menu. Clicks, keys and right-click items check the flags themselves.
 static void ApplyDisplay()
 {
-    // Sidebar: Library > Favorites sits after Songs.
-    g_app.treeUpdating = true;
-    if (!g_app.showFavorites && g_app.treeFavorites) {
-        TreeView_DeleteItem(g_app.tree, g_app.treeFavorites);
-        g_app.treeFavorites = NULL;
-    } else if (g_app.showFavorites && !g_app.treeFavorites) {
-        g_app.treeFavorites = TreeAdd(g_app.treeLibrary, L"Favorites", TREE_FAVORITES, false, g_app.treeSongs);
-    }
-    g_app.treeUpdating = false;
+    RebuildLibraryTree();   // Library > Favorites
 
     // View menu: Fa&vorites follows &Songs.
     HMENU view = GetSubMenu(g_app.menu, 1);
@@ -4280,14 +5511,20 @@ static void ShowSettings()
     st.trayMinimize = g_app.trayMinimize;
     st.mediaKeys = g_app.mediaKeysGlobal;
     st.lastfmInfo = g_app.lastfmInfo;
-    st.serverChanged = st.playbackChanged = st.displayChanged = false;
+    st.serverChanged = st.librariesChanged = st.playbackChanged = st.displayChanged = false;
+    st.dlQuality = g_app.dlQuality;
+    st.dlPlayLocal = g_app.playLocal;
+    memcpy(st.sectionHidden, g_app.sectionHidden, sizeof(st.sectionHidden));
+    st.sidebarChanged = false;
     g_settings = &st;
 
-    PROPSHEETPAGEW pages[3];
+    PROPSHEETPAGEW pages[6];
     ZeroMemory(pages, sizeof(pages));
-    const int ids[3] = { IDD_SET_SERVER, IDD_SET_PLAYBACK, IDD_SET_DISPLAY };
-    DLGPROC procs[3] = { ServerPageProc, PlaybackPageProc, DisplayPageProc };
-    for (int i = 0; i < 3; ++i) {
+    const int ids[6] = { IDD_SET_SERVER, IDD_SET_LIBRARIES, IDD_SET_SIDEBAR, IDD_SET_PLAYBACK, IDD_SET_DOWNLOADS,
+                         IDD_SET_DISPLAY };
+    DLGPROC procs[6] = { ServerPageProc, LibrariesPageProc, SidebarPageProc, PlaybackPageProc, DownloadsPageProc,
+                         DisplayPageProc };
+    for (int i = 0; i < 6; ++i) {
         pages[i].dwSize = sizeof(PROPSHEETPAGEW);
         pages[i].dwFlags = PSP_DEFAULT;
         pages[i].hInstance = GetModuleHandleW(NULL);
@@ -4301,7 +5538,7 @@ static void ShowSettings()
     sheet.hwndParent = g_app.wnd;
     sheet.hInstance = GetModuleHandleW(NULL);
     sheet.pszCaption = L"Settings";
-    sheet.nPages = 3;
+    sheet.nPages = 6;
     sheet.ppsp = pages;
     PropertySheetW(&sheet);
     g_settings = NULL;
@@ -4343,8 +5580,42 @@ static void ShowSettings()
         WritePrivateProfileStringW(L"View", L"LastFmInfo", g_app.lastfmInfo ? L"1" : L"0", g_app.iniPath.c_str());
         RefreshShownInfo();
     }
+    if (st.sidebarChanged) {
+        memcpy(g_app.sectionHidden, st.sectionHidden, sizeof(g_app.sectionHidden));
+        std::wstring keys;
+        for (int i = 0; i < kSectionCount; ++i)
+            if (g_app.sectionHidden[i])
+                keys += (keys.empty() ? L"" : L",") + std::wstring(kSections[i].key);
+        WritePrivateProfileStringW(L"View", L"HiddenSections", keys.c_str(), g_app.iniPath.c_str());   // "" = none
+        RebuildLibraryTree();
+    }
+    if (st.dlQuality != g_app.dlQuality) {
+        g_app.dlQuality = st.dlQuality;
+        WritePrivateProfileStringW(L"Downloads", L"Quality", Fmt(L"%d", g_app.dlQuality).c_str(), g_app.iniPath.c_str());
+    }
+    if (st.dlPlayLocal != g_app.playLocal) {
+        g_app.playLocal = st.dlPlayLocal;
+        WritePrivateProfileStringW(L"Downloads", L"PlayDownloaded", g_app.playLocal ? L"1" : L"0",
+                                   g_app.iniPath.c_str());
+        UpdateGaplessNext();   // the next track may now come from disk, or not
+        SetStatus(g_app.playLocal ? L"Downloaded tracks will play from disk." : L"Tracks will stream from the server.");
+    }
+    if (!st.dlFolder.empty() && _wcsicmp(st.dlFolder.c_str(), g_app.downloads.Folder().c_str()) != 0) {
+        // Downloads already in the old folder stay there (switching back shows them again).
+        g_app.downloads.Cancel();
+        g_app.downloads.SetFolder(st.dlFolder);
+        WritePrivateProfileStringW(L"Downloads", L"Folder",
+                                   _wcsicmp(st.dlFolder.c_str(), DefaultDownloadsFolder().c_str()) ? st.dlFolder.c_str()
+                                                                                                  : NULL,
+                                   g_app.iniPath.c_str());
+        DownloadsChanged();
+        SetStatus(Fmt(L"Downloads folder: %ls (%u tracks there).", g_app.downloads.Folder().c_str(),
+                      (unsigned)g_app.downloads.Tracks().size()));
+    }
     if (st.serverChanged)
         DoConnect();
+    else if (st.librariesChanged)
+        DoConnect(true);
 }
 
 static void OnCreate(HWND hwnd)
@@ -4376,12 +5647,7 @@ static void OnCreate(HWND hwnd)
     TreeView_SetIndent(g_app.tree, 12);
     TreeView_SetItemHeight(g_app.tree, 18);
     g_app.treeUpdating = true;
-    g_app.treeLibrary = TreeAdd(TVI_ROOT, L"LIBRARY", TREE_LIBRARY, true);
-    g_app.treeAlbums = TreeAdd(g_app.treeLibrary, L"Albums", TREE_ALBUMS, false);
-    g_app.treeArtists = TreeAdd(g_app.treeLibrary, L"Artists", TREE_ARTISTS, false);
-    g_app.treeSongs = TreeAdd(g_app.treeLibrary, L"Songs", TREE_SONGS, false);
-    g_app.treeFavorites = TreeAdd(g_app.treeLibrary, L"Favorites", TREE_FAVORITES, false);
-    g_app.treeQueue = TreeAdd(g_app.treeLibrary, L"Play Queue", TREE_QUEUE, false);
+    g_app.treeLibrary = TreeAdd(TVI_ROOT, L"LIBRARY", TREE_LIBRARY, true);   // filled by RebuildLibraryTree
     g_app.treePlaylists = TreeAdd(TVI_ROOT, L"PLAYLISTS", TREE_PLAYLISTS, true);
     TreeView_Expand(g_app.tree, g_app.treeLibrary, TVE_EXPAND);
     g_app.treeUpdating = false;
@@ -4405,7 +5671,7 @@ static void OnCreate(HWND hwnd)
     AddColumn(g_app.artists, 0, L"Artist", 320, LVCFMT_LEFT);
     AddColumn(g_app.artists, 1, L"Albums", 60, LVCFMT_RIGHT);
 
-    g_app.songs = MakeList(hwnd, IDC_SONGS, LVS_OWNERDATA);
+    g_app.songs = MakeList(hwnd, IDC_SONGS, LVS_OWNERDATA, true);   // Ctrl/Shift-click select several
     AddColumn(g_app.songs, COL_NUM, L"#", 32, LVCFMT_RIGHT);
     AddColumn(g_app.songs, COL_TITLE, L"Track", 220, LVCFMT_LEFT);
     AddColumn(g_app.songs, COL_ARTIST, L"Artist", 140, LVCFMT_LEFT);
@@ -4413,6 +5679,11 @@ static void OnCreate(HWND hwnd)
     AddColumn(g_app.songs, COL_RATING, L"Rating", 80, LVCFMT_LEFT);
     AddColumn(g_app.songs, COL_LENGTH, L"Time", 48, LVCFMT_RIGHT);
     AddColumn(g_app.songs, COL_ALBUM, L"Album", 170, LVCFMT_LEFT);
+    AddColumn(g_app.songs, COL_DL, L"", 20, LVCFMT_LEFT);   // downloaded arrow, drawn
+    {
+        int order[] = { COL_NUM, COL_DL, COL_TITLE, COL_ARTIST, COL_FAV, COL_RATING, COL_LENGTH, COL_ALBUM };
+        ListView_SetColumnOrderArray(g_app.songs, sizeof(order) / sizeof(order[0]), order);
+    }
 
     // Transport bar.
     g_app.btnPrev = MakeChild(hwnd, L"BUTTON", L"Previous", WS_TABSTOP | BS_OWNERDRAW, IDC_PREV);
@@ -4441,11 +5712,24 @@ static void OnCreate(HWND hwnd)
     g_app.mediaKeysGlobal = GetPrivateProfileIntW(L"Player", L"GlobalMediaKeys", 1, g_app.iniPath.c_str()) != 0;
     RegisterMediaKeys(g_app.mediaKeysGlobal);
     g_app.lastfmInfo = GetPrivateProfileIntW(L"View", L"LastFmInfo", 0, g_app.iniPath.c_str()) != 0;
+    g_app.downloads.Init(hwnd, WM_APP_DOWNLOAD);
+    g_app.downloads.SetFolder(DownloadsFolderSetting());
+    g_app.dlQuality = (int)GetPrivateProfileIntW(L"Downloads", L"Quality", 0, g_app.iniPath.c_str());
+    g_app.playLocal = GetPrivateProfileIntW(L"Downloads", L"PlayDownloaded", 0, g_app.iniPath.c_str()) != 0;
     PlaybackSettings pb;
     PlaybackLoad(g_app.iniPath, pb);
     ApplyPlayback(pb);
     g_app.showFavorites = GetPrivateProfileIntW(L"View", L"ShowFavorites", 1, g_app.iniPath.c_str()) != 0;
     g_app.showRatings = GetPrivateProfileIntW(L"View", L"ShowRatings", 1, g_app.iniPath.c_str()) != 0;
+    {   // [View] HiddenSections: comma-separated kSections keys. Missing: the Discover lists start
+        // hidden; empty (written when everything is ticked): nothing hidden.
+        wchar_t buf[512] = L"";
+        GetPrivateProfileStringW(L"View", L"HiddenSections", L"added,played,frequent,random", buf, 512,
+                                 g_app.iniPath.c_str());
+        const std::wstring hidden = std::wstring(L",") + buf + L",";
+        for (int i = 0; i < kSectionCount; ++i)
+            g_app.sectionHidden[i] = hidden.find(std::wstring(L",") + kSections[i].key + L",") != std::wstring::npos;
+    }
     ApplyDisplay();
     g_app.trayIcon = GetPrivateProfileIntW(L"View", L"TrayIcon", 1, g_app.iniPath.c_str()) != 0;
     g_app.trayMinimize = GetPrivateProfileIntW(L"View", L"MinimizeToTray", 0, g_app.iniPath.c_str()) != 0;
@@ -4504,7 +5788,8 @@ static LRESULT OnNotify(NMHDR* nm)
         (nm->code == HDN_BEGINTRACKW || nm->code == HDN_BEGINTRACKA ||
          nm->code == HDN_DIVIDERDBLCLICKW || nm->code == HDN_DIVIDERDBLCLICKA)) {
         int col = ((NMHEADERW*)nm)->iItem;
-        if ((col == COL_FAV && !g_app.showFavorites) || (col == COL_RATING && !g_app.showRatings))
+        if ((col == COL_FAV && !g_app.showFavorites) || (col == COL_RATING && !g_app.showRatings) ||
+            (col == COL_DL && g_app.downloads.Tracks().empty()))
             return TRUE;   // hidden column: keep it at width 0
     }
     switch (nm->idFrom) {
@@ -4537,12 +5822,18 @@ static LRESULT OnNotify(NMHDR* nm)
                 SetSongRating(i, vk - VK_NUMPAD0);
             else if (vk == VK_SPACE)
                 PlayPause();
+            else if (vk == 'A' && GetKeyState(VK_CONTROL) < 0) {
+                ListView_SetItemState(g_app.songs, -1, LVIS_SELECTED, LVIS_SELECTED);   // select all
+            } else if (vk == VK_DELETE && i < 0) {
+                // nothing selected
+            } else if (vk == VK_DELETE && g_app.songSource == SRC_DOWNLOADS)
+                RemoveDownloads(SongsAt(SelectedRows(g_app.songs)));
             else if (vk == VK_DELETE && g_app.songSource == SRC_QUEUE)
-                RemoveFromQueue(i);
+                RemoveQueueRows(SelectedRows(g_app.songs));
             else if (vk == VK_DELETE && g_app.songSource == SRC_PLAYLIST && SongsSorted())
                 SetStatus(L"The playlist is sorted: click # to restore its order, then remove the track.");
             else if (vk == VK_DELETE)
-                RemoveFromPlaylist(i);
+                RemovePlaylistRows(SelectedRows(g_app.songs));
             else if (vk == VK_BACK)
                 GoBack();
         }
@@ -4568,18 +5859,10 @@ static LRESULT OnNotify(NMHDR* nm)
         if (nm->code == TVN_SELCHANGEDW && !g_app.treeUpdating) {
             NMTREEVIEWW* tv = (NMTREEVIEWW*)nm;
             LPARAM data = tv->itemNew.lParam;
-            if (data == TREE_ALBUMS)
-                ShowAlbumsView();
-            else if (data == TREE_ARTISTS)
-                ShowArtistsView();
-            else if (data == TREE_SONGS)
-                ShowSongsView();
-            else if (data == TREE_FAVORITES)
-                ShowFavoritesView();
-            else if (data == TREE_QUEUE)
-                ShowQueueView();
-            else if (data >= 0)
+            if (data >= 0)
                 OpenPlaylist((int)data);
+            else if (data != TREE_LIBRARY && data != TREE_PLAYLISTS)
+                ShowSection(data);
         } else if (nm->code == TVN_ITEMEXPANDINGW) {
             return ((NMTREEVIEWW*)nm)->action == TVE_COLLAPSE;   // sections stay open
         }
@@ -4635,6 +5918,15 @@ static void OnCommand(int id)
         break;
     case IDM_FAVORITES:
         ShowFavoritesView();
+        break;
+    case IDM_DOWNLOADS:
+        ShowDownloadsView();
+        break;
+    case IDM_DISCOVER + DISCOVER_ADDED:
+    case IDM_DISCOVER + DISCOVER_PLAYED:
+    case IDM_DISCOVER + DISCOVER_FREQUENT:
+    case IDM_DISCOVER + DISCOVER_RANDOM:
+        ShowDiscoverView(id - IDM_DISCOVER, true);
         break;
     case IDM_QUEUE:
         ShowQueueView();
@@ -5064,6 +6356,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ApplySearch();
         else if (wp == TIMER_DRAGSCROLL)
             DragScroll();
+        else if (wp == TIMER_RELOAD)
+            DoConnect(true);
         return 0;
 
     case WM_CONTEXTMENU:
@@ -5094,6 +6388,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         OnJobDone((Job*)lp);
         return 0;
 
+    case WM_APP_DOWNLOAD:
+        OnDownloadEvent((DownloadEvent*)lp);
+        return 0;
+
     case WM_PLAYER_STATE:
         OnPlayerState(wp, lp);
         RefreshTransport();
@@ -5116,6 +6414,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_POSITION);
+        g_app.downloads.Shutdown();   // an unfinished file is left as .part and not listed
         RegisterMediaKeys(false);
         TrayRemove();
         g_app.player.Stop();

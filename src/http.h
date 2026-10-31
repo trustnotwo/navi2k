@@ -28,6 +28,8 @@ bool HttpInit(const wchar_t* userAgent);
 void HttpShutdown();
 
 // One synchronous GET via WinINet. Read() may block; Abort() from another thread unblocks it.
+// A local file path (C:\... or \\server\...) in place of the URL reads that file instead, with
+// the same range and length behaviour, so downloaded tracks play through the same code.
 class HttpRequest {
 public:
     HttpRequest();
@@ -48,8 +50,11 @@ private:
     HttpRequest& operator=(const HttpRequest&);
     void CloseHandles();
 
+    HttpResult OpenFile(const std::wstring& path, DWORD rangeStart);
+
     HINTERNET volatile m_conn;
     HINTERNET volatile m_req;
+    HANDLE volatile m_file;     // a local file instead of a request (INVALID_HANDLE_VALUE: none)
     volatile LONG m_aborted;
     DWORD m_status;
     DWORD m_lastError;
@@ -61,6 +66,7 @@ HttpResult HttpGetAll(const std::wstring& url, const HttpOptions& opts, std::str
                       DWORD* status, DWORD* winErr);
 
 bool HttpIsHttpsUrl(const std::wstring& url);
+bool HttpIsLocalPath(const std::wstring& url);   // "C:\..." or "\\server\..." rather than a URL
 bool HttpIsTlsFailure(HttpResult r);
 
 // User-facing explanation, including what to do about TLS on Win2000/XP.

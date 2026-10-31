@@ -110,6 +110,7 @@ add_library(lpcore OBJECT
     src/art.cpp
     src/stb_image_impl.c
     src/flac_decoder.cpp
+    src/downloads.cpp
     src/flac_impl.c
     src/compat_win2000.cpp)
 target_link_libraries(lpcore PUBLIC mad cjson)
@@ -135,7 +136,7 @@ function(legacy_target target)
         return()
     endif()
     target_link_libraries(${target} PRIVATE lpcore
-        wininet winmm comctl32 advapi32 shell32 gdi32 user32 kernel32)
+        wininet winmm comctl32 advapi32 shell32 ole32 gdi32 user32 kernel32)
     target_link_options(${target} PRIVATE
         -static -static-libgcc -static-libstdc++
         # Modern linkers stamp 6.0 (Vista) into the PE header and Win2000 refuses to load it.
