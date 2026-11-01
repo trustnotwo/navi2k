@@ -24,9 +24,20 @@ enum {
 
 static HINTERNET g_session = NULL;
 
+// WinINet is called through its ANSI functions so the same code runs on Windows 9x, whose
+// WinINet has no Unicode ones. Everything passed is ASCII (URLs are percent-encoded).
+static std::string Narrow(const std::wstring& s)
+{
+    std::string out(s.size(), '?');
+    for (size_t i = 0; i < s.size(); ++i)
+        if (s[i] < 0x80)
+            out[i] = (char)s[i];
+    return out;
+}
+
 bool HttpInit(const wchar_t* userAgent)
 {
-    g_session = InternetOpenW(userAgent, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    g_session = InternetOpenA(Narrow(userAgent).c_str(), INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!g_session)
         LogF(L"InternetOpen failed: %lu", GetLastError());
     return g_session != NULL;
@@ -152,14 +163,15 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts, D
     if (!g_session)
         return HTTP_ERR_OTHER;
 
-    URL_COMPONENTSW uc;
+    const std::string urlA = Narrow(url);
+    URL_COMPONENTSA uc;
     ZeroMemory(&uc, sizeof(uc));
     uc.dwStructSize = sizeof(uc);
     uc.dwSchemeLength = 1;
     uc.dwHostNameLength = 1;
     uc.dwUrlPathLength = 1;
     uc.dwExtraInfoLength = 1;
-    if (!InternetCrackUrlW(url.c_str(), (DWORD)url.size(), 0, &uc)) {
+    if (!InternetCrackUrlA(urlA.c_str(), (DWORD)urlA.size(), 0, &uc)) {
         m_lastError = GetLastError();
         return HTTP_ERR_BAD_URL;
     }
@@ -167,14 +179,14 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts, D
         return HTTP_ERR_BAD_URL;
     m_https = uc.nScheme == INTERNET_SCHEME_HTTPS;
 
-    std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
-    std::wstring path(uc.lpszUrlPath, uc.dwUrlPathLength);
+    std::string host(uc.lpszHostName, uc.dwHostNameLength);
+    std::string path(uc.lpszUrlPath, uc.dwUrlPathLength);
     if (uc.dwExtraInfoLength)
         path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
     if (path.empty())
-        path = L"/";
+        path = "/";
 
-    HINTERNET conn = InternetConnectW(g_session, host.c_str(), uc.nPort, NULL, NULL,
+    HINTERNET conn = InternetConnectA(g_session, host.c_str(), uc.nPort, NULL, NULL,
                                       INTERNET_SERVICE_HTTP, 0, 0);
     if (!conn) {
         m_lastError = GetLastError();
@@ -183,9 +195,9 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts, D
     m_conn = conn;
 
     DWORD t = opts.timeoutMs;
-    InternetSetOptionW(conn, INTERNET_OPTION_CONNECT_TIMEOUT, &t, sizeof(t));
-    InternetSetOptionW(conn, INTERNET_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t));
-    InternetSetOptionW(conn, INTERNET_OPTION_SEND_TIMEOUT, &t, sizeof(t));
+    InternetSetOptionA(conn, INTERNET_OPTION_CONNECT_TIMEOUT, &t, sizeof(t));
+    InternetSetOptionA(conn, INTERNET_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t));
+    InternetSetOptionA(conn, INTERNET_OPTION_SEND_TIMEOUT, &t, sizeof(t));
 
     DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE |
                   INTERNET_FLAG_NO_UI | INTERNET_FLAG_NO_COOKIES | INTERNET_FLAG_NO_AUTO_REDIRECT;
@@ -196,7 +208,7 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts, D
     }
 
     // GET only: Windows 2000's WinINet answers form POSTs to Navidrome with error 12150.
-    HINTERNET req = HttpOpenRequestW(conn, L"GET", path.c_str(), NULL, NULL, NULL, flags, 0);
+    HINTERNET req = HttpOpenRequestA(conn, "GET", path.c_str(), NULL, NULL, NULL, flags, 0);
     if (!req) {
         m_lastError = GetLastError();
         return Classify(m_lastError, m_https);
@@ -207,15 +219,15 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts, D
 
     if (m_https && opts.allowUntrustedCert) {
         DWORD sf = 0, len = sizeof(sf);
-        InternetQueryOptionW(req, INTERNET_OPTION_SECURITY_FLAGS, &sf, &len);
+        InternetQueryOptionA(req, INTERNET_OPTION_SECURITY_FLAGS, &sf, &len);
         sf |= SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_REVOCATION;
-        InternetSetOptionW(req, INTERNET_OPTION_SECURITY_FLAGS, &sf, sizeof(sf));
+        InternetSetOptionA(req, INTERNET_OPTION_SECURITY_FLAGS, &sf, sizeof(sf));
     }
 
-    wchar_t range[48] = L"";
+    char range[48] = "";
     if (rangeStart > 0)
-        _snwprintf(range, 47, L"Range: bytes=%lu-\r\n", rangeStart);
-    if (!HttpSendRequestW(req, rangeStart > 0 ? range : NULL, rangeStart > 0 ? (DWORD)-1L : 0, NULL, 0)) {
+        _snprintf(range, 47, "Range: bytes=%lu-\r\n", rangeStart);
+    if (!HttpSendRequestA(req, rangeStart > 0 ? range : NULL, rangeStart > 0 ? (DWORD)-1L : 0, NULL, 0)) {
         m_lastError = GetLastError();
         if (m_aborted)
             return HTTP_ERR_CANCELLED;
@@ -224,14 +236,14 @@ HttpResult HttpRequest::Open(const std::wstring& url, const HttpOptions& opts, D
     }
 
     DWORD status = 0, len = sizeof(status);
-    if (!HttpQueryInfoW(req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &len, NULL)) {
+    if (!HttpQueryInfoA(req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &len, NULL)) {
         m_lastError = GetLastError();
         return HTTP_ERR_OTHER;
     }
     m_status = status;
     DWORD length = 0;
     len = sizeof(length);
-    if (HttpQueryInfoW(req, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &length, &len, NULL))
+    if (HttpQueryInfoA(req, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &length, &len, NULL))
         m_contentLength = length;
     return (status == 200 && rangeStart == 0) || (status == 206 && rangeStart > 0) ? HTTP_OK : HTTP_ERR_STATUS;
 }
@@ -307,16 +319,16 @@ bool HttpIsTlsFailure(HttpResult r)
 static int WinInetTls10State()
 {
     static const DWORD kTls10 = 0x80;
-    const struct { HKEY root; const wchar_t* key; } places[] = {
-        { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" },
-        { HKEY_CURRENT_USER,  L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" },
+    const struct { HKEY root; const char* key; } places[] = {
+        { HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" },
+        { HKEY_CURRENT_USER,  "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" },
     };
     for (size_t i = 0; i < sizeof(places) / sizeof(places[0]); ++i) {
         HKEY k;
-        if (RegOpenKeyExW(places[i].root, places[i].key, 0, KEY_READ, &k) != ERROR_SUCCESS)
+        if (RegOpenKeyExA(places[i].root, places[i].key, 0, KEY_READ, &k) != ERROR_SUCCESS)
             continue;
         DWORD value = 0, type = 0, size = sizeof(value);
-        LONG rc = RegQueryValueExW(k, L"SecureProtocols", NULL, &type, (BYTE*)&value, &size);
+        LONG rc = RegQueryValueExA(k, "SecureProtocols", NULL, &type, (BYTE*)&value, &size);
         RegCloseKey(k);
         if (rc == ERROR_SUCCESS && type == REG_DWORD)
             return (value & kTls10) ? 1 : 0;

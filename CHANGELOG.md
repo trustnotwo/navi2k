@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3
+
+- Runs on Windows 95, 98, and ME as well (Windows 2000 is still the target and nothing changes there). On 9x, text in other scripts (Japanese on an English Windows 98, say) shows in the lists, sidebar, header, and now-playing panel using the bundled Droid Sans Fallback font or an installed one, and as `?` elsewhere; download names replace those characters with `_`, the settings file is ANSI, and media keys probably don't work.
+- Runs on Pentium and Pentium MMX processors (and AMD K6) as well as everything newer. The compiler's own runtime was built for the Pentium Pro, so the pieces the player uses (text strings, `std::map`, memory allocation, startup) are now compiled for the Pentium, and the build checks that no Pentium Pro-only instruction is left. Tested on a Pentium 90 and a Pentium MMX 200 under Windows 98 SE, where MP3 plays in real time.
+- On Windows 2000 and later without East Asian language support, Japanese, Chinese and Korean in the lists, sidebar, header and now-playing panel use the bundled Droid Sans Fallback font instead of boxes.
+- Pause now also works with sound drivers that ignore the pause request, such as Windows 98's Sound Blaster 16 driver in 86Box: playback stops once the audio already queued has played.
+
 ## 1.2
 
 - **Offline listening**: right-click a track, album, or playlist and choose **Download for offline**. **Library > Downloads** lists what's saved. If the server can't be reached, the player opens with your downloads (downloaded playlists included), and plays heard offline are sent to Navidrome when it next connects. **File > Settings > Downloads** sets the folder, the download quality, and whether to play downloaded copies instead of streaming. Downloads from a different server still play from disk.

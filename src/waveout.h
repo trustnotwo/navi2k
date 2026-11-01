@@ -29,6 +29,9 @@ public:
     // Plays out everything queued, unless cancelled.
     void Drain(HANDLE cancel);
 
+    // Pauses with waveOutPause and also stops queueing more audio, so pause still takes
+    // effect (once the queued audio has played) on drivers that ignore waveOutPause, such
+    // as Windows 98's Sound Blaster 16 driver in 86Box.
     void SetPaused(bool paused);
     bool IsStarted() const { return m_started; }
 
@@ -51,6 +54,7 @@ private:
     CRITICAL_SECTION m_lock;
     HWAVEOUT m_wo;
     HANDLE m_doneEvent;
+    HANDLE m_resumeEvent;       // manual-reset: set while not paused; Write waits on it
     WAVEHDR m_hdr[MAX_BUFFERS];
     bool m_queued[MAX_BUFFERS];
     int m_numBuffers;

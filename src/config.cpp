@@ -1,4 +1,5 @@
 #include "config.h"
+#include "compat_win9x.h"
 #include "util.h"
 
 static std::wstring IniGet(const std::wstring& ini, const wchar_t* key)
@@ -42,7 +43,16 @@ static void WriteIniTemplate(const std::wstring& ini)
     if (f == INVALID_HANDLE_VALUE)
         return;
     DWORD written;
-    WriteFile(f, kTemplate, sizeof(kTemplate) - sizeof(wchar_t), &written, NULL);
+    if (Win9xMode()) {
+        const std::wstring body(kTemplate + 1);   // without the BOM
+        int n = WideCharToMultiByte(CP_ACP, 0, body.c_str(), (int)body.size(), NULL, 0, NULL, NULL);
+        std::string a(n > 0 ? n : 0, '\0');
+        if (n > 0)
+            WideCharToMultiByte(CP_ACP, 0, body.c_str(), (int)body.size(), &a[0], n, NULL, NULL);
+        WriteFile(f, a.data(), (DWORD)a.size(), &written, NULL);
+    } else {
+        WriteFile(f, kTemplate, sizeof(kTemplate) - sizeof(wchar_t), &written, NULL);
+    }
     CloseHandle(f);
 }
 

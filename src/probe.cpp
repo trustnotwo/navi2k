@@ -26,6 +26,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include "version.h"
 #include <algorithm>
 #include <stdlib.h>
 #include <string>
@@ -441,7 +442,7 @@ int main()
         Out(L"CONFIG: " + err);
         return 2;
     }
-    if (!HttpInit(L"Navi2KPlayer/1.2 (probe)")) {
+    if (!HttpInit(L"Navi2KPlayer/" LP_VERSION_WTEXT L" (probe)")) {
         Out(L"WinINet init failed");
         return 2;
     }

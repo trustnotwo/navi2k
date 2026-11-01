@@ -1,4 +1,6 @@
-# Navi2K Player - Navidrome/Subsonic client for Windows 2000 SP4 and XP SP3.
+# Navi2K Player - Navidrome/Subsonic client for Windows 2000 and later. It also runs on
+# Windows 95, 98 and ME (src/compat_win9x.cpp stands in for the Unicode API there), and on
+# Pentium / Pentium MMX CPUs (src/compat_i586.cpp replaces the runtime pieces built for P6).
 #
 # Toolchain: 32-bit MinGW-w64 GCC, msvcrt runtime (NOT ucrt), win32 thread model.
 # Win2000 has no UCRT and no winpthreads-friendly kernel APIs, so those variants won't run there.
@@ -21,10 +23,11 @@ endif()
 option(LEGACY_NO_SSE2 "Compile all code for CPUs without SSE2 (Pentium, P-II, P-III, Athlon XP)" ON)
 option(LEGACY_SSE2_DISPATCH "Include one SSE2 PCM-conversion routine, used only if CPUID reports SSE2 at runtime" ON)
 option(LEGACY_STRICT_CHECK "Fail the build if the post-build Win2000/SSE2 check finds problems" ON)
-# i686 (CMOV) is the realistic floor: stock i686 MinGW-w64 runtimes (libgcc, libstdc++, CRT
-# startup) already contain CMOV. i586 needs a toolchain whose runtime was itself built for i586;
-# the post-build check scans for P6 instructions when i586 is selected.
-set(LEGACY_MARCH "i686" CACHE STRING "GCC -march baseline: i686 = Pentium Pro/II/III, Athlon; i586 = Pentium/K6 (needs an i586-built runtime)")
+# i586 (Pentium, Pentium MMX) is the default. The stock MinGW-w64 runtime (libstdc++, libgcc,
+# CRT startup) was built for i686 and contains CMOV, so src/compat_i586.cpp, winmain_i586.cpp
+# and lp_i586_cxxconfig.h supply the pieces the player uses, compiled for i586; the
+# post-build check scans the whole .exe for P6 instructions and fails if any remain.
+set(LEGACY_MARCH "i586" CACHE STRING "GCC -march baseline: i586 = Pentium/MMX/K6 and up; i686 = Pentium Pro and up")
 set(LIBMAD_FPM "FPM_INTEL" CACHE STRING "libmad fixed-point backend: FPM_INTEL (i386 integer asm) or FPM_64BIT (portable C)")
 set_property(CACHE LIBMAD_FPM PROPERTY STRINGS FPM_INTEL FPM_64BIT)
 
@@ -90,13 +93,16 @@ target_compile_options(mad PRIVATE ${LEGACY_CPU_FLAGS} -O2 -std=gnu89 -w)
 
 add_library(cjson STATIC ${CJSON_DIR}/cJSON.c)
 target_include_directories(cjson PUBLIC ${CJSON_DIR})
+# The C library's own printf/scanf/strtod (MinGW's replacements were built for i686).
+target_compile_definitions(cjson PRIVATE __USE_MINGW_ANSI_STDIO=0)
 target_compile_options(cjson PRIVATE ${LEGACY_CPU_FLAGS} -O2)
 
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 # Shared code for the GUI player and the console probe. An OBJECT library (not STATIC) so
-# compat_win2000.cpp is always linked: its import-slot overrides must win over kernel32.
+# compat_win2000.cpp and compat_win9x.cpp are always linked: their import-slot overrides
+# must win over the system import libraries.
 add_library(lpcore OBJECT
     src/cpu.cpp
     src/util.cpp
@@ -112,7 +118,10 @@ add_library(lpcore OBJECT
     src/flac_decoder.cpp
     src/downloads.cpp
     src/flac_impl.c
-    src/compat_win2000.cpp)
+    src/compat_win2000.cpp
+    src/compat_win9x.cpp
+    src/compat_win9x_text.cpp
+    src/compat_i586.cpp)
 target_link_libraries(lpcore PUBLIC mad cjson)
 target_include_directories(lpcore PUBLIC ${CMAKE_SOURCE_DIR}/third_party/stb ${CMAKE_SOURCE_DIR}/third_party/dr_libs)
 # Third-party single-file decoders: optimise, keep their warnings out of the log.
@@ -129,7 +138,8 @@ function(legacy_target target)
     # variables. Function-local statics with dynamic initialisers must not be relied on from threads.
     target_compile_options(${target} PRIVATE
         ${LEGACY_CPU_FLAGS}
-        $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++98 -fno-exceptions -fno-rtti -fno-threadsafe-statics -Wall -O2>)
+        $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++98 -fno-exceptions -fno-rtti -fno-threadsafe-statics -Wall -O2>
+        $<$<COMPILE_LANGUAGE:CXX>:-include${CMAKE_SOURCE_DIR}/src/lp_i586_cxxconfig.h>)
 
     get_target_property(type ${target} TYPE)
     if(NOT type STREQUAL "EXECUTABLE")
@@ -139,9 +149,9 @@ function(legacy_target target)
         wininet winmm comctl32 advapi32 shell32 ole32 gdi32 user32 kernel32)
     target_link_options(${target} PRIVATE
         -static -static-libgcc -static-libstdc++
-        # Modern linkers stamp 6.0 (Vista) into the PE header and Win2000 refuses to load it.
-        -Wl,--major-subsystem-version,5,--minor-subsystem-version,0
-        -Wl,--major-os-version,5,--minor-os-version,0)
+        # Modern linkers stamp 6.0 (Vista) into the PE header; Windows 95/98 need 4.0.
+        -Wl,--major-subsystem-version,4,--minor-subsystem-version,0
+        -Wl,--major-os-version,4,--minor-os-version,0)
 
     # Post-build: verify the .exe is actually Win2000-loadable and SSE2-free.
     if(LEGACY_OBJDUMP)
@@ -154,6 +164,7 @@ function(legacy_target target)
                 -DSCAN_CMOV=${LEGACY_SCAN_CMOV}
                 -DALLOW_XMM_IN=LpConvertPcmSse2
                 -DSTRICT=${LEGACY_STRICT_CHECK}
+                -DWIN9X=ON
                 -P ${CMAKE_SOURCE_DIR}/cmake/check_binary.cmake
             VERBATIM)
     endif()
@@ -161,7 +172,7 @@ endfunction()
 
 legacy_target(lpcore)
 
-add_executable(Navi2KPlayer WIN32 src/main.cpp src/app.rc)
+add_executable(Navi2KPlayer WIN32 src/main.cpp src/winmain_i586.cpp src/app.rc)
 legacy_target(Navi2KPlayer)
 
 # Console end-to-end check: connect, list, load an album, stream a track.

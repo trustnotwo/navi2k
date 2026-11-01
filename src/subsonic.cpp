@@ -1,7 +1,6 @@
 #include "subsonic.h"
 #include "util.h"
 
-#include <wincrypt.h>
 #include <algorithm>
 #include <stdio.h>
 #include <string.h>
@@ -23,31 +22,113 @@ static std::string HexEncode(const BYTE* p, size_t n)
     return s;
 }
 
+// MD5 (RFC 1321) for the Subsonic token: Windows 95 may have no CryptoAPI.
+static void Md5(const std::string& msg, BYTE digest[16])
+{
+    static const unsigned kShift[64] = { 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+                                         5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20,
+                                         4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+                                         6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21 };
+    static const unsigned kK[64] = {
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391 };
+    unsigned h[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+    std::string m = msg;
+    const unsigned long long bits = (unsigned long long)msg.size() * 8;
+    m += (char)0x80;
+    while (m.size() % 64 != 56)
+        m += (char)0;
+    for (int i = 0; i < 8; ++i)
+        m += (char)(bits >> (8 * i));
+    for (size_t off = 0; off < m.size(); off += 64) {
+        unsigned w[16];
+        for (int i = 0; i < 16; ++i) {
+            const unsigned char* b = (const unsigned char*)m.data() + off + i * 4;
+            w[i] = b[0] | (b[1] << 8) | (b[2] << 16) | ((unsigned)b[3] << 24);
+        }
+        unsigned a = h[0], b = h[1], c = h[2], d = h[3];
+        for (int i = 0; i < 64; ++i) {
+            unsigned f, g;
+            if (i < 16) {
+                f = (b & c) | (~b & d);
+                g = i;
+            } else if (i < 32) {
+                f = (d & b) | (~d & c);
+                g = (5 * i + 1) % 16;
+            } else if (i < 48) {
+                f = b ^ c ^ d;
+                g = (3 * i + 5) % 16;
+            } else {
+                f = c ^ (b | ~d);
+                g = (7 * i) % 16;
+            }
+            unsigned t = d;
+            d = c;
+            c = b;
+            unsigned x = a + f + kK[i] + w[g];
+            b = b + ((x << kShift[i]) | (x >> (32 - kShift[i])));
+            a = t;
+        }
+        h[0] += a;
+        h[1] += b;
+        h[2] += c;
+        h[3] += d;
+    }
+    for (int i = 0; i < 16; ++i)
+        digest[i] = (BYTE)(h[i / 4] >> (8 * (i % 4)));
+}
+
+// The salt only has to differ between logins, so the CryptoAPI is used when it's there
+// (Windows 98 and later) and otherwise timers and addresses are mixed through MD5.
+static void RandomBytes(BYTE* out, size_t n)
+{
+    typedef BOOL (WINAPI* AcquireFn)(ULONG_PTR*, LPCSTR, LPCSTR, DWORD, DWORD);
+    typedef BOOL (WINAPI* GenFn)(ULONG_PTR, DWORD, BYTE*);
+    typedef BOOL (WINAPI* ReleaseFn)(ULONG_PTR, DWORD);
+    HMODULE adv = LoadLibraryA("advapi32.dll");
+    AcquireFn acquire = adv ? (AcquireFn)GetProcAddress(adv, "CryptAcquireContextA") : NULL;
+    GenFn gen = adv ? (GenFn)GetProcAddress(adv, "CryptGenRandom") : NULL;
+    ReleaseFn release = adv ? (ReleaseFn)GetProcAddress(adv, "CryptReleaseContext") : NULL;
+    ULONG_PTR prov = 0;
+    bool done = false;
+    if (acquire && gen && release && acquire(&prov, NULL, NULL, 1 /* PROV_RSA_FULL */, 0xF0000000 /* VERIFYCONTEXT */)) {
+        done = gen(prov, (DWORD)n, out) != 0;
+        release(prov, 0);
+    }
+    if (adv)
+        FreeLibrary(adv);
+    if (done)
+        return;
+    LARGE_INTEGER pc;
+    QueryPerformanceCounter(&pc);
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    char seed[128];
+    _snprintf(seed, sizeof(seed) - 1, "%lu-%lu-%lu-%lu-%p-%u", GetTickCount(), (unsigned long)pc.LowPart,
+              (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(), (void*)&pc,
+              (unsigned)st.wMilliseconds);
+    seed[sizeof(seed) - 1] = 0;
+    BYTE digest[16];
+    Md5(seed, digest);
+    for (size_t i = 0; i < n; ++i)
+        out[i] = digest[i % 16];
+}
+
 bool SubsonicMakeToken(const std::string& passwordUtf8, std::string& token, std::string& salt)
 {
-    HCRYPTPROV prov = 0;
-    if (!CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
-        return false;
-
     BYTE rnd[8];
-    bool ok = CryptGenRandom(prov, sizeof(rnd), rnd) != 0;
-    if (ok) {
-        salt = HexEncode(rnd, sizeof(rnd));
-        std::string input = passwordUtf8 + salt;
-        HCRYPTHASH hash = 0;
-        ok = CryptCreateHash(prov, CALG_MD5, 0, 0, &hash) != 0;
-        if (ok) {
-            BYTE digest[16];
-            DWORD len = sizeof(digest);
-            ok = CryptHashData(hash, (const BYTE*)input.data(), (DWORD)input.size(), 0) &&
-                 CryptGetHashParam(hash, HP_HASHVAL, digest, &len, 0);
-            if (ok)
-                token = HexEncode(digest, sizeof(digest));
-            CryptDestroyHash(hash);
-        }
-    }
-    CryptReleaseContext(prov, 0);
-    return ok;
+    RandomBytes(rnd, sizeof(rnd));
+    salt = HexEncode(rnd, sizeof(rnd));
+    BYTE digest[16];
+    Md5(passwordUtf8 + salt, digest);
+    token = HexEncode(digest, sizeof(digest));
+    return true;
 }
 
 // --- JSON helpers -------------------------------------------------------------
@@ -135,18 +216,40 @@ static SubsonicAlbum ParseAlbum(cJSON* a)
 // crosses the internet unencrypted.
 static bool IsLanUrl(const std::wstring& url)
 {
-    URL_COMPONENTSW uc;
+    // ANSI WinINet (Windows 9x has no Unicode one); addresses are ASCII.
+    std::string urlA(url.size(), '?');
+    for (size_t i = 0; i < url.size(); ++i)
+        if (url[i] < 0x80)
+            urlA[i] = (char)url[i];
+    URL_COMPONENTSA uc;
     ZeroMemory(&uc, sizeof(uc));
     uc.dwStructSize = sizeof(uc);
     uc.dwHostNameLength = 1;
-    if (!InternetCrackUrlW(url.c_str(), (DWORD)url.size(), 0, &uc) || !uc.lpszHostName)
+    if (!InternetCrackUrlA(urlA.c_str(), (DWORD)urlA.size(), 0, &uc) || !uc.lpszHostName)
         return false;
-    std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
+    std::wstring host(uc.lpszHostName, uc.lpszHostName + uc.dwHostNameLength);
 
-    unsigned a, b, c, d;
-    if (swscanf(host.c_str(), L"%u.%u.%u.%u", &a, &b, &c, &d) == 4)
+    // A dotted IPv4 address (parsed by hand: MinGW's swscanf was built for i686).
+    unsigned part[4] = { 0, 0, 0, 0 };
+    int parts = 0, digits = 0;
+    bool ip = !host.empty();
+    for (size_t i = 0; i < host.size() && ip; ++i) {
+        wchar_t ch = host[i];
+        if (ch >= L'0' && ch <= L'9' && digits < 3) {
+            part[parts] = part[parts] * 10 + (ch - L'0');
+            ++digits;
+        } else if (ch == L'.' && digits > 0 && parts < 3) {
+            ++parts;
+            digits = 0;
+        } else {
+            ip = false;
+        }
+    }
+    if (ip && parts == 3 && digits > 0) {
+        const unsigned a = part[0], b = part[1];
         return a == 10 || a == 127 || (a == 192 && b == 168) ||
                (a == 172 && b >= 16 && b <= 31) || (a == 169 && b == 254);
+    }
     if (host.find(L'.') == std::wstring::npos)
         return true;   // single-label name such as "nas"
     return EndsWithNoCase(host, L".local") || EndsWithNoCase(host, L".lan") ||

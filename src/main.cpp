@@ -13,6 +13,8 @@
 #include <mmsystem.h>
 #include <shellapi.h>
 #include <process.h>
+#include "version.h"
+#include "compat_win9x.h"
 #include <stdlib.h>
 #include <algorithm>
 #include <map>
@@ -32,7 +34,7 @@
 #include "util.h"
 
 #define APP_TITLE   L"Navi2K Player"
-#define APP_VERSION L"1.2"
+#define APP_VERSION LP_VERSION_WTEXT
 
 enum {
     IDC_PLAY = 102, IDC_PAUSE, IDC_STOP,
@@ -1637,6 +1639,124 @@ static void DrawRowExtras(HDC dc, int item)
     DeleteObject(clip);
 }
 
+// List cells the control can't draw (on 9x, text outside the ANSI code page shows as "?"; on
+// 2000+ without East Asian fonts, Japanese shows as boxes) are drawn again after the row, with
+// the Unicode GDI functions and a font that has the characters. The background is read back
+// from what the control drew, so selection shows.
+static void RedrawUnicodeCells(HWND lv, HDC dc, int item, HFONT font, COLORREF textColor)
+{
+    if (!OwnTextDrawing())
+        return;
+    HWND header = ListView_GetHeader(lv);
+    const int cols = header ? Header_GetItemCount(header) : 1;
+    for (int c = 0; c < cols; ++c) {
+        wchar_t text[512];
+        text[0] = 0;
+        ListView_GetItemText(lv, item, c, text, 512);
+        if (!NeedsUnicodeDrawing(text))
+            continue;
+        RECT rc;
+        if (!ListView_GetSubItemRect(lv, item, c, c == 0 ? LVIR_LABEL : LVIR_BOUNDS, &rc) || rc.right - rc.left < 8)
+            continue;
+        COLORREF bg = GetPixel(dc, rc.left + 1, rc.top + 1);
+        if (bg == CLR_INVALID)
+            bg = GetSysColor(COLOR_WINDOW);
+        HBRUSH brush = CreateSolidBrush(bg);
+        FillRect(dc, &rc, brush);
+        DeleteObject(brush);
+        RECT tr = { rc.left + (c == 0 ? 2 : 6), rc.top, rc.right - 6, rc.bottom };
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        const int oldMode = SetBkMode(dc, TRANSPARENT);
+        const COLORREF oldColor =
+            SetTextColor(dc, bg == GetSysColor(COLOR_HIGHLIGHT) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : textColor);
+        DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SetTextColor(dc, oldColor);
+        SetBkMode(dc, oldMode);
+        SelectObject(dc, oldFont);
+    }
+}
+
+// The album and artist lists only need custom drawing for that.
+static LRESULT OnListCustomDraw(NMLVCUSTOMDRAW* cd)
+{
+    if (!OwnTextDrawing())
+        return CDRF_DODEFAULT;
+    switch (cd->nmcd.dwDrawStage) {
+    case CDDS_PREPAINT:
+        return CDRF_NOTIFYITEMDRAW;
+    case CDDS_ITEMPREPAINT:
+        return CDRF_NOTIFYPOSTPAINT;
+    case CDDS_ITEMPOSTPAINT:
+        RedrawUnicodeCells(cd->nmcd.hdr.hwndFrom, cd->nmcd.hdc, (int)cd->nmcd.dwItemSpec, g_app.font,
+                           GetSysColor(COLOR_WINDOWTEXT));
+        break;
+    }
+    return CDRF_DODEFAULT;
+}
+
+// The sidebar, likewise: playlist names in other scripts.
+static LRESULT OnTreeCustomDraw(NMTVCUSTOMDRAW* cd)
+{
+    if (!OwnTextDrawing())
+        return CDRF_DODEFAULT;
+    switch (cd->nmcd.dwDrawStage) {
+    case CDDS_PREPAINT:
+        return CDRF_NOTIFYITEMDRAW;
+    case CDDS_ITEMPREPAINT:
+        return CDRF_NOTIFYPOSTPAINT;
+    case CDDS_ITEMPOSTPAINT: {
+        HTREEITEM h = (HTREEITEM)cd->nmcd.dwItemSpec;
+        wchar_t text[256];
+        text[0] = 0;
+        TVITEMW it;
+        ZeroMemory(&it, sizeof(it));
+        it.mask = TVIF_TEXT | TVIF_STATE;
+        it.hItem = h;
+        it.stateMask = TVIS_BOLD;
+        it.pszText = text;
+        it.cchTextMax = 256;
+        if (!TreeView_GetItem(g_app.tree, &it) || !NeedsUnicodeDrawing(text))
+            break;
+        RECT rc, client;
+        if (!TreeView_GetItemRect(g_app.tree, h, &rc, TRUE))
+            break;
+        GetClientRect(g_app.tree, &client);
+        rc.right = client.right;
+        COLORREF bg = GetPixel(cd->nmcd.hdc, rc.left + 1, rc.top + 1);
+        if (bg == CLR_INVALID)
+            bg = GetSysColor(COLOR_WINDOW);
+        HDC dc = cd->nmcd.hdc;
+        HBRUSH brush = CreateSolidBrush(bg);
+        FillRect(dc, &rc, brush);
+        DeleteObject(brush);
+        RECT tr = { rc.left + 2, rc.top, rc.right - 2, rc.bottom };
+        HGDIOBJ oldFont = SelectObject(dc, (it.state & TVIS_BOLD) ? g_app.fontBold : g_app.font);
+        const int oldMode = SetBkMode(dc, TRANSPARENT);
+        const COLORREF oldColor = SetTextColor(
+            dc, GetSysColor(bg == GetSysColor(COLOR_HIGHLIGHT) ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
+        DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SetTextColor(dc, oldColor);
+        SetBkMode(dc, oldMode);
+        SelectObject(dc, oldFont);
+        break;
+    }
+    }
+    return CDRF_DODEFAULT;
+}
+
+// Bold for the playing track; grey for tracks already played in the queue.
+static void SongRowStyle(int item, bool& bold, bool& grey)
+{
+    bold = grey = false;
+    if (g_app.songSource == SRC_QUEUE) {
+        bold = item == g_app.queueIndex;
+        grey = item < g_app.queueIndex && !ListView_GetItemState(g_app.songs, item, LVIS_SELECTED);
+    } else {
+        bold = QueueValid() && item < (int)g_app.songData.size() &&
+               g_app.songData[item].id == g_app.queue[g_app.queueIndex].id;
+    }
+}
+
 static LRESULT OnSongsCustomDraw(NMLVCUSTOMDRAW* cd)
 {
     switch (cd->nmcd.dwDrawStage) {
@@ -1665,6 +1785,12 @@ static LRESULT OnSongsCustomDraw(NMLVCUSTOMDRAW* cd)
     }
     case CDDS_ITEMPOSTPAINT: {
         const int item = (int)cd->nmcd.dwItemSpec;
+        if (OwnTextDrawing()) {
+            bool bold, grey;
+            SongRowStyle(item, bold, grey);
+            RedrawUnicodeCells(g_app.songs, cd->nmcd.hdc, item, bold ? g_app.fontBold : g_app.font,
+                               GetSysColor(grey ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
+        }
         DrawRowExtras(cd->nmcd.hdc, item);
         // Drag and drop: a line where the track would go (above this row, or below the last).
         const int last = (int)g_app.songData.size() - 1;
@@ -5840,6 +5966,8 @@ static LRESULT OnNotify(NMHDR* nm)
         break;
 
     case IDC_ALBUMS:
+        if (nm->code == NM_CUSTOMDRAW)
+            return OnListCustomDraw((NMLVCUSTOMDRAW*)nm);
         if (nm->code == LVN_COLUMNCLICK)
             OnAlbumsColumnClick(((NMLISTVIEW*)nm)->iSubItem);
         else if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
@@ -5849,6 +5977,8 @@ static LRESULT OnNotify(NMHDR* nm)
         break;
 
     case IDC_ARTISTS:
+        if (nm->code == NM_CUSTOMDRAW)
+            return OnListCustomDraw((NMLVCUSTOMDRAW*)nm);
         if (nm->code == LVN_COLUMNCLICK)
             OnArtistsColumnClick(((NMLISTVIEW*)nm)->iSubItem);
         else if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
@@ -5856,6 +5986,8 @@ static LRESULT OnNotify(NMHDR* nm)
         break;
 
     case IDC_TREE:
+        if (nm->code == NM_CUSTOMDRAW)
+            return OnTreeCustomDraw((NMTVCUSTOMDRAW*)nm);
         if (nm->code == TVN_SELCHANGEDW && !g_app.treeUpdating) {
             NMTREEVIEWW* tv = (NMTREEVIEWW*)nm;
             LPARAM data = tv->itemNew.lParam;
@@ -5968,7 +6100,7 @@ static void OnCommand(int id)
         EditShownPlaylist();
         break;
     case IDM_ABOUT: {
-        std::wstring about = L"Navi2K Player " APP_VERSION L"\r\nNavidrome client for Windows 2000 / XP\r\n\r\n";
+        std::wstring about = L"Navi2K Player " APP_VERSION L"\r\nNavidrome client for Windows 95 and later\r\n\r\n";
         about += L"Server: " + (g_app.serverUrl.empty() ? std::wstring(L"(not connected)") : g_app.serverUrl);
         about += L"\r\nCPU: " + g_app.cpuSummary;
         MessageBoxW(g_app.wnd, about.c_str(), L"About " APP_TITLE, MB_ICONINFORMATION);
@@ -6445,6 +6577,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show)
     g_app.pendingPlaylist = -1;
     LogInit(dir + L"\\Navi2KPlayer.log");
     srand(GetTickCount());
+    LoadFallbackFont(dir);   // East Asian text without installing a font (9x, or 2000+ without them)
 
     // --- CPU check before anything that might execute SIMD code ---
     g_app.cpu = DetectCpu();
@@ -6525,5 +6658,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show)
     for (int i = 0; i < 100 && g_app.jobsRunning > 0; ++i)
         Sleep(50);
     HttpShutdown();
+    UnloadFallbackFont();
     return (int)msg.wParam;
 }

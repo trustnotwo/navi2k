@@ -1,5 +1,6 @@
 #include <windows.h>
 #include "resource.h"
+#include "version.h"
 
 // RT_MANIFEST (24), id 1 = process manifest. Windows 2000 ignores it; XP uses it for themed controls.
 1 24 "app.manifest"
@@ -146,9 +147,9 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,2,0,0
-PRODUCTVERSION  1,2,0,0
-FILEOS          VOS_NT_WINDOWS32
+FILEVERSION     LP_VERSION_MAJOR,LP_VERSION_MINOR,LP_VERSION_PATCH,LP_DEV_BUILD
+PRODUCTVERSION  LP_VERSION_MAJOR,LP_VERSION_MINOR,LP_VERSION_PATCH,LP_DEV_BUILD
+FILEOS          VOS__WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
     BLOCK "StringFileInfo"
@@ -156,9 +157,9 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription", "Navi2K Player - Navidrome client\0"
-            VALUE "FileVersion", "1.2.0\0"
+            VALUE "FileVersion", LP_VERSION_TEXT
             VALUE "ProductName", "Navi2K Player\0"
-            VALUE "ProductVersion", "1.2.0\0"
+            VALUE "ProductVersion", LP_VERSION_TEXT
         END
     END
     BLOCK "VarFileInfo"

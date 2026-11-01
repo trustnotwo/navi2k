@@ -9,6 +9,7 @@ WaveOut::WaveOut()
 {
     InitializeCriticalSection(&m_lock);
     m_doneEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    m_resumeEvent = CreateEventW(NULL, TRUE, TRUE, NULL);
     m_mem = new char[MAX_BUFFERS * BUFFER_BYTES];
     ZeroMemory(m_hdr, sizeof(m_hdr));
     for (int i = 0; i < MAX_BUFFERS; ++i)
@@ -32,6 +33,7 @@ WaveOut::~WaveOut()
     Close();
     delete[] m_mem;
     CloseHandle(m_doneEvent);
+    CloseHandle(m_resumeEvent);
     DeleteCriticalSection(&m_lock);
 }
 
@@ -159,8 +161,14 @@ bool WaveOut::Write(const short* samples, size_t count, HANDLE cancel)
     const char* src = (const char*)samples;
     size_t bytes = count * sizeof(short);
     while (bytes > 0) {
-        if (m_fill == 0 && !WaitForBuffer(m_cur, cancel))
-            return false;
+        if (m_fill == 0) {
+            // Paused: queue nothing more until resumed (Stop and seeking still cancel).
+            HANDLE h[2] = { cancel, m_resumeEvent };
+            if (WaitForMultipleObjects(2, h, FALSE, INFINITE) == WAIT_OBJECT_0)
+                return false;
+            if (!WaitForBuffer(m_cur, cancel))
+                return false;
+        }
         DWORD n = BUFFER_BYTES - m_fill;
         if (n > bytes)
             n = (DWORD)bytes;
@@ -228,11 +236,14 @@ void WaveOut::SetPaused(bool paused)
 {
     EnterCriticalSection(&m_lock);
     m_paused = paused;
-    if (m_wo && m_started) {
-        if (paused)
-            waveOutPause(m_wo);
-        else
-            waveOutRestart(m_wo);
-    }
+    if (paused)
+        ResetEvent(m_resumeEvent);
+    else
+        SetEvent(m_resumeEvent);
+    MMRESULT mr = MMSYSERR_NOERROR;
+    if (m_wo && m_started)
+        mr = paused ? waveOutPause(m_wo) : waveOutRestart(m_wo);
     LeaveCriticalSection(&m_lock);
+    if (mr != MMSYSERR_NOERROR)
+        LogF(L"%ls failed: %u", paused ? L"waveOutPause" : L"waveOutRestart", mr);
 }

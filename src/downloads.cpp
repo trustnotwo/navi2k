@@ -1,4 +1,5 @@
 #include "downloads.h"
+#include "compat_win9x.h"
 #include "util.h"
 #include <process.h>
 #include <stdio.h>
@@ -15,7 +16,7 @@ static std::wstring CleanPart(const std::wstring& in, const wchar_t* fallback)
     std::wstring s;
     for (size_t i = 0; i < in.size(); ++i) {
         wchar_t c = in[i];
-        s += (c < 32 || wcschr(L"\\/:*?\"<>|", c)) ? L'_' : c;
+        s += (c < 32 || wcschr(L"\\/:*?\"<>|", c) || (Win9xMode() && !AnsiCanHold(c))) ? L'_' : c;
     }
     if (s.size() > kMaxPart)
         s.erase(kMaxPart);

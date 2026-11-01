@@ -1,11 +1,15 @@
 # Post-build compatibility check for Windows 2000 / non-SSE2 CPUs.
 #
 #   cmake -DOBJDUMP=... -DEXE=... -DOUT_DIR=... [-DSCAN_XMM=ON] [-DALLOW_XMM_IN=regex] [-DSTRICT=ON]
+#         [-DWIN9X=ON]
 #         -P check_binary.cmake
 #
 # 1. PE subsystem version must be <= 5 or the Win2000 loader rejects the image.
 # 2. No imports that only exist on XP or later (best-effort list + every msvcrt *_s function).
 # 3. With SCAN_XMM, no function may touch XMM registers except the runtime-dispatched ones.
+#
+# 4. With WIN9X, the PE header must say 4.0 and no Unicode (W) or NT-only import may remain
+#    except the few W functions Windows 95 implements (src/compat_win9x.cpp covers the rest).
 #
 # Full import list is written to OUT_DIR/imports.txt for manual review. Passing this check is
 # necessary, not sufficient: the real test is launching the .exe on Windows 2000 SP4.
@@ -32,6 +36,23 @@ string(REGEX MATCH "[0-9]+" subsys_major "${subsys_line}")
 if(subsys_major GREATER 5)
     list(APPEND problems "PE MajorSubsystemVersion is ${subsys_major}; Windows 2000 needs 5 or lower")
 endif()
+if(WIN9X AND subsys_major GREATER 4)
+    list(APPEND problems "PE MajorSubsystemVersion is ${subsys_major}; Windows 95/98 need 4")
+endif()
+
+# W functions that really work on Windows 95/98/ME (the rest are stubs or missing).
+set(win9x_native_w
+    TextOutW ExtTextOutW GetTextExtentPoint32W GetTextExtentPointW GetTextExtentExPointW GetCharWidthW
+    MessageBoxW MessageBoxExW lstrlenW GetCommandLineW
+    EnumResourceLanguagesW EnumResourceNamesW EnumResourceTypesW FindResourceW FindResourceExW)
+# Not Unicode, but missing from Windows 95 and/or 98.
+set(win9x_missing
+    TryEnterCriticalSection IsProcessorFeaturePresent MoveFileExA GetFileSizeEx SetFilePointerEx
+    GetFileAttributesExA GetLongPathNameA InterlockedCompareExchange InterlockedExchangeAdd
+    SignalObjectAndWait SwitchToThread CreateWaitableTimerA CopyFileExA ReadDirectoryChangesW
+    CryptAcquireContextA CryptGenRandom CryptCreateHash
+    SetLayeredWindowAttributes UpdateLayeredWindow AnimateWindow GetMonitorInfoA MonitorFromWindow
+    TrackMouseEvent SendInput AllowSetForegroundWindow GetGUIThreadInfo LockSetForegroundWindow)
 
 # --- 2. Imports ---------------------------------------------------------------
 set(xp_or_later
@@ -75,6 +96,10 @@ foreach(line IN LISTS import_lines)
         list(APPEND problems "imports msvcrt!${name}; the Win2000 msvcrt has no *_s functions")
     elseif(dll MATCHES "^(ucrtbase|api-ms-win-)")
         list(APPEND problems "imports ${dll}; use an msvcrt-based MinGW-w64 toolchain, not UCRT")
+    elseif(WIN9X AND name MATCHES "W$" AND NOT name IN_LIST win9x_native_w AND NOT dll STREQUAL "msvcrt.dll")
+        list(APPEND problems "imports ${dll}!${name}, which Windows 9x lacks (add a stand-in to src/compat_win9x.cpp)")
+    elseif(WIN9X AND name IN_LIST win9x_missing)
+        list(APPEND problems "imports ${dll}!${name}, which Windows 95/98 lack")
     endif()
 endforeach()
 file(WRITE "${OUT_DIR}/imports.txt" "${import_report}")
@@ -121,7 +146,7 @@ endif()
 # --- Report -----------------------------------------------------------------
 if(problems)
     list(LENGTH problems n)
-    set(msg "Windows 2000 / non-SSE2 compatibility check found ${n} problem(s):")
+    set(msg "Windows 9x/2000 / non-SSE2 compatibility check found ${n} problem(s):")
     foreach(p IN LISTS problems)
         string(APPEND msg "\n  - ${p}")
     endforeach()
@@ -132,5 +157,5 @@ if(problems)
         message(WARNING "${msg}")
     endif()
 else()
-    message(STATUS "Win2000/SSE2 check passed (imports listed in ${OUT_DIR}/imports.txt)")
+    message(STATUS "Win9x/2000/SSE2 check passed (imports listed in ${OUT_DIR}/imports.txt)")
 endif()
