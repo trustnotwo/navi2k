@@ -39,6 +39,7 @@ The password itself is never stored: Settings saves a login token (`Token` and `
 | `ShowFavorites` | `1` | Shows the ♥ column and the Favorites section |
 | `ShowRatings` | `1` | Shows the star rating column |
 | `HiddenSections` | `added,played,frequent,random` | Sidebar sections to hide, comma-separated (empty shows them all): `albums`, `artists`, `songs`, `favorites`, `added`, `played`, `frequent`, `random`, `queue`, `downloads` |
+| `ShownSections` | (empty) | Sidebar sections that are off unless listed here: `genres` |
 | `LastFmInfo` | `0` | Set to `1` to show album and artist descriptions from Last.fm. Navidrome fetches them, so Last.fm must be turned on there. |
 | `TrayIcon` | `1` | Shows an icon in the notification area |
 | `MinimizeToTray` | `0` | Set to `1` to hide the player in the notification area when minimized |

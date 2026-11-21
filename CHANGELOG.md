@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4
+
+- **Genres**: Library > Genres lists every genre with its song and album counts; click one to see its albums. Genres come from every song's tags, so albums where only some tracks carry a genre are included too. Off by default: turn it on under File > Settings > Sidebar.
+- **Faster on old PCs**: the Songs list loads in the background and can be used while it fills (about 12 seconds instead of 26 for 7,000 songs on a Pentium 90). Searching and sorting are much faster, especially on Windows 95/98/ME, and playing a large list no longer copies every song. The Albums, Artists and Genres lists only build the rows on screen, and typing in them jumps to a match. MP3 decoding is about 20% faster.
+- On Windows 95, 98 and ME, the log and the plays saved for later are written again; they failed there in 1.3.
+- On Windows 95, 98 and ME, a settings file created on Windows 2000 or later is converted so the settings can be read and saved.
+- The log records how long the library takes to load, and what the server sent when a FLAC file can't be played.
+
 ## 1.3
 
 - Runs on Windows 95, 98, and ME as well (Windows 2000 is still the target and nothing changes there). On 9x, text in other scripts (Japanese on an English Windows 98, say) shows in the lists, sidebar, header, and now-playing panel using the bundled Droid Sans Fallback font or an installed one, and as `?` elsewhere; download names replace those characters with `_`, the settings file is ANSI, and media keys probably don't work.

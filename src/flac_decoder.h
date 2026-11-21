@@ -43,6 +43,7 @@ private:
     static unsigned OnSeek(void* self, int offset, int origin);
     static unsigned OnTell(void* self, long long* cursor);
     size_t ReadAt(void* buf, size_t bytes);
+    void LogRejectedStart();
     bool Reconnect(unsigned long long pos);
 
     HttpRequest& m_req;

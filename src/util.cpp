@@ -10,10 +10,14 @@
 // beyond the BMP become surrogate pairs, as Windows does.
 std::wstring Utf8ToWide(const std::string& s)
 {
+    return Utf8ToWide(s.data(), s.size());
+}
+
+std::wstring Utf8ToWide(const char* s, size_t n)
+{
     std::wstring out;
-    out.reserve(s.size());
-    const unsigned char* p = (const unsigned char*)s.data();
-    const size_t n = s.size();
+    out.reserve(n);
+    const unsigned char* p = (const unsigned char*)s;
     for (size_t i = 0; i < n;) {
         unsigned c = p[i];
         int extra = c < 0x80 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : (c & 0xF8) == 0xF0 ? 3 : -1;

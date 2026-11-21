@@ -45,7 +45,7 @@ enum {
     // Mini player.
     IDC_MINI_PREV, IDC_MINI_PLAYPAUSE, IDC_MINI_STOP, IDC_MINI_NEXT,
     IDC_MINI_SEEK, IDC_MINI_VOLUME, IDC_MINI_TIME_CUR, IDC_MINI_TIME_TOTAL,
-    IDC_REPEAT, IDC_PREV, IDC_NEXT
+    IDC_REPEAT, IDC_PREV, IDC_NEXT, IDC_GENRES
 };
 
 // Menu bar.
@@ -54,6 +54,7 @@ enum {
     IDM_ALBUMS, IDM_NEW_PLAYLIST, IDM_ABOUT, IDM_ARTISTS, IDM_SONGS, IDM_FIND,
     IDM_MINI, IDM_PREV, IDM_NEXT, IDM_SETTINGS, IDM_FAVORITES, IDM_QUEUE, IDM_SHOW, IDM_PLAYPAUSE,
     IDM_REPEAT_OFF, IDM_REPEAT_ALL, IDM_REPEAT_ONE, IDM_REPEAT_CYCLE, IDM_EDIT_PLAYLIST, IDM_DOWNLOADS,
+    IDM_GENRES,
     IDM_DISCOVER   // + DiscoverKind: View > Discover
 };
 
@@ -88,7 +89,8 @@ enum { COL_NUM = 0, COL_TITLE, COL_ARTIST, COL_FAV, COL_RATING, COL_LENGTH, COL_
 // Sidebar tree item data (playlists use their index, >= 0).
 enum { TREE_LIBRARY = -1, TREE_ALBUMS = -2, TREE_PLAYLISTS = -3, TREE_ARTISTS = -4, TREE_SONGS = -5,
        TREE_FAVORITES = -6, TREE_QUEUE = -7, TREE_DOWNLOADS = -8,
-       TREE_DISCOVER = -9 };   // -9 - DiscoverKind: the Discover lists
+       TREE_DISCOVER = -9,     // -9 - DiscoverKind: the Discover lists
+       TREE_GENRES = -20 };
 
 // Discover lists (getAlbumList2 types), in sidebar order.
 enum DiscoverKind { DISCOVER_ADDED, DISCOVER_PLAYED, DISCOVER_FREQUENT, DISCOVER_RANDOM, DISCOVER_COUNT };
@@ -98,12 +100,13 @@ static const wchar_t* const kDiscoverTitles[DISCOVER_COUNT] = { L"Recently Added
 static const int kDiscoverSize = 100;
 
 // What the album list control shows.
-enum { ALBUMS_ALL, ALBUMS_ARTIST, ALBUMS_DISCOVER };
+enum { ALBUMS_ALL, ALBUMS_ARTIST, ALBUMS_DISCOVER, ALBUMS_GENRE };
 
 #define WM_APP_JOB_DONE (WM_APP + 10)
 #define WM_APP_TEST_DONE (WM_APP + 11)   // Settings > Test Connection finished (to the page)
 #define WM_APP_TRAY (WM_APP + 12)        // notification-area icon mouse messages
 #define WM_APP_DOWNLOAD (WM_APP + 13)    // a DownloadEvent from the download thread
+#define WM_APP_SONG_PAGE (WM_APP + 14)   // a SongPage from the song list load
 static const UINT kTrayId = 1;
 
 static const int kArtSize = 160;        // requested from the server and drawn 1:1
@@ -114,7 +117,8 @@ static const int kSidebarW = kArtSize + 12;
 // --- Background jobs ------------------------------------------------------------------
 // Loads (connect/album/playlist) run one at a time. Writes (ratings, playlist edits) and
 // now-playing cover fetches run alongside them; playlist edits are serialised because
-// removal is by index.
+// removal is by index. The song list (JOB_SONGS) also runs alongside, as it takes a while
+// on slow PCs.
 
 enum JobKind { JOB_CONNECT, JOB_ALBUM, JOB_PLAYLIST, JOB_RATE, JOB_PLEDIT, JOB_ART, JOB_ARTIST, JOB_SONGS,
                JOB_FAVORITES, JOB_STAR, JOB_SCROBBLE, JOB_QUEUE_FETCH, JOB_INFO, JOB_DL_FETCH, JOB_DISCOVER };
@@ -122,8 +126,7 @@ enum PlEdit { PL_CREATE, PL_RENAME, PL_ADD, PL_REMOVE, PL_SETSONGS, PL_DELETE };
 
 static bool IsLoadJob(JobKind k)
 {
-    return k == JOB_CONNECT || k == JOB_ALBUM || k == JOB_PLAYLIST || k == JOB_ARTIST || k == JOB_SONGS ||
-           k == JOB_FAVORITES;
+    return k == JOB_CONNECT || k == JOB_ALBUM || k == JOB_PLAYLIST || k == JOB_ARTIST || k == JOB_FAVORITES;
 }
 
 struct Job {
@@ -176,9 +179,90 @@ enum SongSource { SRC_NONE, SRC_ALBUM, SRC_PLAYLIST, SRC_LIBRARY, SRC_FAVORITES,
 // VIEW_ALBUMS: all albums. VIEW_ARTISTS: all artists. VIEW_ARTIST: one artist's albums
 // (same list control as VIEW_ALBUMS). VIEW_TRACKS: an album's or playlist's tracks.
 // VIEW_SONGS: every song in the library; VIEW_FAVORITES: starred songs; VIEW_QUEUE: the play
-// queue (all use the same list control as VIEW_TRACKS).
+// queue (all use the same list control as VIEW_TRACKS). VIEW_GENRES: all genres; VIEW_GENRE:
+// one genre's albums (the album list again).
 enum MainView { VIEW_ALBUMS, VIEW_TRACKS, VIEW_ARTISTS, VIEW_ARTIST, VIEW_SONGS, VIEW_FAVORITES, VIEW_QUEUE,
-                VIEW_DOWNLOADS, VIEW_DISCOVER };
+                VIEW_DOWNLOADS, VIEW_DISCOVER, VIEW_GENRES, VIEW_GENRE };
+
+// The tracks the track table shows, as row numbers into a list of songs: usually its own
+// list, but the Songs page uses the whole library (App::allSongs) directly. Searching and
+// sorting then only rearrange ints; copying 7,000 songs (every string of each, as C++98 has
+// no move) took seconds on a Pentium.
+class SongRows {
+public:
+    SongRows() : m_base(&m_own) {}
+    size_t size() const { return m_rows.size(); }
+    bool empty() const { return m_rows.empty(); }
+    SubsonicSong& operator[](size_t row) { return (*m_base)[m_rows[row]]; }
+    const SubsonicSong& operator[](size_t row) const { return (*m_base)[m_rows[row]]; }
+
+    // Show 'songs' in order; takes them (swaps them in), leaving 'songs' with the old list.
+    void Take(std::vector<SubsonicSong>& songs)
+    {
+        m_own.swap(songs);
+        UseOwn();
+    }
+    void Assign(const std::vector<SubsonicSong>& songs)
+    {
+        m_own = songs;
+        UseOwn();
+    }
+    void push_back(const SubsonicSong& s)
+    {
+        if (m_base != &m_own)
+            clear();
+        m_own.push_back(s);
+        m_rows.push_back((int)m_own.size() - 1);
+    }
+    void clear()
+    {
+        m_own.clear();
+        UseOwn();
+    }
+    // Show these rows of 'songs', which must outlive this view (or be dropped with clear()).
+    void ShowRows(std::vector<SubsonicSong>& songs, std::vector<int>& rows)
+    {
+        m_own.clear();
+        m_base = &songs;
+        m_rows.swap(rows);
+    }
+    bool Shows(const std::vector<SubsonicSong>& songs) const { return m_base == &songs; }
+
+    const std::vector<SubsonicSong>& Base() const { return *m_base; }
+    std::vector<int>& Rows() { return m_rows; }
+    std::vector<SubsonicSong> Copy() const
+    {
+        std::vector<SubsonicSong> v;
+        v.reserve(m_rows.size());
+        for (size_t i = 0; i < m_rows.size(); ++i)
+            v.push_back((*m_base)[m_rows[i]]);
+        return v;
+    }
+
+private:
+    void UseOwn()
+    {
+        m_base = &m_own;
+        m_rows.resize(m_own.size());
+        for (size_t i = 0; i < m_rows.size(); ++i)
+            m_rows[i] = (int)i;
+    }
+    SongRows(const SongRows&);
+    SongRows& operator=(const SongRows&);
+
+    std::vector<SubsonicSong> m_own;
+    std::vector<SubsonicSong>* m_base;
+    std::vector<int> m_rows;
+};
+
+// The play order: entry i is App::queueSource[App::queueSrcIdx[i]]. A view rather than a
+// second copy of every song (playing the 7,000-song library copied them all twice).
+struct QueueView {
+    size_t size() const;
+    bool empty() const { return size() == 0; }
+    SubsonicSong& operator[](size_t i);
+    const SubsonicSong& operator[](size_t i) const;
+};
 
 struct Shown {                  // what the header describes
     bool has;
@@ -188,7 +272,7 @@ struct Shown {                  // what the header describes
 };
 
 struct App {
-    HWND wnd, tree, btnNewPlaylist, albums, artists, songs, status;
+    HWND wnd, tree, btnNewPlaylist, albums, artists, genres, songs, status;
     HWND search, searchLabel;
     // Mini player (a separate top-level window; Ctrl+M swaps it with the main window).
     HWND mini, miniPrev, miniPlayPause, miniStop, miniNext, miniSeek, miniVolume, miniTimeCur, miniTimeTotal;
@@ -199,7 +283,7 @@ struct App {
     HMENU menu;
     HFONT font, fontBold, fontTitle;
     HBRUSH latchBrush;
-    HTREEITEM treeLibrary, treeAlbums, treeArtists, treeSongs, treePlaylists;
+    HTREEITEM treeLibrary, treeAlbums, treeArtists, treeGenres, treeSongs, treePlaylists;
     bool treeUpdating;
     RECT headerRect, artRect, npRect, speakerRect, transportRect;
     MainView mainView;
@@ -209,6 +293,13 @@ struct App {
     Player player;
     std::vector<SubsonicAlbum> albumData;
     std::vector<SubsonicArtist> artistData;
+    // Genres, built from the song list's tags once it has loaded (BuildGenres), with each
+    // genre's album ids; and the open genre's albums.
+    std::vector<SubsonicGenre> genreData, genreList;   // all; as shown (searched, sorted)
+    std::map<std::wstring, std::set<std::string> > genreAlbumIds;
+    bool genresBuilt;
+    SubsonicGenre shownGenre;
+    std::vector<SubsonicAlbum> genreAlbums;
     std::vector<SubsonicLibrary> libraries;  // on the server (File > Settings > Libraries)
     std::set<std::string> libraryAlbums;     // albums in the chosen libraries (filled only when filtering)
 
@@ -228,9 +319,16 @@ struct App {
     SubsonicArtist shownArtist;
     SubsonicAlbum shownAlbum;               // valid when songSource == SRC_ALBUM
     std::string shownArtistCover;            // artist image, or a collage of their album covers
-    std::vector<SubsonicSong> allSongs;      // the whole library, loaded on first visit to Songs
+    // The whole library, in SongLibraryOrder: loaded in the background after connecting, a
+    // page at a time (OnSongPage), with songKeys (search keys) kept in step. songsGen
+    // counts connections, so pages of a load from before a reconnect are dropped.
+    std::vector<SubsonicSong> allSongs;
     bool allSongsLoaded;
-    bool pendingSongs;
+    bool songsLoading;
+    int songsGen, songsLoadingGen;
+    volatile LONG songsCancel;                // set by the UI: the load stops after its page
+    std::vector<SubsonicSong> songsPending;   // arrived pages, merged into allSongs in larger steps
+    bool reloadKeepPlayback;                  // for DoConnect retried by TIMER_RELOAD
     HTREEITEM treeFavorites, treeQueue, treeDownloads;
     HTREEITEM treeDiscover[DISCOVER_COUNT];
     bool favoritesLoaded;
@@ -247,11 +345,11 @@ struct App {
     // built once when the data arrives; the lists on screen are filtered copies.
     std::vector<SubsonicAlbum> albumList;    // what the album list control shows
     std::vector<SubsonicArtist> artistList;  // what the artist list control shows
-    std::vector<std::wstring> albumKeys, artistKeys, songKeys;
-    std::wstring queryAlbums, queryArtists, querySongs;
+    std::vector<std::wstring> albumKeys, artistKeys, songKeys, genreKeys;
+    std::wstring queryAlbums, queryArtists, querySongs, queryGenres;
     bool searchUpdating;                     // setting the box's text ourselves
     std::vector<SubsonicPlaylist> playlistData;
-    std::vector<SubsonicSong> songData;     // tracks of the album/playlist being shown
+    SongRows songData;                      // tracks of the album/playlist being shown
     SongSource songSource;
     SubsonicPlaylist shownPlaylist;         // valid when songSource == SRC_PLAYLIST
     // The shown playlist in full: songData holds only the tracks in the chosen libraries, so
@@ -259,24 +357,27 @@ struct App {
     std::vector<std::string> playlistIds;
     std::vector<int> playlistRows;
 
-    // Playback queue: queueSource is the list as it was when playback started; queue is the
-    // play order (shuffled or not) and queueSrcIdx maps each queue entry back to the source.
-    // Editing the queue (Play next, Add to queue, remove, reorder) makes its current order
-    // the new source.
-    std::vector<SubsonicSong> queueSource, queue;
+    // Playback queue: queueSource holds the songs, in the order of the list as it was when
+    // playback started; queueSrcIdx is the play order (shuffled or not), as positions in
+    // queueSource, and 'queue' reads the songs in that order. Editing the queue (Play next,
+    // Add to queue, remove, reorder) makes its current order the new source (QueueEdited).
+    std::vector<SubsonicSong> queueSource;
     std::vector<int> queueSrcIdx;
+    QueueView queue;
     int queueIndex;
     bool queueFinished;                // played to the end; adding tracks starts them
     bool shuffle;
     int repeat;                        // RepeatMode
 
-    // Column sorting. The track list sorts a copy (songUnsorted keeps the original order,
+    // Column sorting. The track list sorts its rows (songUnsorted keeps the original order,
     // restored by clicking "#"); songSortKey names the list it applies to, so another
-    // album or playlist opens unsorted. -1 = not sorted.
-    int songSortCol, albumSortCol, artistSortCol;
-    bool songSortDesc, albumSortDesc, artistSortDesc;
+    // album or playlist opens unsorted. -1 = not sorted. librarySortKeys: sort keys of
+    // allSongs by column, built on first use (BuildSortKeys).
+    int songSortCol, albumSortCol, artistSortCol, genreSortCol;
+    bool songSortDesc, albumSortDesc, artistSortDesc, genreSortDesc;
     std::string songSortKey;
-    std::vector<SubsonicSong> songUnsorted;
+    std::vector<int> songUnsorted;
+    std::map<int, std::vector<std::string> > librarySortKeys;
     bool headerArrows;                 // comctl32 6 draws sort arrows in list headers
 
     bool mediaKeysGlobal;              // Settings > Display
@@ -321,6 +422,10 @@ struct App {
     std::wstring cpuSummary;
 };
 static App g_app;
+
+size_t QueueView::size() const { return g_app.queueSrcIdx.size(); }
+SubsonicSong& QueueView::operator[](size_t i) { return g_app.queueSource[g_app.queueSrcIdx[i]]; }
+const SubsonicSong& QueueView::operator[](size_t i) const { return g_app.queueSource[g_app.queueSrcIdx[i]]; }
 
 static void SetStatus(const std::wstring& text)
 {
@@ -459,6 +564,28 @@ static void KeepArtistsWithAlbums(std::vector<SubsonicArtist>& artists, const st
     artists.swap(kept);
 }
 
+// One page of the song list, on its way to the UI thread (OnSongPage).
+struct SongPage {
+    int gen;                          // App::songsGen when the load started
+    std::vector<SubsonicSong> songs;
+};
+
+// GetAllSongs page callback. JOB_SONGS: index = songsGen, flag = stopped early.
+static bool PostSongPage(std::vector<SubsonicSong>& songs, void* ctx)
+{
+    Job* job = (Job*)ctx;
+    SongPage* page = new SongPage;
+    page->gen = job->index;
+    page->songs.swap(songs);
+    if (!PostMessageW(g_app.wnd, WM_APP_SONG_PAGE, 0, (LPARAM)page))
+        delete page;
+    if (g_app.songsCancel) {
+        job->flag = true;
+        return false;
+    }
+    return true;
+}
+
 static unsigned __stdcall JobThread(void* p)
 {
     Job* job = (Job*)p;
@@ -496,7 +623,7 @@ static unsigned __stdcall JobThread(void* p)
                 }
         break;
     case JOB_SONGS:
-        job->ok = c.GetAllSongs(job->songs, job->message);
+        job->ok = c.GetAllSongs(job->songs, job->message, PostSongPage, job);
         break;
     case JOB_FAVORITES:
         job->ok = c.GetStarredSongs(job->songs, job->message);
@@ -700,7 +827,8 @@ static void ShowInfo(const std::string& id, const std::string& coverArt, const s
     InvalidateHeader();
 }
 
-static int TotalDuration(const std::vector<SubsonicSong>& songs)
+template <class Songs>
+static int TotalDuration(const Songs& songs)
 {
     int total = 0;
     for (size_t i = 0; i < songs.size(); ++i)
@@ -728,7 +856,7 @@ static void FilterShownPlaylist()
             shown.push_back(g_app.songData[i]);
         }
     }
-    g_app.songData.swap(shown);
+    g_app.songData.Take(shown);
 }
 
 static void ShowPlaylistInfo(const SubsonicPlaylist& pl)
@@ -947,20 +1075,6 @@ static void AddColumn(HWND lv, int index, const wchar_t* text, int width, int fm
     ListView_InsertColumn(lv, index, &c);
 }
 
-static void SetCell(HWND lv, int row, int col, const std::wstring& text)
-{
-    if (col == 0) {
-        LVITEMW it;
-        ZeroMemory(&it, sizeof(it));
-        it.mask = LVIF_TEXT;
-        it.iItem = row;
-        it.pszText = (LPWSTR)text.c_str();
-        ListView_InsertItem(lv, &it);
-    } else {
-        ListView_SetItemText(lv, row, col, (LPWSTR)text.c_str());
-    }
-}
-
 static int SelectedIndex(HWND lv)
 {
     return ListView_GetNextItem(lv, -1, LVNI_SELECTED);
@@ -1033,13 +1147,9 @@ static void BuildArtistKeys()
         g_app.artistKeys.push_back(Lower(g_app.artistData[i].name));
 }
 
-static void BuildSongKeys()
+static std::wstring SongSearchKey(const SubsonicSong& s)
 {
-    g_app.songKeys.clear();
-    for (size_t i = 0; i < g_app.allSongs.size(); ++i) {
-        const SubsonicSong& s = g_app.allSongs[i];
-        g_app.songKeys.push_back(Lower(s.title + L"\n" + s.artist + L"\n" + s.album));
-    }
+    return Lower(s.title + L"\n" + s.artist + L"\n" + s.album);
 }
 
 template <class T>
@@ -1057,27 +1167,184 @@ static void FilterInto(const std::vector<T>& all, const std::vector<std::wstring
             out.push_back(all[i]);
 }
 
+// allSongs is about to change: the track table mustn't keep rows of the old list.
+static void DropLibraryRows()
+{
+    g_app.librarySortKeys.clear();
+    if (g_app.songData.Shows(g_app.allSongs)) {
+        g_app.songData.clear();
+        g_app.songUnsorted.clear();
+        ListView_SetItemCountEx(g_app.songs, 0, 0);
+    }
+}
+
+static void ShowLibraryRows();
+static void ApplySongSortToNewData();
+
+static const size_t kSongMergeStep = 2000;
+
+// Merges the waiting pages into allSongs (keeping the library order) and, if the track table
+// shows the library, rebuilds its rows. The selected song stays selected and the top row stays
+// in place, so the list can be used while it fills.
+static void FlushSongPages()
+{
+    if (g_app.songsPending.empty())
+        return;
+    const DWORD start = GetTickCount();
+    HWND lv = g_app.songs;
+    const bool shown = g_app.songData.Shows(g_app.allSongs);
+    std::string selId, topId;
+    if (shown) {
+        const int sel = ListView_GetNextItem(lv, -1, LVNI_FOCUSED);
+        if (sel >= 0 && sel < (int)g_app.songData.size())
+            selId = g_app.songData[sel].id;
+        const int top = ListView_GetTopIndex(lv);
+        if (top > 0 && top < (int)g_app.songData.size())
+            topId = g_app.songData[top].id;
+    }
+
+    std::vector<int> from;
+    MergeSongs(g_app.allSongs, g_app.songsPending, &from);
+    std::vector<std::wstring> keys(from.size());
+    for (size_t i = 0; i < from.size(); ++i) {
+        if (from[i] >= 0 && from[i] < (int)g_app.songKeys.size())
+            keys[i].swap(g_app.songKeys[from[i]]);
+        else
+            keys[i] = SongSearchKey(g_app.allSongs[i]);
+    }
+    g_app.songKeys.swap(keys);
+    g_app.librarySortKeys.clear();   // by position, which moved
+
+    if (shown) {
+        ShowLibraryRows();
+        ApplySongSortToNewData();
+        ListView_SetItemState(lv, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_SetItemCountEx(lv, (int)g_app.songData.size(), LVSICF_NOSCROLL);
+        // Find both rows in one pass; an empty id means there's nothing to find.
+        int selRow = selId.empty() ? -2 : -1, topRow = topId.empty() ? -2 : -1;
+        for (size_t i = 0; i < g_app.songData.size() && (selRow == -1 || topRow == -1); ++i) {
+            const std::string& id = g_app.songData[i].id;
+            if (selRow == -1 && id == selId)
+                selRow = (int)i;
+            if (topRow == -1 && id == topId)
+                topRow = (int)i;
+        }
+        RECT r;
+        if (topRow >= 0 && ListView_GetItemRect(lv, 0, &r, LVIR_BOUNDS))
+            ListView_Scroll(lv, 0, (topRow - ListView_GetTopIndex(lv)) * (r.bottom - r.top));
+        if (selRow >= 0)
+            ListView_SetItemState(lv, selRow, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        InvalidateRect(lv, NULL, FALSE);
+    }
+    if (g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_GENRES)
+        InvalidateHeader();
+    LogF(L"Songs: %u merged in %lu ms", (unsigned)g_app.allSongs.size(), GetTickCount() - start);
+}
+
+// A page of the song list arrived. The first shows at once; after that they gather until
+// there are enough to be worth a merge, whose cost grows with the whole list.
+static void OnSongPage(SongPage* page)
+{
+    if (page->gen == g_app.songsGen && !page->songs.empty()) {
+        MergeSongs(g_app.songsPending, page->songs, NULL);
+        if (g_app.allSongs.empty() || g_app.songsPending.size() >= kSongMergeStep)
+            FlushSongPages();
+    }
+    delete page;
+}
+
+// The Songs page: the songs matching the search, shown as rows of allSongs (not copied).
+static void ShowLibraryRows()
+{
+    const DWORD start = GetTickCount();
+    std::vector<int> rows;
+    std::vector<std::wstring> terms = SearchTerms(g_app.querySongs);
+    const size_t n = std::min(g_app.allSongs.size(), g_app.songKeys.size());
+    rows.reserve(terms.empty() ? n : 0);
+    for (size_t i = 0; i < n; ++i)
+        if (terms.empty() || MatchesAll(g_app.songKeys[i], terms))
+            rows.push_back((int)i);
+    g_app.songData.ShowRows(g_app.allSongs, rows);
+    if (n >= 1000)
+        LogF(L"Songs search: %u of %u in %lu ms", (unsigned)g_app.songData.size(), (unsigned)n,
+             GetTickCount() - start);
+}
+
 // The album list control shows the (searched) list of every album, or one artist's albums.
 static std::vector<SubsonicAlbum>& ShownAlbums()
 {
     return g_app.albumList;
 }
 
-static void FillAlbums()
+// The album, artist and genre lists are virtual like the track list: a new row count here, and
+// the text of visible cells on request (On...DispInfo).
+static void SetListRows(HWND lv, size_t rows)
 {
-    HWND lv = g_app.albums;
-    const std::vector<SubsonicAlbum>& list = ShownAlbums();
-    SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(lv);
-    for (size_t i = 0; i < list.size(); ++i) {
-        const SubsonicAlbum& a = list[i];
-        SetCell(lv, (int)i, 0, a.name);
-        SetCell(lv, (int)i, 1, a.artist);
-        SetCell(lv, (int)i, 2, a.year ? Fmt(L"%d", a.year) : std::wstring());
-        SetCell(lv, (int)i, 3, Fmt(L"%d", a.songCount));
-    }
-    SendMessageW(lv, WM_SETREDRAW, TRUE, 0);
+    ListView_SetItemState(lv, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_SetItemCountEx(lv, (int)rows, 0);
+    if (rows)
+        ListView_EnsureVisible(lv, 0, FALSE);
     InvalidateRect(lv, NULL, TRUE);
+}
+
+static void CopyCell(NMLVDISPINFOW* di, const wchar_t* text)
+{
+    lstrcpynW(di->item.pszText, text, di->item.cchTextMax);
+}
+
+static void CopyNumberCell(NMLVDISPINFOW* di, int n)
+{
+    wchar_t num[16];
+    _itow(n, num, 10);
+    CopyCell(di, num);
+}
+
+// The row a virtual list is being asked for, or NULL.
+template <class T>
+static const T* DispRow(const std::vector<T>& rows, const NMLVDISPINFOW* di)
+{
+    const int i = di->item.iItem;
+    if (!(di->item.mask & LVIF_TEXT) || di->item.cchTextMax <= 0 || i < 0 || i >= (int)rows.size())
+        return NULL;
+    return &rows[i];
+}
+
+static void OnAlbumsDispInfo(NMLVDISPINFOW* di)
+{
+    const SubsonicAlbum* a = DispRow(ShownAlbums(), di);
+    if (!a)
+        return;
+    switch (di->item.iSubItem) {
+    case 0: CopyCell(di, a->name.c_str()); break;
+    case 1: CopyCell(di, a->artist.c_str()); break;
+    case 2:
+        if (a->year)
+            CopyNumberCell(di, a->year);
+        else
+            CopyCell(di, L"");
+        break;
+    case 3: CopyNumberCell(di, a->songCount); break;
+    }
+}
+
+// Typing in a virtual list: the next row (from iStart, around the end) starting with the letters.
+template <class T>
+static LRESULT FindRow(const std::vector<T>& rows, const NMLVFINDITEMW* f)
+{
+    enum { kPartial = LVFI_PARTIAL | 0x0004 };   // LVFI_SUBSTRING, which comctl32 6 asks with
+    if (!(f->lvfi.flags & (LVFI_STRING | kPartial)) || !f->lvfi.psz || !f->lvfi.psz[0] || rows.empty())
+        return -1;
+    const int n = (int)rows.size(), start = f->iStart > 0 ? f->iStart % n : 0;
+    const size_t len = wcslen(f->lvfi.psz);
+    for (int k = 0; k < n; ++k) {
+        const int i = (start + k) % n;
+        if (i < start && !(f->lvfi.flags & LVFI_WRAP))
+            break;
+        const bool whole = (f->lvfi.flags & kPartial) || rows[i].name.size() == len;
+        if (whole && _wcsnicmp(rows[i].name.c_str(), f->lvfi.psz, len) == 0)
+            return i;
+    }
+    return -1;
 }
 
 // --- Column sorting ------------------------------------------------------------------------
@@ -1103,72 +1370,6 @@ static void SetHeaderArrow(HWND lv, int col, bool desc)
     }
 }
 
-static int CmpText(const std::wstring& a, const std::wstring& b)
-{
-    return lstrcmpiW(a.c_str(), b.c_str());
-}
-
-static int CmpInt(int a, int b)
-{
-    return a < b ? -1 : (a > b ? 1 : 0);
-}
-
-struct AlbumLess {
-    int col;
-    bool operator()(const SubsonicAlbum& a, const SubsonicAlbum& b) const
-    {
-        int c = 0;
-        switch (col) {
-        case 0: c = CmpText(a.name, b.name); break;
-        case 1:   // artist, then their albums by year
-            c = CmpText(a.artist, b.artist);
-            if (!c) c = CmpInt(a.year, b.year);
-            if (!c) c = CmpText(a.name, b.name);
-            break;
-        case 2: c = CmpInt(a.year, b.year); break;
-        case 3: c = CmpInt(a.songCount, b.songCount); break;
-        }
-        return c < 0;
-    }
-};
-
-struct ArtistLess {
-    int col;
-    bool operator()(const SubsonicArtist& a, const SubsonicArtist& b) const
-    {
-        return (col == 0 ? CmpText(a.name, b.name) : CmpInt(a.albumCount, b.albumCount)) < 0;
-    }
-};
-
-struct SongLess {
-    int col;
-    bool operator()(const SubsonicSong& a, const SubsonicSong& b) const
-    {
-        int c = 0;
-        switch (col) {
-        case COL_TITLE:  c = CmpText(a.title, b.title); break;
-        case COL_ARTIST:   // artist, then album, then track order
-            c = CmpText(a.artist, b.artist);
-            if (!c) c = CmpText(a.album, b.album);
-            if (!c) c = CmpInt(a.disc, b.disc);
-            if (!c) c = CmpInt(a.track, b.track);
-            break;
-        case COL_ALBUM:
-            c = CmpText(a.album, b.album);
-            if (!c) c = CmpInt(a.disc, b.disc);
-            if (!c) c = CmpInt(a.track, b.track);
-            break;
-        case COL_FAV:    c = CmpInt(a.starred ? 1 : 0, b.starred ? 1 : 0); break;
-        case COL_RATING: c = CmpInt(a.userRating, b.userRating); break;
-        case COL_LENGTH: c = CmpInt(a.duration, b.duration); break;
-        case COL_DL:
-            c = CmpInt(g_app.downloads.Find(a.id) ? 1 : 0, g_app.downloads.Find(b.id) ? 1 : 0);
-            break;
-        }
-        return c < 0;
-    }
-};
-
 // Descending sorts swap the arguments, which keeps them stable.
 template <class T, class Less>
 struct Reversed {
@@ -1176,18 +1377,191 @@ struct Reversed {
     bool operator()(const T& a, const T& b) const { return less(b, a); }
 };
 
-template <class T, class Less>
+// A sort key for 'text': its bytes compare (as a std::string) the same way lstrcmpiW orders
+// the texts, so sorting needn't call lstrcmpiW for every comparison (on 9x each call also
+// converted both strings to ANSI). Ends with a 0 byte, so keys can be joined.
+static void AppendSortKey(std::string& key, const std::wstring& text)
+{
+    if (!text.empty()) {
+        const DWORD flags = LCMAP_SORTKEY | NORM_IGNORECASE;
+        const int n = LCMapStringW(LOCALE_USER_DEFAULT, flags, text.c_str(), (int)text.size(), NULL, 0);
+        if (n > 0) {
+            const size_t at = key.size();
+            key.resize(at + n);
+            if (LCMapStringW(LOCALE_USER_DEFAULT, flags, text.c_str(), (int)text.size(), (LPWSTR)&key[at], n) == n) {
+                if (key[key.size() - 1] != 0)
+                    key += '\0';
+                return;
+            }
+            key.resize(at);
+        }
+    }
+    key += '\0';
+}
+
+static bool TextColumn(int col)
+{
+    return col == COL_TITLE || col == COL_ARTIST || col == COL_ALBUM;
+}
+
+// Sort keys for a text column, one per song: the title; the artist then album; the album.
+static void BuildSortKeys(const std::vector<SubsonicSong>& songs, int col, std::vector<std::string>& keys)
+{
+    keys.resize(songs.size());
+    for (size_t i = 0; i < songs.size(); ++i) {
+        std::string& k = keys[i];
+        k.clear();
+        const SubsonicSong& s = songs[i];
+        if (col == COL_TITLE)
+            AppendSortKey(k, s.title);
+        if (col == COL_ARTIST)
+            AppendSortKey(k, s.artist);
+        if (col == COL_ARTIST || col == COL_ALBUM)
+            AppendSortKey(k, s.album);
+    }
+}
+
+// Orders row numbers of 'songs' by one column. Text columns compare prebuilt keys (then
+// disc and track number); the others compare a number per song taken before sorting.
+struct SongRowLess {
+    int col;
+    const std::vector<SubsonicSong>* songs;
+    const std::vector<std::string>* keys;   // text columns
+    const std::vector<int>* values;         // other columns
+    bool operator()(int x, int y) const
+    {
+        if (!TextColumn(col))
+            return (*values)[x] < (*values)[y];
+        const int c = (*keys)[x].compare((*keys)[y]);
+        if (c || col == COL_TITLE)
+            return c < 0;
+        const SubsonicSong& a = (*songs)[x];
+        const SubsonicSong& b = (*songs)[y];
+        if (a.disc != b.disc)
+            return a.disc < b.disc;
+        return a.track < b.track;
+    }
+};
+
+// Sorts the track table's rows by 'col' (stable; descending keeps ties in their order).
+static void SortSongRows(int col, bool desc)
+{
+    const DWORD start = GetTickCount();
+    const std::vector<SubsonicSong>& songs = g_app.songData.Base();
+    SongRowLess less;
+    less.col = col;
+    less.songs = &songs;
+    less.keys = NULL;
+    less.values = NULL;
+    std::vector<std::string> keys;
+    std::vector<int> values;
+    if (TextColumn(col)) {
+        if (g_app.songData.Shows(g_app.allSongs)) {   // the library: kept for later sorts
+            std::vector<std::string>& cached = g_app.librarySortKeys[col];
+            if (cached.size() != songs.size())
+                BuildSortKeys(songs, col, cached);
+            less.keys = &cached;
+        } else {
+            BuildSortKeys(songs, col, keys);
+            less.keys = &keys;
+        }
+    } else {
+        values.resize(songs.size());
+        for (size_t i = 0; i < songs.size(); ++i) {
+            const SubsonicSong& s = songs[i];
+            switch (col) {
+            case COL_FAV:    values[i] = s.starred ? 1 : 0; break;
+            case COL_RATING: values[i] = s.userRating; break;
+            case COL_LENGTH: values[i] = s.duration; break;
+            case COL_DL:     values[i] = g_app.downloads.Find(s.id) ? 1 : 0; break;
+            default:         values[i] = 0; break;
+            }
+        }
+        less.values = &values;
+    }
+    std::vector<int>& rows = g_app.songData.Rows();
+    if (desc) {
+        Reversed<int, SongRowLess> r;
+        r.less = less;
+        std::stable_sort(rows.begin(), rows.end(), r);
+    } else {
+        std::stable_sort(rows.begin(), rows.end(), less);
+    }
+    if (rows.size() >= 1000)
+        LogF(L"Sorted %u songs in %lu ms", (unsigned)rows.size(), GetTickCount() - start);
+}
+
+// A number in a sort key: big-endian, so its bytes compare like the number (none are negative).
+static void AppendNumberKey(std::string& key, int n)
+{
+    key += (char)((unsigned)n >> 24);
+    key += (char)((unsigned)n >> 16);
+    key += (char)((unsigned)n >> 8);
+    key += (char)n;
+}
+
+static void RowSortKey(const SubsonicAlbum& a, int col, std::string& key)
+{
+    switch (col) {
+    case 0: AppendSortKey(key, a.name); break;
+    case 1:   // artist, then their albums by year
+        AppendSortKey(key, a.artist);
+        AppendNumberKey(key, a.year);
+        AppendSortKey(key, a.name);
+        break;
+    case 2: AppendNumberKey(key, a.year); break;
+    case 3: AppendNumberKey(key, a.songCount); break;
+    }
+}
+
+static void RowSortKey(const SubsonicArtist& a, int col, std::string& key)
+{
+    if (col == 0)
+        AppendSortKey(key, a.name);
+    else
+        AppendNumberKey(key, a.albumCount);
+}
+
+static void RowSortKey(const SubsonicGenre& g, int col, std::string& key)
+{
+    if (col == 0)
+        AppendSortKey(key, g.name);
+    else
+        AppendNumberKey(key, col == 1 ? g.albumCount : g.songCount);
+}
+
+struct RowKeyLess {
+    const std::vector<std::string>* keys;
+    bool operator()(int x, int y) const { return (*keys)[x] < (*keys)[y]; }
+};
+
+// Sorts the album, artist or genre rows by one column (stable): compares prebuilt keys, sorts
+// positions, then swaps the rows into that order.
+template <class T>
 static void SortList(std::vector<T>& v, int col, bool desc)
 {
-    Less less;
-    less.col = col;
-    if (desc) {
-        Reversed<T, Less> r;
-        r.less = less;
-        std::stable_sort(v.begin(), v.end(), r);
-    } else {
-        std::stable_sort(v.begin(), v.end(), less);
+    const DWORD start = GetTickCount();
+    std::vector<std::string> keys(v.size());
+    std::vector<int> order(v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+        RowSortKey(v[i], col, keys[i]);
+        order[i] = (int)i;
     }
+    RowKeyLess less;
+    less.keys = &keys;
+    if (desc) {
+        Reversed<int, RowKeyLess> r;
+        r.less = less;
+        std::stable_sort(order.begin(), order.end(), r);
+    } else {
+        std::stable_sort(order.begin(), order.end(), less);
+    }
+    std::vector<T> sorted(v.size());
+    for (size_t i = 0; i < order.size(); ++i)
+        sorted[i].swap(v[order[i]]);
+    v.swap(sorted);
+    if (v.size() >= 100)
+        LogF(L"Sorted %u rows in %lu ms", (unsigned)v.size(), GetTickCount() - start);
 }
 
 // Rebuilds the album list from every album (filtered by the Albums search) or the open artist.
@@ -1197,11 +1571,15 @@ static void RebuildAlbumList()
         g_app.albumList = g_app.artistAlbums;
     else if (g_app.albumListMode == ALBUMS_DISCOVER)
         g_app.albumList = g_app.discoverAlbums;   // in the server's order (newest, most played...)
+    else if (g_app.albumListMode == ALBUMS_GENRE)
+        g_app.albumList = g_app.genreAlbums;
     else
         FilterInto(g_app.albumData, g_app.albumKeys, g_app.queryAlbums, g_app.albumList);
     if (g_app.albumSortCol >= 0 && g_app.albumListMode != ALBUMS_DISCOVER)
-        SortList<SubsonicAlbum, AlbumLess>(g_app.albumList, g_app.albumSortCol, g_app.albumSortDesc);
-    FillAlbums();
+        SortList(g_app.albumList, g_app.albumSortCol, g_app.albumSortDesc);
+    else if (g_app.albumListMode == ALBUMS_GENRE)   // unsorted: by artist, then their albums by year
+        SortList(g_app.albumList, 1, false);
+    SetListRows(g_app.albums, g_app.albumList.size());
 }
 
 static void FillArtists()
@@ -1209,15 +1587,42 @@ static void FillArtists()
     HWND lv = g_app.artists;
     FilterInto(g_app.artistData, g_app.artistKeys, g_app.queryArtists, g_app.artistList);
     if (g_app.artistSortCol >= 0)
-        SortList<SubsonicArtist, ArtistLess>(g_app.artistList, g_app.artistSortCol, g_app.artistSortDesc);
-    SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(lv);
-    for (size_t i = 0; i < g_app.artistList.size(); ++i) {
-        SetCell(lv, (int)i, 0, g_app.artistList[i].name);
-        SetCell(lv, (int)i, 1, Fmt(L"%d", g_app.artistList[i].albumCount));
-    }
-    SendMessageW(lv, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(lv, NULL, TRUE);
+        SortList(g_app.artistList, g_app.artistSortCol, g_app.artistSortDesc);
+    SetListRows(lv, g_app.artistList.size());
+}
+
+static void OnArtistsDispInfo(NMLVDISPINFOW* di)
+{
+    const SubsonicArtist* a = DispRow(g_app.artistList, di);
+    if (!a)
+        return;
+    if (di->item.iSubItem == 0)
+        CopyCell(di, a->name.c_str());
+    else
+        CopyNumberCell(di, a->albumCount);
+}
+
+// The genre list: searched, then sorted (by name until a column is clicked).
+static void FillGenres()
+{
+    HWND lv = g_app.genres;
+    FilterInto(g_app.genreData, g_app.genreKeys, g_app.queryGenres, g_app.genreList);
+    if (g_app.genreSortCol >= 0)
+        SortList(g_app.genreList, g_app.genreSortCol, g_app.genreSortDesc);
+    else
+        SortList(g_app.genreList, 0, false);
+    SetListRows(lv, g_app.genreList.size());
+}
+
+static void OnGenresDispInfo(NMLVDISPINFOW* di)
+{
+    const SubsonicGenre* g = DispRow(g_app.genreList, di);
+    if (!g)
+        return;
+    if (di->item.iSubItem == 0)
+        CopyCell(di, g->name.c_str());
+    else
+        CopyNumberCell(di, di->item.iSubItem == 1 ? g->albumCount : g->songCount);
 }
 
 // Which list the track table shows, so a sort stays with that list (a Songs search or a
@@ -1244,8 +1649,8 @@ static void ApplySongSortToNewData()
 {
     const std::string key = SongListKey();
     if (SongsSorted() && !key.empty() && key == g_app.songSortKey) {
-        g_app.songUnsorted = g_app.songData;
-        SortList<SubsonicSong, SongLess>(g_app.songData, g_app.songSortCol, g_app.songSortDesc);
+        g_app.songUnsorted = g_app.songData.Rows();
+        SortSongRows(g_app.songSortCol, g_app.songSortDesc);
     } else if (SongsSorted()) {
         g_app.songSortCol = -1;
         g_app.songUnsorted.clear();
@@ -1285,20 +1690,20 @@ static void OnSongsColumnClick(int col)
     if (col == COL_NUM) {
         if (!SongsSorted())
             return;
-        g_app.songData = g_app.songUnsorted;
+        g_app.songData.Rows().swap(g_app.songUnsorted);
         g_app.songUnsorted.clear();
         g_app.songSortCol = -1;
         SetHeaderArrow(g_app.songs, -1, false);
         SetStatus(L"Back to the original order.");
     } else {
         if (!SongsSorted()) {
-            g_app.songUnsorted = g_app.songData;
+            g_app.songUnsorted = g_app.songData.Rows();
             g_app.songSortKey = SongListKey();
         }
         g_app.songSortDesc = col == g_app.songSortCol ? !g_app.songSortDesc : (col == COL_FAV || col == COL_RATING);
         g_app.songSortCol = col;
-        g_app.songData = g_app.songUnsorted;
-        SortList<SubsonicSong, SongLess>(g_app.songData, col, g_app.songSortDesc);
+        g_app.songData.Rows() = g_app.songUnsorted;
+        SortSongRows(col, g_app.songSortDesc);
         SetHeaderArrow(g_app.songs, col, g_app.songSortDesc);
         std::wstring msg = Fmt(L"Sorted by %ls%ls. Click # for the original order", kSongColNames[col],
                                g_app.songSortDesc ? L" (reversed)" : L"");
@@ -1351,28 +1756,88 @@ static void OnArtistsColumnClick(int col)
     SelectRow(g_app.artists, 0);
 }
 
+// Genres from the song list's tags: each genre's songs, and its albums among those in the album
+// list (the chosen libraries). Navidrome's own genre album lists match only an album's genre
+// tag, which leaves out albums where just some of the tracks carry the genre.
+static void BuildGenres()
+{
+    const DWORD start = GetTickCount();
+    std::set<std::string> known;
+    for (size_t i = 0; i < g_app.albumData.size(); ++i)
+        known.insert(g_app.albumData[i].id);
+    std::map<std::wstring, int> songs;
+    g_app.genreAlbumIds.clear();
+    for (size_t i = 0; i < g_app.allSongs.size(); ++i) {
+        const SubsonicSong& s = g_app.allSongs[i];
+        for (size_t at = 0; at < s.genres.size();) {
+            size_t end = s.genres.find(L'\n', at);
+            if (end == std::wstring::npos)
+                end = s.genres.size();
+            const std::wstring name = s.genres.substr(at, end - at);
+            ++songs[name];
+            if (known.count(s.albumId))
+                g_app.genreAlbumIds[name].insert(s.albumId);
+            at = end + 1;
+        }
+    }
+    g_app.genreData.clear();
+    g_app.genreKeys.clear();
+    for (std::map<std::wstring, int>::const_iterator it = songs.begin(); it != songs.end(); ++it) {
+        SubsonicGenre g;
+        g.name = it->first;
+        g.songCount = it->second;
+        std::map<std::wstring, std::set<std::string> >::const_iterator ids = g_app.genreAlbumIds.find(it->first);
+        g.albumCount = ids == g_app.genreAlbumIds.end() ? 0 : (int)ids->second.size();
+        g_app.genreData.push_back(g);
+        g_app.genreKeys.push_back(Lower(g.name));
+    }
+    g_app.genresBuilt = true;
+    FillGenres();
+    LogF(L"Genres: %u from %u songs in %lu ms", (unsigned)g_app.genreData.size(), (unsigned)g_app.allSongs.size(),
+         GetTickCount() - start);
+}
+
+// Header click on the genre list. Album and song counts sort highest first.
+static void OnGenresColumnClick(int col)
+{
+    const int sel = SelectedIndex(g_app.genres);
+    const std::wstring selName =
+        sel >= 0 && sel < (int)g_app.genreList.size() ? g_app.genreList[sel].name : std::wstring();
+    g_app.genreSortDesc = col == g_app.genreSortCol ? !g_app.genreSortDesc : col != 0;
+    g_app.genreSortCol = col;
+    FillGenres();
+    SetHeaderArrow(g_app.genres, col, g_app.genreSortDesc);
+    for (size_t i = 0; i < g_app.genreList.size(); ++i)
+        if (g_app.genreList[i].name == selName) {
+            SelectRow(g_app.genres, (int)i);
+            return;
+        }
+    SelectRow(g_app.genres, 0);
+}
+
 static void OnSongsDispInfo(NMLVDISPINFOW* di)
 {
     const int i = di->item.iItem;
     if (!(di->item.mask & LVIF_TEXT) || di->item.cchTextMax <= 0 || i < 0 || i >= (int)g_app.songData.size())
         return;
     const SubsonicSong& s = g_app.songData[i];
-    std::wstring text;
     switch (di->item.iSubItem) {
     case COL_NUM: {
         // Playlists and the queue number by position; albums and the library by track number.
         int n = (g_app.songSource == SRC_PLAYLIST || g_app.songSource == SRC_FAVORITES ||
                  g_app.songSource == SRC_QUEUE) ? i + 1 : s.track;
         if (n)
-            text = Fmt(L"%d", n);
+            CopyNumberCell(di, n);
+        else
+            CopyCell(di, L"");
         break;
     }
-    case COL_TITLE:  text = s.title; break;
-    case COL_ARTIST: text = s.artist; break;
-    case COL_LENGTH: text = FormatTime(s.duration); break;
-    case COL_ALBUM:  text = s.album; break;
+    case COL_TITLE:  CopyCell(di, s.title.c_str()); break;
+    case COL_ARTIST: CopyCell(di, s.artist.c_str()); break;
+    case COL_LENGTH: CopyCell(di, FormatTime(s.duration).c_str()); break;
+    case COL_ALBUM:  CopyCell(di, s.album.c_str()); break;
+    default:         CopyCell(di, L""); break;
     }
-    lstrcpynW(di->item.pszText, text.c_str(), di->item.cchTextMax);
 }
 
 // --- Sidebar tree ----------------------------------------------------------------------
@@ -1413,21 +1878,24 @@ static void TreeSelectQuietly(HTREEITEM item)
 
 // Library sections in sidebar order; Settings > Sidebar hides any of them.
 struct SidebarSection {
-    const wchar_t* key;    // in [View] HiddenSections
+    const wchar_t* key;    // in [View] HiddenSections (or ShownSections, if optIn)
     const wchar_t* label;
     LPARAM data;
+    bool optIn;            // hidden unless listed in ShownSections, so inis saved before the
+                           // section existed (with a HiddenSections that doesn't name it) keep it off
 };
 static const SidebarSection kSections[] = {
-    { L"albums",    L"Albums",          TREE_ALBUMS },
-    { L"artists",   L"Artists",         TREE_ARTISTS },
-    { L"songs",     L"Songs",           TREE_SONGS },
-    { L"favorites", L"Favorites",       TREE_FAVORITES },
-    { L"added",     L"Recently Added",  TREE_DISCOVER - DISCOVER_ADDED },
-    { L"played",    L"Recently Played", TREE_DISCOVER - DISCOVER_PLAYED },
-    { L"frequent",  L"Most Played",     TREE_DISCOVER - DISCOVER_FREQUENT },
-    { L"random",    L"Random Albums",   TREE_DISCOVER - DISCOVER_RANDOM },
-    { L"queue",     L"Play Queue",      TREE_QUEUE },
-    { L"downloads", L"Downloads",       TREE_DOWNLOADS },
+    { L"albums",    L"Albums",          TREE_ALBUMS,                        false },
+    { L"artists",   L"Artists",         TREE_ARTISTS,                       false },
+    { L"genres",    L"Genres",          TREE_GENRES,                        true },
+    { L"songs",     L"Songs",           TREE_SONGS,                         false },
+    { L"favorites", L"Favorites",       TREE_FAVORITES,                     false },
+    { L"added",     L"Recently Added",  TREE_DISCOVER - DISCOVER_ADDED,     false },
+    { L"played",    L"Recently Played", TREE_DISCOVER - DISCOVER_PLAYED,    false },
+    { L"frequent",  L"Most Played",     TREE_DISCOVER - DISCOVER_FREQUENT,  false },
+    { L"random",    L"Random Albums",   TREE_DISCOVER - DISCOVER_RANDOM,    false },
+    { L"queue",     L"Play Queue",      TREE_QUEUE,                         false },
+    { L"downloads", L"Downloads",       TREE_DOWNLOADS,                     false },
 };
 static const int kSectionCount = (int)(sizeof(kSections) / sizeof(kSections[0]));
 
@@ -1436,6 +1904,7 @@ static HTREEITEM* SectionItem(LPARAM data)
     switch (data) {
     case TREE_ALBUMS:    return &g_app.treeAlbums;
     case TREE_ARTISTS:   return &g_app.treeArtists;
+    case TREE_GENRES:    return &g_app.treeGenres;
     case TREE_SONGS:     return &g_app.treeSongs;
     case TREE_FAVORITES: return &g_app.treeFavorites;
     case TREE_QUEUE:     return &g_app.treeQueue;
@@ -1450,6 +1919,7 @@ static HTREEITEM ItemForView()
     switch (g_app.mainView) {
     case VIEW_ALBUMS:    return g_app.treeAlbums;
     case VIEW_ARTISTS:   return g_app.treeArtists;
+    case VIEW_GENRES:    return g_app.treeGenres;
     case VIEW_SONGS:     return g_app.treeSongs;
     case VIEW_FAVORITES: return g_app.treeFavorites;
     case VIEW_QUEUE:     return g_app.treeQueue;
@@ -1480,6 +1950,7 @@ static void RebuildLibraryTree()
 }
 
 static void ShowArtistsView();
+static void ShowGenresView();
 static void ShowSongsView();
 static void ShowFavoritesView();
 static void ShowQueueView();
@@ -1494,6 +1965,8 @@ static void ShowSection(LPARAM data)
         ShowAlbumsView();
     else if (data == TREE_ARTISTS)
         ShowArtistsView();
+    else if (data == TREE_GENRES)
+        ShowGenresView();
     else if (data == TREE_SONGS)
         ShowSongsView();
     else if (data == TREE_FAVORITES)
@@ -1643,37 +2116,52 @@ static void DrawRowExtras(HDC dc, int item)
 // 2000+ without East Asian fonts, Japanese shows as boxes) are drawn again after the row, with
 // the Unicode GDI functions and a font that has the characters. The background is read back
 // from what the control drew, so selection shows.
-static void RedrawUnicodeCells(HWND lv, HDC dc, int item, HFONT font, COLORREF textColor)
+static void RedrawUnicodeCell(HWND lv, HDC dc, int item, int c, const wchar_t* text, HFONT font, COLORREF textColor)
+{
+    if (!NeedsUnicodeDrawing(text))
+        return;
+    RECT rc;
+    if (!ListView_GetSubItemRect(lv, item, c, c == 0 ? LVIR_LABEL : LVIR_BOUNDS, &rc) || rc.right - rc.left < 8)
+        return;
+    COLORREF bg = GetPixel(dc, rc.left + 1, rc.top + 1);
+    if (bg == CLR_INVALID)
+        bg = GetSysColor(COLOR_WINDOW);
+    HBRUSH brush = CreateSolidBrush(bg);
+    FillRect(dc, &rc, brush);
+    DeleteObject(brush);
+    RECT tr = { rc.left + (c == 0 ? 2 : 6), rc.top, rc.right - 6, rc.bottom };
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    const int oldMode = SetBkMode(dc, TRANSPARENT);
+    const COLORREF oldColor =
+        SetTextColor(dc, bg == GetSysColor(COLOR_HIGHLIGHT) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : textColor);
+    DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetTextColor(dc, oldColor);
+    SetBkMode(dc, oldMode);
+    SelectObject(dc, oldFont);
+}
+
+// The first 'cols' columns of a list hold text (the rest are numbers, which need no redrawing).
+static void RedrawUnicodeCells(HWND lv, HDC dc, int item, int cols, HFONT font, COLORREF textColor)
 {
     if (!OwnTextDrawing())
         return;
-    HWND header = ListView_GetHeader(lv);
-    const int cols = header ? Header_GetItemCount(header) : 1;
     for (int c = 0; c < cols; ++c) {
         wchar_t text[512];
         text[0] = 0;
         ListView_GetItemText(lv, item, c, text, 512);
-        if (!NeedsUnicodeDrawing(text))
-            continue;
-        RECT rc;
-        if (!ListView_GetSubItemRect(lv, item, c, c == 0 ? LVIR_LABEL : LVIR_BOUNDS, &rc) || rc.right - rc.left < 8)
-            continue;
-        COLORREF bg = GetPixel(dc, rc.left + 1, rc.top + 1);
-        if (bg == CLR_INVALID)
-            bg = GetSysColor(COLOR_WINDOW);
-        HBRUSH brush = CreateSolidBrush(bg);
-        FillRect(dc, &rc, brush);
-        DeleteObject(brush);
-        RECT tr = { rc.left + (c == 0 ? 2 : 6), rc.top, rc.right - 6, rc.bottom };
-        HGDIOBJ oldFont = SelectObject(dc, font);
-        const int oldMode = SetBkMode(dc, TRANSPARENT);
-        const COLORREF oldColor =
-            SetTextColor(dc, bg == GetSysColor(COLOR_HIGHLIGHT) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : textColor);
-        DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SetTextColor(dc, oldColor);
-        SetBkMode(dc, oldMode);
-        SelectObject(dc, oldFont);
+        RedrawUnicodeCell(lv, dc, item, c, text, font, textColor);
     }
+}
+
+// A track row: straight from the song, without asking the list for its columns.
+static void RedrawSongCells(HDC dc, int item, HFONT font, COLORREF textColor)
+{
+    if (item < 0 || item >= (int)g_app.songData.size())
+        return;
+    const SubsonicSong& s = g_app.songData[item];
+    RedrawUnicodeCell(g_app.songs, dc, item, COL_TITLE, s.title.c_str(), font, textColor);
+    RedrawUnicodeCell(g_app.songs, dc, item, COL_ARTIST, s.artist.c_str(), font, textColor);
+    RedrawUnicodeCell(g_app.songs, dc, item, COL_ALBUM, s.album.c_str(), font, textColor);
 }
 
 // The album and artist lists only need custom drawing for that.
@@ -1687,8 +2175,8 @@ static LRESULT OnListCustomDraw(NMLVCUSTOMDRAW* cd)
     case CDDS_ITEMPREPAINT:
         return CDRF_NOTIFYPOSTPAINT;
     case CDDS_ITEMPOSTPAINT:
-        RedrawUnicodeCells(cd->nmcd.hdr.hwndFrom, cd->nmcd.hdc, (int)cd->nmcd.dwItemSpec, g_app.font,
-                           GetSysColor(COLOR_WINDOWTEXT));
+        RedrawUnicodeCells(cd->nmcd.hdr.hwndFrom, cd->nmcd.hdc, (int)cd->nmcd.dwItemSpec,
+                           cd->nmcd.hdr.hwndFrom == g_app.albums ? 2 : 1, g_app.font, GetSysColor(COLOR_WINDOWTEXT));
         break;
     }
     return CDRF_DODEFAULT;
@@ -1788,8 +2276,8 @@ static LRESULT OnSongsCustomDraw(NMLVCUSTOMDRAW* cd)
         if (OwnTextDrawing()) {
             bool bold, grey;
             SongRowStyle(item, bold, grey);
-            RedrawUnicodeCells(g_app.songs, cd->nmcd.hdc, item, bold ? g_app.fontBold : g_app.font,
-                               GetSysColor(grey ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
+            RedrawSongCells(cd->nmcd.hdc, item, bold ? g_app.fontBold : g_app.font,
+                            GetSysColor(grey ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
         }
         DrawRowExtras(cd->nmcd.hdc, item);
         // Drag and drop: a line where the track would go (above this row, or below the last).
@@ -1815,12 +2303,6 @@ static void ApplyRatingLocal(const std::string& songId, int rating)
             g_app.songData[i].userRating = rating;
             ListView_RedrawItems(g_app.songs, (int)i, (int)i);
         }
-    for (size_t i = 0; i < g_app.songUnsorted.size(); ++i)
-        if (g_app.songUnsorted[i].id == songId)
-            g_app.songUnsorted[i].userRating = rating;
-    for (size_t i = 0; i < g_app.queue.size(); ++i)
-        if (g_app.queue[i].id == songId)
-            g_app.queue[i].userRating = rating;
     for (size_t i = 0; i < g_app.queueSource.size(); ++i)
         if (g_app.queueSource[i].id == songId)
             g_app.queueSource[i].userRating = rating;
@@ -1880,12 +2362,6 @@ static void ApplyFavoriteLocal(const std::string& songId, bool starred)
             g_app.songData[i].starred = starred;
             ListView_RedrawItems(g_app.songs, (int)i, (int)i);
         }
-    for (size_t i = 0; i < g_app.songUnsorted.size(); ++i)
-        if (g_app.songUnsorted[i].id == songId)
-            g_app.songUnsorted[i].starred = starred;
-    for (size_t i = 0; i < g_app.queue.size(); ++i)
-        if (g_app.queue[i].id == songId)
-            g_app.queue[i].starred = starred;
     for (size_t i = 0; i < g_app.queueSource.size(); ++i)
         if (g_app.queueSource[i].id == songId)
             g_app.queueSource[i].starred = starred;
@@ -2244,6 +2720,20 @@ static int RandomBelow(int n)
     return n > 0 ? (int)((((unsigned)rand() << 15) | (unsigned)rand()) % (unsigned)n) : 0;
 }
 
+// The track table mustn't keep rows of queueSource while its songs are replaced or reordered.
+static void DetachQueueRows()
+{
+    if (g_app.songData.Shows(g_app.queueSource))
+        g_app.songData.clear();
+}
+
+// The Play Queue page: the queue's songs in play order, as rows of queueSource.
+static void ShowQueueRows()
+{
+    std::vector<int> rows = g_app.queueSrcIdx;
+    g_app.songData.ShowRows(g_app.queueSource, rows);
+}
+
 // If the Play Queue page is showing, refills it from the queue and selects 'select'
 // (-1: keep the selected row where it is).
 static void RefreshQueueView(int select = -1)
@@ -2253,7 +2743,7 @@ static void RefreshQueueView(int select = -1)
     if (select < 0)
         select = SelectedIndex(g_app.songs);
     const int top = ListView_GetTopIndex(g_app.songs);
-    g_app.songData = g_app.queue;
+    ShowQueueRows();
     ListView_SetItemState(g_app.songs, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_SetItemCountEx(g_app.songs, (int)g_app.songData.size(), LVSICF_NOSCROLL);
     if (select >= (int)g_app.songData.size())
@@ -2287,9 +2777,6 @@ static void BuildQueue(int startSrc)
         for (int i = 0; i < n; ++i)
             g_app.queueSrcIdx.push_back(i);
     }
-    g_app.queue.clear();
-    for (size_t i = 0; i < g_app.queueSrcIdx.size(); ++i)
-        g_app.queue.push_back(g_app.queueSource[g_app.queueSrcIdx[i]]);
     g_app.queueIndex = g_app.shuffle ? 0 : startSrc;
     RefreshQueueView(g_app.queueIndex);
     UpdateGaplessNext();
@@ -2299,10 +2786,14 @@ static void BuildQueue(int startSrc)
 // shuffle off later keeps the user's order rather than the original album/playlist order.
 static void QueueEdited(int select)
 {
-    g_app.queueSource = g_app.queue;
-    g_app.queueSrcIdx.clear();
-    for (int i = 0; i < (int)g_app.queue.size(); ++i)
-        g_app.queueSrcIdx.push_back(i);
+    // Swap the songs into play order (dropping removed ones); nothing is copied.
+    DetachQueueRows();
+    std::vector<SubsonicSong> ordered(g_app.queueSrcIdx.size());
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        ordered[i].swap(g_app.queueSource[g_app.queueSrcIdx[i]]);
+        g_app.queueSrcIdx[i] = (int)i;
+    }
+    g_app.queueSource.swap(ordered);
     RefreshQueueView(select);
     UpdateGaplessNext();
 }
@@ -2389,8 +2880,12 @@ static void PlayFromSongList(int i)
         StartQueue(i, 0);
         return;
     }
-    g_app.queueSource = g_app.songData;
+    const DWORD start = GetTickCount();
+    DetachQueueRows();
+    g_app.queueSource = g_app.songData.Copy();
     BuildQueue(i);
+    if (g_app.queueSource.size() >= 1000)
+        LogF(L"Queue: %u songs in %lu ms", (unsigned)g_app.queueSource.size(), GetTickCount() - start);
     StartQueue(g_app.queueIndex, 0);
 }
 
@@ -2403,7 +2898,11 @@ static void QueueSongs(const std::vector<SubsonicSong>& songs, bool next)
     const std::wstring what = songs.size() == 1 ? L"\"" + songs[0].title + L"\""
                                                 : Fmt(L"%u tracks", (unsigned)songs.size());
     if (!QueueValid()) {
-        g_app.queue = songs;
+        DetachQueueRows();
+        g_app.queueSource = songs;
+        g_app.queueSrcIdx.clear();
+        for (size_t i = 0; i < songs.size(); ++i)
+            g_app.queueSrcIdx.push_back((int)i);
         g_app.queueIndex = 0;
         QueueEdited(0);
         StartQueue(0, 0);
@@ -2411,7 +2910,11 @@ static void QueueSongs(const std::vector<SubsonicSong>& songs, bool next)
     }
     const bool resume = g_app.queueFinished;
     const int at = (next && !resume) ? g_app.queueIndex + 1 : (int)g_app.queue.size();
-    g_app.queue.insert(g_app.queue.begin() + at, songs.begin(), songs.end());
+    DetachQueueRows();
+    const int first = (int)g_app.queueSource.size();
+    g_app.queueSource.insert(g_app.queueSource.end(), songs.begin(), songs.end());
+    for (size_t i = 0; i < songs.size(); ++i)
+        g_app.queueSrcIdx.insert(g_app.queueSrcIdx.begin() + at + i, first + (int)i);
     QueueEdited(-1);
     if (resume) {
         StartQueue(at, 0);
@@ -2453,9 +2956,9 @@ static void MoveQueueEntry(int from, int to)
     const int n = (int)g_app.queue.size();
     if (from < 0 || to < 0 || from >= n || to >= n || from == to)
         return;
-    const SubsonicSong s = g_app.queue[from];
-    g_app.queue.erase(g_app.queue.begin() + from);
-    g_app.queue.insert(g_app.queue.begin() + to, s);
+    const int moved = g_app.queueSrcIdx[from];
+    g_app.queueSrcIdx.erase(g_app.queueSrcIdx.begin() + from);
+    g_app.queueSrcIdx.insert(g_app.queueSrcIdx.begin() + to, moved);
     int& cur = g_app.queueIndex;
     if (cur == from)
         cur = to;
@@ -2476,7 +2979,7 @@ static void ClearUpcoming()
 {
     if (!QueueValid() || g_app.queueIndex + 1 >= (int)g_app.queue.size())
         return;
-    g_app.queue.erase(g_app.queue.begin() + g_app.queueIndex + 1, g_app.queue.end());
+    g_app.queueSrcIdx.erase(g_app.queueSrcIdx.begin() + g_app.queueIndex + 1, g_app.queueSrcIdx.end());
     QueueEdited(g_app.queueIndex);
     SetStatus(L"Cleared the upcoming tracks.");
 }
@@ -2592,6 +3095,7 @@ static std::wstring* CurrentQuery()
     switch (g_app.mainView) {
     case VIEW_ALBUMS:  return &g_app.queryAlbums;
     case VIEW_ARTISTS: return &g_app.queryArtists;
+    case VIEW_GENRES:  return &g_app.queryGenres;
     case VIEW_SONGS:   return &g_app.querySongs;
     default:           return NULL;
     }
@@ -2601,6 +3105,7 @@ static HWND CurrentList()
 {
     switch (g_app.mainView) {
     case VIEW_ARTISTS: return g_app.artists;
+    case VIEW_GENRES:  return g_app.genres;
     case VIEW_TRACKS:
     case VIEW_SONGS:
     case VIEW_FAVORITES:
@@ -2613,12 +3118,16 @@ static HWND CurrentList()
 static void SetView(MainView v)
 {
     g_app.mainView = v;
-    if (v != VIEW_QUEUE && g_app.songSource == SRC_QUEUE)
+    if (v != VIEW_QUEUE && g_app.songSource == SRC_QUEUE) {
         g_app.songSource = SRC_NONE;   // the hidden list no longer follows the queue
-    const bool albumList = v == VIEW_ALBUMS || v == VIEW_ARTIST || v == VIEW_DISCOVER;
+        DetachQueueRows();
+        ListView_SetItemCountEx(g_app.songs, 0, 0);
+    }
+    const bool albumList = v == VIEW_ALBUMS || v == VIEW_ARTIST || v == VIEW_DISCOVER || v == VIEW_GENRE;
     const bool trackList = v == VIEW_TRACKS || v == VIEW_SONGS || v == VIEW_FAVORITES || v == VIEW_DOWNLOADS;
     ShowWindow(g_app.albums, albumList ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.artists, v == VIEW_ARTISTS ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.genres, v == VIEW_GENRES ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.songs, trackList || v == VIEW_QUEUE ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.hdrPlay, trackList ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.hdrShuffle, trackList ? SW_SHOW : SW_HIDE);
@@ -2654,30 +3163,37 @@ static void ShowAlbumsView()
     SetFocus(g_app.albums);
 }
 
+// Fetches every song in the background, a page at a time (OnSongPage).
 static void LoadAllSongs()
 {
-    if (g_app.offline) {
-        SetStatus(L"Offline: only Downloads can be used. File > Connect tries again.");
+    if (g_app.offline || g_app.allSongsLoaded || (g_app.songsLoading && g_app.songsLoadingGen == g_app.songsGen))
         return;
-    }
-    if (!TryBeginLoad()) {
-        g_app.pendingSongs = true;   // retried when the running load finishes
-        return;
-    }
-    SetStatus(L"Loading every song in the library...");
-    LaunchJob(NewJob(JOB_SONGS));
+    DropLibraryRows();   // what a failed load left
+    g_app.allSongs.clear();
+    g_app.songKeys.clear();
+    g_app.songsPending.clear();
+    g_app.songsLoading = true;
+    g_app.songsLoadingGen = g_app.songsGen;
+    InterlockedExchange(&g_app.songsCancel, 0);
+    Job* job = NewJob(JOB_SONGS);
+    job->index = g_app.songsGen;
+    LaunchJob(job);
 }
 
-// Library > Songs. The full list is fetched once per connection, then reused.
+// Library > Songs. The full list is fetched once per connection (in the background, from
+// connecting), then reused; while it loads, the songs that have arrived are shown.
 static void ShowSongsView()
 {
     g_app.songSource = SRC_LIBRARY;
-    if (g_app.allSongsLoaded)
-        FilterInto(g_app.allSongs, g_app.songKeys, g_app.querySongs, g_app.songData);
-    else {
-        g_app.songData.clear();
-        LoadAllSongs();
+    if (!g_app.allSongsLoaded) {
+        if (g_app.offline) {
+            SetStatus(L"Offline: only Downloads can be used. File > Connect tries again.");
+        } else {
+            LoadAllSongs();
+            SetStatus(L"Loading every song in the library...");
+        }
     }
+    ShowLibraryRows();
     FillSongs();
     SetView(VIEW_SONGS);
     TreeSelectQuietly(g_app.treeSongs);
@@ -2719,7 +3235,7 @@ static void ShowFavoritesView()
 static void ShowQueueView()
 {
     g_app.songSource = SRC_QUEUE;
-    g_app.songData = g_app.queue;
+    ShowQueueRows();
     FillSongs();
     SetView(VIEW_QUEUE);
     TreeSelectQuietly(g_app.treeQueue);
@@ -2790,7 +3306,7 @@ static void FillDownloadsList()
     for (size_t i = 0; i < t.size(); ++i)
         songs.push_back(t[i].song);
     std::stable_sort(songs.begin(), songs.end(), DownloadOrder());
-    g_app.songData.swap(songs);
+    g_app.songData.Take(songs);
 }
 
 // Library > Downloads: every downloaded track, by artist and album.
@@ -2997,6 +3513,52 @@ static void ShowArtistsView()
     SetFocus(g_app.artists);
 }
 
+// Library > Genres: filled once the song list has loaded (in the background from connecting).
+static void ShowGenresView()
+{
+    if (!g_app.allSongsLoaded) {
+        if (g_app.offline) {
+            SetStatus(L"Offline: only Downloads can be used. File > Connect tries again.");
+            return;
+        }
+        LoadAllSongs();   // if it isn't loading already (or failed)
+    }
+    SetView(VIEW_GENRES);
+    TreeSelectQuietly(g_app.treeGenres);
+    SetFocus(g_app.genres);
+}
+
+// A genre's albums, as already loaded (Back from one of them).
+static void ShowGenrePage()
+{
+    g_app.albumListMode = -1;   // refill
+    ShowAlbumList(ALBUMS_GENRE);
+    SetView(VIEW_GENRE);
+    TreeSelectQuietly(NULL);   // so clicking "Genres" goes back
+    SetFocus(g_app.albums);
+}
+
+static void OpenGenre(const SubsonicGenre& g)
+{
+    g_app.shownGenre = g;
+    g_app.genreAlbums.clear();
+    std::map<std::wstring, std::set<std::string> >::const_iterator ids = g_app.genreAlbumIds.find(g.name);
+    if (ids != g_app.genreAlbumIds.end())
+        for (size_t i = 0; i < g_app.albumData.size(); ++i)
+            if (ids->second.count(g_app.albumData[i].id))
+                g_app.genreAlbums.push_back(g_app.albumData[i]);
+    ShowGenrePage();
+    SelectRow(g_app.albums, 0);
+    InvalidateHeader();
+}
+
+static void OpenSelectedGenre()
+{
+    const int i = SelectedIndex(g_app.genres);
+    if (i >= 0 && i < (int)g_app.genreList.size())
+        OpenGenre(g_app.genreList[i]);
+}
+
 // Re-filters the current library section from the search box (after a short typing pause).
 static void ApplySearch()
 {
@@ -3015,8 +3577,11 @@ static void ApplySearch()
     } else if (g_app.mainView == VIEW_ARTISTS) {
         FillArtists();
         SelectRow(g_app.artists, 0);
-    } else if (g_app.mainView == VIEW_SONGS && g_app.allSongsLoaded) {
-        FilterInto(g_app.allSongs, g_app.songKeys, g_app.querySongs, g_app.songData);
+    } else if (g_app.mainView == VIEW_GENRES) {
+        FillGenres();
+        SelectRow(g_app.genres, 0);
+    } else if (g_app.mainView == VIEW_SONGS) {
+        ShowLibraryRows();
         FillSongs();
         SelectRow(g_app.songs, 0);
     }
@@ -3087,18 +3652,23 @@ static void ShowArtistPage()
     SetFocus(g_app.albums);
 }
 
-// Backspace: tracks -> the album list it came from; an artist's albums -> all artists.
+// Backspace: tracks -> the album list it came from; an artist's (or genre's) albums -> all
+// artists (genres).
 static void GoBack()
 {
     if (g_app.mainView == VIEW_TRACKS && g_app.songSource == SRC_ALBUM) {
         if (g_app.albumOrigin == VIEW_ARTIST)
             ShowArtistPage();
+        else if (g_app.albumOrigin == VIEW_GENRE)
+            ShowGenrePage();
         else if (g_app.albumOrigin == VIEW_DISCOVER)
             ShowDiscoverView(g_app.discoverKind, false);
         else
             ShowAlbumsView();
     } else if (g_app.mainView == VIEW_ARTIST) {
         ShowArtistsView();
+    } else if (g_app.mainView == VIEW_GENRE) {
+        ShowGenresView();
     }
 }
 
@@ -3128,10 +3698,15 @@ static std::string ServerKey(const SubsonicConfig& cfg)
 
 static void DoConnect(bool keepPlayback = false)
 {
+    // The song list load is stopped after its current page rather than waited for.
+    if (g_app.songsLoading)
+        InterlockedExchange(&g_app.songsCancel, 1);
     // A library reload waits for whatever is running (often a now-playing report) and
-    // retries on its own; reconnecting by hand would stop the music.
-    if (keepPlayback && (g_app.loadBusy || g_app.jobsRunning > 0)) {
-        SetStatus(L"Loading the chosen libraries in a moment...");
+    // retries on its own; reconnecting by hand would stop the music. Both wait for the
+    // stopped song load.
+    if ((keepPlayback || g_app.songsLoading) && (g_app.loadBusy || g_app.jobsRunning > 0)) {
+        g_app.reloadKeepPlayback = keepPlayback;
+        SetStatus(keepPlayback ? L"Loading the chosen libraries in a moment..." : L"Connecting in a moment...");
         SetTimer(g_app.wnd, TIMER_RELOAD, 500, NULL);
         return;
     }
@@ -3160,10 +3735,19 @@ static void DoConnect(bool keepPlayback = false)
     g_app.playlistData.clear();
     g_app.artistData.clear();
     g_app.artistAlbums.clear();
+    g_app.genreData.clear();
+    g_app.genreKeys.clear();
+    g_app.genreAlbumIds.clear();
+    g_app.genresBuilt = false;
+    FillGenres();
     g_app.albumListMode = ALBUMS_ALL;
+    DropLibraryRows();
     g_app.allSongs.clear();
+    g_app.songKeys.clear();
+    g_app.songsPending.clear();
     g_app.allSongsLoaded = false;
-    g_app.pendingSongs = false;
+    g_app.songsLoading = false;
+    ++g_app.songsGen;
     g_app.favoritesLoaded = false;
     g_app.pendingFavorites = false;
     g_app.albumKeys.clear();
@@ -3174,7 +3758,7 @@ static void DoConnect(bool keepPlayback = false)
     g_app.querySongs.clear();
     FillArtists();
     if (!keepPlayback) {
-        g_app.queue.clear();
+        DetachQueueRows();
         g_app.queueSource.clear();
         g_app.queueSrcIdx.clear();
         g_app.queueIndex = -1;
@@ -3244,7 +3828,8 @@ static void OpenSelectedAlbum()
         g_app.pendingPlaylist = -1;
         return;
     }
-    OpenAlbum(list[i], g_app.mainView == VIEW_ARTIST || g_app.mainView == VIEW_DISCOVER ? g_app.mainView : VIEW_ALBUMS);
+    const MainView v = g_app.mainView;
+    OpenAlbum(list[i], v == VIEW_ARTIST || v == VIEW_DISCOVER || v == VIEW_GENRE ? v : VIEW_ALBUMS);
 }
 
 // Right-click a track > Go to album / Go to artist. Uses the library lists loaded at connect;
@@ -3690,7 +4275,7 @@ static void OnPlaylistEditDone(Job* job)
         SetView(VIEW_ALBUMS);
     }
     if (job->reloaded && g_app.songSource == SRC_PLAYLIST && g_app.shownPlaylist.id == job->reloadId) {
-        g_app.songData.swap(job->songs);
+        g_app.songData.Take(job->songs);
         FilterShownPlaylist();
         FillSongs();
         SelectRow(g_app.songs, job->selectAfter);
@@ -3776,6 +4361,7 @@ static void OnJobDone(Job* job)
                 MessageBoxW(g_app.wnd, job->message.c_str(), APP_TITLE, MB_ICONWARNING);
             SelectRow(g_app.albums, 0);
             ShowStartView();
+            LoadAllSongs();   // in the background, so Songs is usually ready when opened
         } else if (!g_app.downloads.Tracks().empty()) {
             // No server, but there is music on disk: open with that instead of an error.
             g_app.offline = true;
@@ -3794,7 +4380,7 @@ static void OnJobDone(Job* job)
     case JOB_ALBUM:
     case JOB_PLAYLIST:
         if (job->ok) {
-            g_app.songData.swap(job->songs);
+            g_app.songData.Take(job->songs);
             if (job->kind == JOB_ALBUM) {
                 g_app.songSource = SRC_ALBUM;
                 ShowAlbumInfo(job->album);
@@ -3826,7 +4412,7 @@ static void OnJobDone(Job* job)
     case JOB_FAVORITES:
         if (job->ok) {
             if (g_app.mainView == VIEW_FAVORITES) {
-                g_app.songData.swap(job->songs);
+                g_app.songData.Take(job->songs);
                 g_app.favoritesLoaded = true;
                 FillSongs();
                 SelectRow(g_app.songs, 0);
@@ -3919,22 +4505,32 @@ static void OnJobDone(Job* job)
         }
         break;
 
-    case JOB_SONGS:
+    case JOB_SONGS:   // the songs themselves arrived page by page (OnSongPage)
+        if (job->index != g_app.songsGen)
+            break;   // from before a reconnect
+        g_app.songsLoading = false;
+        if (job->flag)
+            break;   // stopped for a reconnect
         if (job->ok) {
-            g_app.allSongs.swap(job->songs);
+            FlushSongPages();
             g_app.allSongsLoaded = true;
-            BuildSongKeys();
-            if (g_app.mainView == VIEW_SONGS) {
-                FilterInto(g_app.allSongs, g_app.songKeys, g_app.querySongs, g_app.songData);
-                FillSongs();
-                SelectRow(g_app.songs, 0);
+            BuildGenres();
+            if (g_app.mainView == VIEW_GENRES) {
+                SelectRow(g_app.genres, 0);
                 InvalidateHeader();
             }
-            SetStatus(Fmt(L"%u songs.", (unsigned)g_app.allSongs.size()));
+            if (g_app.mainView == VIEW_SONGS)
+                SetStatus(Fmt(L"%u songs.", (unsigned)g_app.allSongs.size()));
         } else {
-            SetStatus(L"Could not load the song list.");
-            MessageBoxW(g_app.wnd, job->message.c_str(), APP_TITLE, MB_ICONERROR);
+            // Opening Songs again retries.
+            LogF(L"Could not load the song list: %ls", job->message.c_str());
+            if (g_app.mainView == VIEW_SONGS) {
+                SetStatus(L"Could not load the song list.");
+                MessageBoxW(g_app.wnd, job->message.c_str(), APP_TITLE, MB_ICONERROR);
+            }
         }
+        if (g_app.mainView == VIEW_SONGS)
+            InvalidateHeader();
         break;
 
     case JOB_ARTIST:
@@ -3984,9 +4580,6 @@ static void OnJobDone(Job* job)
     } else if (g_app.pendingFavorites && g_app.mainView == VIEW_FAVORITES) {
         g_app.pendingFavorites = false;
         LoadFavorites();
-    } else if (g_app.pendingSongs && !g_app.allSongsLoaded) {
-        g_app.pendingSongs = false;
-        LoadAllSongs();
     }
 }
 
@@ -4093,6 +4686,7 @@ static void PlaySongs(const std::vector<SubsonicSong>& songs)
 {
     if (songs.empty())
         return;
+    DetachQueueRows();
     g_app.queueSource = songs;
     BuildQueue(0);
     StartQueue(g_app.queueIndex, 0);
@@ -4119,7 +4713,7 @@ static void RemoveQueueRows(std::vector<int> rows)
         const int r = rows[k];
         if (r < 0 || r >= (int)g_app.queue.size() || r == g_app.queueIndex)
             continue;   // the playing track stays
-        g_app.queue.erase(g_app.queue.begin() + r);
+        g_app.queueSrcIdx.erase(g_app.queueSrcIdx.begin() + r);
         if (r < g_app.queueIndex)
             --g_app.queueIndex;
         ++removed;
@@ -4724,13 +5318,15 @@ static void PaintHeader(HDC dc)
             line2 = Fmt(L"%u artists", (unsigned)g_app.artistData.size());
     } else if (g_app.mainView == VIEW_SONGS) {
         title = L"Songs";
-        if (!g_app.allSongsLoaded)
-            line2 = L"Loading...";
+        const wchar_t* loading = g_app.allSongsLoaded ? L"" : L"  \x00B7  loading...";
+        if (!g_app.allSongsLoaded && g_app.allSongs.empty())
+            line2 = g_app.songsLoading ? L"Loading..." : L"Not loaded";
         else if (searching)
-            line2 = Fmt(L"%u of %u songs", (unsigned)g_app.songData.size(), (unsigned)g_app.allSongs.size());
+            line2 = Fmt(L"%u of %u songs%ls", (unsigned)g_app.songData.size(), (unsigned)g_app.allSongs.size(),
+                        loading);
         else
-            line2 = Fmt(L"%u songs  \x00B7  %ls", (unsigned)g_app.allSongs.size(),
-                        FormatTime(TotalDuration(g_app.allSongs)).c_str());
+            line2 = Fmt(L"%u songs  \x00B7  %ls%ls", (unsigned)g_app.allSongs.size(),
+                        FormatTime(TotalDuration(g_app.allSongs)).c_str(), loading);
     } else if (g_app.mainView == VIEW_FAVORITES) {
         title = L"Favorites";
         if (!g_app.favoritesLoaded)
@@ -4740,6 +5336,26 @@ static void PaintHeader(HDC dc)
         else
             line2 = Fmt(L"%u song%ls  \x00B7  %ls", (unsigned)g_app.songData.size(),
                         g_app.songData.size() == 1 ? L"" : L"s", FormatTime(TotalDuration(g_app.songData)).c_str());
+    } else if (g_app.mainView == VIEW_GENRES) {
+        title = L"Genres";
+        if (!g_app.genresBuilt && g_app.songsLoading)
+            line2 = g_app.allSongs.empty() ? std::wstring(L"Waiting for the song list...")
+                                           : Fmt(L"Waiting for the song list (%u songs so far)...",
+                                                 (unsigned)g_app.allSongs.size());
+        else if (!g_app.genresBuilt)
+            line2 = g_app.albumData.empty() ? L"Not connected" : L"The song list didn't load. Open Genres to retry.";
+        else if (searching)
+            line2 = Fmt(L"%u of %u genres", (unsigned)g_app.genreList.size(), (unsigned)g_app.genreData.size());
+        else
+            line2 = Fmt(L"%u genres", (unsigned)g_app.genreData.size());
+    } else if (g_app.mainView == VIEW_GENRE) {
+        title = g_app.shownGenre.name;
+        const size_t n = g_app.genreAlbums.size();
+        if (!n)
+            line2 = L"No albums in the chosen libraries.";
+        else
+            line2 = Fmt(L"%u album%ls  \x00B7  %d songs", (unsigned)n, n == 1 ? L"" : L"s",
+                        g_app.shownGenre.songCount);
     } else if (g_app.mainView == VIEW_DISCOVER) {
         const int k = g_app.discoverKind;
         title = kDiscoverTitles[k];
@@ -4783,7 +5399,8 @@ static void PaintHeader(HDC dc)
     const bool compact = !g_app.shown.has || g_app.mainView == VIEW_ALBUMS || g_app.mainView == VIEW_ARTISTS ||
                          g_app.mainView == VIEW_SONGS || g_app.mainView == VIEW_FAVORITES ||
                          g_app.mainView == VIEW_QUEUE || g_app.mainView == VIEW_DOWNLOADS ||
-                         g_app.mainView == VIEW_DISCOVER;
+                         g_app.mainView == VIEW_DISCOVER || g_app.mainView == VIEW_GENRES ||
+                         g_app.mainView == VIEW_GENRE;
     RECT t = { textX, h.top + (compact ? 0 : 6), h.right, h.top + (compact ? 32 : 40) };
     SetTextColor(dc, text);
     SelectObject(dc, g_app.fontTitle);
@@ -4852,6 +5469,7 @@ struct ColSpec {
 
 static const ColSpec kAlbumCols[]  = { { 0, 5, 120 }, { 0, 4, 100 }, { 50, 0, 0 }, { 55, 0, 0 } };
 static const ColSpec kArtistCols[] = { { 0, 1, 150 }, { 60, 0, 0 } };
+static const ColSpec kGenreCols[]  = { { 0, 1, 150 }, { 60, 0, 0 }, { 60, 0, 0 } };
 static const ColSpec kSongCols[]   = { { 32, 0, 0 }, { 0, 5, 120 }, { 0, 3, 90 }, { 24, 0, 0 }, { 80, 0, 0 },
                                        { 48, 0, 0 }, { 0, 4, 90 }, { 20, 0, 0 } };
 
@@ -4968,9 +5586,11 @@ static void Layout(HWND hwnd)
     const int listH = contentBottom - listTop;
     MoveWindow(g_app.albums, mx, listTop, mw, listH > 0 ? listH : 0, TRUE);
     MoveWindow(g_app.artists, mx, listTop, mw, listH > 0 ? listH : 0, TRUE);
+    MoveWindow(g_app.genres, mx, listTop, mw, listH > 0 ? listH : 0, TRUE);
     MoveWindow(g_app.songs, mx, listTop, mw, listH > 0 ? listH : 0, TRUE);
     FitColumns(g_app.albums, kAlbumCols, sizeof(kAlbumCols) / sizeof(kAlbumCols[0]));
     FitColumns(g_app.artists, kArtistCols, sizeof(kArtistCols) / sizeof(kArtistCols[0]));
+    FitColumns(g_app.genres, kGenreCols, sizeof(kGenreCols) / sizeof(kGenreCols[0]));
     ColSpec songCols[sizeof(kSongCols) / sizeof(kSongCols[0])];
     memcpy(songCols, kSongCols, sizeof(songCols));
     const ColSpec hidden = { 0, 0, 0 };   // flexible with no share: width 0
@@ -5024,6 +5644,7 @@ static HMENU BuildMenuBar()
     HMENU view = CreatePopupMenu();
     AppendMenuW(view, MF_STRING, IDM_ALBUMS, L"&Albums");
     AppendMenuW(view, MF_STRING, IDM_ARTISTS, L"A&rtists");
+    AppendMenuW(view, MF_STRING, IDM_GENRES, L"&Genres");
     AppendMenuW(view, MF_STRING, IDM_SONGS, L"&Songs");
     AppendMenuW(view, MF_STRING, IDM_FAVORITES, L"Fa&vorites");
     AppendMenuW(view, MF_STRING, IDM_QUEUE, L"Play &Queue\tCtrl+Q");
@@ -5708,11 +6329,14 @@ static void ShowSettings()
     }
     if (st.sidebarChanged) {
         memcpy(g_app.sectionHidden, st.sectionHidden, sizeof(g_app.sectionHidden));
-        std::wstring keys;
-        for (int i = 0; i < kSectionCount; ++i)
-            if (g_app.sectionHidden[i])
+        std::wstring hidden, shown;   // shown: the opt-in sections that are on
+        for (int i = 0; i < kSectionCount; ++i) {
+            std::wstring& keys = kSections[i].optIn ? shown : hidden;
+            if (g_app.sectionHidden[i] != kSections[i].optIn)
                 keys += (keys.empty() ? L"" : L",") + std::wstring(kSections[i].key);
-        WritePrivateProfileStringW(L"View", L"HiddenSections", keys.c_str(), g_app.iniPath.c_str());   // "" = none
+        }
+        WritePrivateProfileStringW(L"View", L"HiddenSections", hidden.c_str(), g_app.iniPath.c_str());   // "" = none
+        WritePrivateProfileStringW(L"View", L"ShownSections", shown.c_str(), g_app.iniPath.c_str());
         RebuildLibraryTree();
     }
     if (st.dlQuality != g_app.dlQuality) {
@@ -5787,15 +6411,20 @@ static void OnCreate(HWND hwnd)
     g_app.hdrPlay = MakeChild(hwnd, L"BUTTON", L"Play", WS_TABSTOP | BS_OWNERDRAW, IDC_HDR_PLAY);
     g_app.hdrShuffle = MakeChild(hwnd, L"BUTTON", L"Shuffle", WS_TABSTOP | BS_OWNERDRAW, IDC_HDR_SHUFFLE);
 
-    g_app.albums = MakeList(hwnd, IDC_ALBUMS);
+    g_app.albums = MakeList(hwnd, IDC_ALBUMS, LVS_OWNERDATA);
     AddColumn(g_app.albums, 0, L"Album", 260, LVCFMT_LEFT);
     AddColumn(g_app.albums, 1, L"Artist", 200, LVCFMT_LEFT);
     AddColumn(g_app.albums, 2, L"Year", 50, LVCFMT_RIGHT);
     AddColumn(g_app.albums, 3, L"Tracks", 55, LVCFMT_RIGHT);
 
-    g_app.artists = MakeList(hwnd, IDC_ARTISTS);
+    g_app.artists = MakeList(hwnd, IDC_ARTISTS, LVS_OWNERDATA);
     AddColumn(g_app.artists, 0, L"Artist", 320, LVCFMT_LEFT);
     AddColumn(g_app.artists, 1, L"Albums", 60, LVCFMT_RIGHT);
+
+    g_app.genres = MakeList(hwnd, IDC_GENRES, LVS_OWNERDATA);
+    AddColumn(g_app.genres, 0, L"Genre", 320, LVCFMT_LEFT);
+    AddColumn(g_app.genres, 1, L"Albums", 60, LVCFMT_RIGHT);
+    AddColumn(g_app.genres, 2, L"Songs", 60, LVCFMT_RIGHT);
 
     g_app.songs = MakeList(hwnd, IDC_SONGS, LVS_OWNERDATA, true);   // Ctrl/Shift-click select several
     AddColumn(g_app.songs, COL_NUM, L"#", 32, LVCFMT_RIGHT);
@@ -5833,7 +6462,7 @@ static void OnCreate(HWND hwnd)
     g_app.repeat = (int)GetPrivateProfileIntW(L"Player", L"Repeat", REPEAT_OFF, g_app.iniPath.c_str());
     if (g_app.repeat < REPEAT_OFF || g_app.repeat > REPEAT_ONE)
         g_app.repeat = REPEAT_OFF;
-    g_app.songSortCol = g_app.albumSortCol = g_app.artistSortCol = -1;
+    g_app.songSortCol = g_app.albumSortCol = g_app.artistSortCol = g_app.genreSortCol = -1;
     g_app.headerArrows = CommonControls6();
     g_app.mediaKeysGlobal = GetPrivateProfileIntW(L"Player", L"GlobalMediaKeys", 1, g_app.iniPath.c_str()) != 0;
     RegisterMediaKeys(g_app.mediaKeysGlobal);
@@ -5848,13 +6477,19 @@ static void OnCreate(HWND hwnd)
     g_app.showFavorites = GetPrivateProfileIntW(L"View", L"ShowFavorites", 1, g_app.iniPath.c_str()) != 0;
     g_app.showRatings = GetPrivateProfileIntW(L"View", L"ShowRatings", 1, g_app.iniPath.c_str()) != 0;
     {   // [View] HiddenSections: comma-separated kSections keys. Missing: the Discover lists start
-        // hidden; empty (written when everything is ticked): nothing hidden.
+        // hidden; empty (written when everything is ticked): nothing hidden. ShownSections: the
+        // opt-in sections that are on (Genres).
         wchar_t buf[512] = L"";
         GetPrivateProfileStringW(L"View", L"HiddenSections", L"added,played,frequent,random", buf, 512,
                                  g_app.iniPath.c_str());
         const std::wstring hidden = std::wstring(L",") + buf + L",";
-        for (int i = 0; i < kSectionCount; ++i)
-            g_app.sectionHidden[i] = hidden.find(std::wstring(L",") + kSections[i].key + L",") != std::wstring::npos;
+        GetPrivateProfileStringW(L"View", L"ShownSections", L"", buf, 512, g_app.iniPath.c_str());
+        const std::wstring shown = std::wstring(L",") + buf + L",";
+        for (int i = 0; i < kSectionCount; ++i) {
+            const std::wstring key = std::wstring(L",") + kSections[i].key + L",";
+            g_app.sectionHidden[i] = kSections[i].optIn ? shown.find(key) == std::wstring::npos
+                                                        : hidden.find(key) != std::wstring::npos;
+        }
     }
     ApplyDisplay();
     g_app.trayIcon = GetPrivateProfileIntW(L"View", L"TrayIcon", 1, g_app.iniPath.c_str()) != 0;
@@ -5968,6 +6603,12 @@ static LRESULT OnNotify(NMHDR* nm)
     case IDC_ALBUMS:
         if (nm->code == NM_CUSTOMDRAW)
             return OnListCustomDraw((NMLVCUSTOMDRAW*)nm);
+        if (nm->code == LVN_GETDISPINFOW) {
+            OnAlbumsDispInfo((NMLVDISPINFOW*)nm);
+            return 0;
+        }
+        if (nm->code == LVN_ODFINDITEMW)
+            return FindRow(ShownAlbums(), (NMLVFINDITEMW*)nm);
         if (nm->code == LVN_COLUMNCLICK)
             OnAlbumsColumnClick(((NMLISTVIEW*)nm)->iSubItem);
         else if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
@@ -5979,10 +6620,31 @@ static LRESULT OnNotify(NMHDR* nm)
     case IDC_ARTISTS:
         if (nm->code == NM_CUSTOMDRAW)
             return OnListCustomDraw((NMLVCUSTOMDRAW*)nm);
+        if (nm->code == LVN_GETDISPINFOW) {
+            OnArtistsDispInfo((NMLVDISPINFOW*)nm);
+            return 0;
+        }
+        if (nm->code == LVN_ODFINDITEMW)
+            return FindRow(g_app.artistList, (NMLVFINDITEMW*)nm);
         if (nm->code == LVN_COLUMNCLICK)
             OnArtistsColumnClick(((NMLISTVIEW*)nm)->iSubItem);
         else if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
             OpenSelectedArtist();
+        break;
+
+    case IDC_GENRES:
+        if (nm->code == NM_CUSTOMDRAW)
+            return OnListCustomDraw((NMLVCUSTOMDRAW*)nm);
+        if (nm->code == LVN_GETDISPINFOW) {
+            OnGenresDispInfo((NMLVDISPINFOW*)nm);
+            return 0;
+        }
+        if (nm->code == LVN_ODFINDITEMW)
+            return FindRow(g_app.genreList, (NMLVFINDITEMW*)nm);
+        if (nm->code == LVN_COLUMNCLICK)
+            OnGenresColumnClick(((NMLISTVIEW*)nm)->iSubItem);
+        else if (nm->code == NM_DBLCLK || nm->code == NM_RETURN)
+            OpenSelectedGenre();
         break;
 
     case IDC_TREE:
@@ -6044,6 +6706,9 @@ static void OnCommand(int id)
         break;
     case IDM_ARTISTS:
         ShowArtistsView();
+        break;
+    case IDM_GENRES:
+        ShowGenresView();
         break;
     case IDM_SONGS:
         ShowSongsView();
@@ -6489,7 +7154,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (wp == TIMER_DRAGSCROLL)
             DragScroll();
         else if (wp == TIMER_RELOAD)
-            DoConnect(true);
+            DoConnect(g_app.reloadKeepPlayback);
         return 0;
 
     case WM_CONTEXTMENU:
@@ -6522,6 +7187,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_APP_DOWNLOAD:
         OnDownloadEvent((DownloadEvent*)lp);
+        return 0;
+
+    case WM_APP_SONG_PAGE:
+        OnSongPage((SongPage*)lp);
         return 0;
 
     case WM_PLAYER_STATE:
@@ -6576,6 +7245,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show)
     g_app.queueIndex = -1;
     g_app.pendingPlaylist = -1;
     LogInit(dir + L"\\Navi2KPlayer.log");
+    IniToAnsiOn9x(g_app.iniPath);
     srand(GetTickCount());
     LoadFallbackFont(dir);   // East Asian text without installing a font (9x, or 2000+ without them)
 
@@ -6654,7 +7324,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show)
     }
     DestroyAcceleratorTable(accelTable);
 
-    // Let in-flight requests (e.g. a rating being saved) finish before WinINet goes away.
+    // Let in-flight requests (e.g. a rating being saved) finish before WinINet goes away;
+    // the song list load stops after its current page.
+    InterlockedExchange(&g_app.songsCancel, 1);
     for (int i = 0; i < 100 && g_app.jobsRunning > 0; ++i)
         Sleep(50);
     HttpShutdown();

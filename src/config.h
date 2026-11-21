@@ -7,6 +7,10 @@
 
 // Settings live in Navi2KPlayer.ini next to the exe; File > Settings edits them.
 
+// Windows 9x's ini functions only read ANSI files: an ini first made on 2000/XP or later
+// (UTF-16) is rewritten in the ANSI code page there. Call before anything reads the ini.
+void IniToAnsiOn9x(const std::wstring& iniPath);
+
 // Reads [Server] as-is (creating a commented template if the file is missing), with no
 // checks, for filling the Settings dialog.
 void ConfigRead(const std::wstring& iniPath, SubsonicConfig& cfg);

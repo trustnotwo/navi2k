@@ -56,6 +56,38 @@ static void WriteIniTemplate(const std::wstring& ini)
     CloseHandle(f);
 }
 
+void IniToAnsiOn9x(const std::wstring& ini)
+{
+    if (!Win9xMode())
+        return;
+    HANDLE f = CreateFileW(ini.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE)
+        return;
+    const DWORD size = GetFileSize(f, NULL);
+    std::string data(size == INVALID_FILE_SIZE || size > (1u << 20) ? 0 : size, '\0');
+    DWORD got = 0;
+    const bool ok = !data.empty() && ReadFile(f, &data[0], (DWORD)data.size(), &got, NULL);
+    CloseHandle(f);
+    if (!ok || got < 2 || (unsigned char)data[0] != 0xFF || (unsigned char)data[1] != 0xFE)
+        return;
+    std::wstring wide((got - 2) / 2, L'\0');
+    for (size_t i = 0; i < wide.size(); ++i)
+        wide[i] = (wchar_t)((unsigned char)data[2 + 2 * i] | ((unsigned char)data[3 + 2 * i] << 8));
+    int n = wide.empty() ? 0 : WideCharToMultiByte(CP_ACP, 0, wide.c_str(), (int)wide.size(), NULL, 0, NULL, NULL);
+    std::string a(n > 0 ? n : 0, '\0');
+    if (n > 0)
+        WideCharToMultiByte(CP_ACP, 0, wide.c_str(), (int)wide.size(), &a[0], n, NULL, NULL);
+    f = CreateFileW(ini.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        LogF(L"ini: could not rewrite the UTF-16 ini for Windows 9x (error %lu)", GetLastError());
+        return;
+    }
+    DWORD written;
+    WriteFile(f, a.data(), (DWORD)a.size(), &written, NULL);
+    CloseHandle(f);
+    LogF(L"ini: converted from UTF-16 to ANSI so Windows 9x can read it");
+}
+
 // Pre-rename builds were "Legacy Player": adopt their settings (and token) once.
 static void MigrateOldIni(const std::wstring& ini)
 {

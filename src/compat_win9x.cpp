@@ -154,8 +154,16 @@ HANDLE WINAPI LpCreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
 {
     NT_FIRST("kernel32.dll", CreateFileW, (name, access, share, sa, disp, flags, tmpl));
     A a(name);
+    // 9x only knows GENERIC_READ/GENERIC_WRITE: FILE_APPEND_DATA (the log, the saved plays)
+    // failed there. Open for writing at the end instead; the callers only write sequentially.
+    const bool append = (access & FILE_APPEND_DATA) && !(access & GENERIC_WRITE);
+    if (append)
+        access = (access & ~FILE_APPEND_DATA) | GENERIC_WRITE;
     // 9x rejects FILE_SHARE_DELETE (and files there can't be deleted while open anyway).
-    return CreateFileA(a.p, access, share & ~FILE_SHARE_DELETE, sa, disp, flags, tmpl);
+    HANDLE h = CreateFileA(a.p, access, share & ~FILE_SHARE_DELETE, sa, disp, flags, tmpl);
+    if (append && h != INVALID_HANDLE_VALUE)
+        SetFilePointer(h, 0, NULL, FILE_END);
+    return h;
 }
 
 BOOL WINAPI LpCreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa)
@@ -315,6 +323,28 @@ int WINAPI LplstrcmpiW(LPCWSTR x, LPCWSTR y)
     NT_FIRST("kernel32.dll", lstrcmpiW, (x, y));
     A a(x), b(y);
     return lstrcmpiA(a.p ? a.p : "", b.p ? b.p : "");
+}
+
+// Only sort keys (LCMAP_SORTKEY) on 9x: their output is bytes either way, and comparing
+// them orders strings the same as lstrcmpiA does.
+int WINAPI LpLCMapStringW(LCID lcid, DWORD flags, LPCWSTR src, int srcLen, LPWSTR dst, int dstLen)
+{
+    NT_FIRST("kernel32.dll", LCMapStringW, (lcid, flags, src, srcLen, dst, dstLen));
+    if (!(flags & LCMAP_SORTKEY) || !src) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+    std::string a;
+    if (srcLen != 0) {
+        const int n = WideCharToMultiByte(CP_ACP, 0, src, srcLen, NULL, 0, NULL, NULL);
+        if (n > 0) {
+            a.resize(n);
+            WideCharToMultiByte(CP_ACP, 0, src, srcLen, &a[0], n, NULL, NULL);
+        }
+    }
+    if (srcLen < 0 && !a.empty())
+        a.resize(a.size() - 1);   // the converted terminator
+    return LCMapStringA(lcid, flags, a.data(), (int)a.size(), (LPSTR)dst, dstLen);
 }
 
 LPWSTR WINAPI LplstrcpyW(LPWSTR dst, LPCWSTR src)
@@ -970,6 +1000,7 @@ LP_SLOT(GetPrivateProfileIntW, "GetPrivateProfileIntW@16")
 LP_SLOT(GetPrivateProfileStringW, "GetPrivateProfileStringW@24")
 LP_SLOT(WritePrivateProfileStringW, "WritePrivateProfileStringW@16")
 LP_SLOT(lstrcmpiW, "lstrcmpiW@8")
+LP_SLOT(LCMapStringW, "LCMapStringW@24")
 LP_SLOT(lstrcpyW, "lstrcpyW@8")
 LP_SLOT(lstrcpynW, "lstrcpynW@12")
 LP_SLOT(TryEnterCriticalSection, "TryEnterCriticalSection@4")

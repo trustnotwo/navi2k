@@ -2,6 +2,7 @@
 #define LP_SUBSONIC_H
 
 #include "http.h"
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,17 @@ struct SubsonicAlbum {
     std::wstring name, artist;
     std::vector<std::string> artistIds;   // album artist ids (artistId plus OpenSubsonic "artists")
     int year, songCount;
+
+    void swap(SubsonicAlbum& o)
+    {
+        id.swap(o.id);
+        coverArt.swap(o.coverArt);
+        name.swap(o.name);
+        artist.swap(o.artist);
+        artistIds.swap(o.artistIds);
+        std::swap(year, o.year);
+        std::swap(songCount, o.songCount);
+    }
 };
 
 struct SubsonicSong {
@@ -39,6 +51,11 @@ struct SubsonicSong {
     int bitDepth, samplingRate, channelCount;   // of the original file; 0 = not reported
     int userRating;                 // 0 = unrated, 1..5
     bool starred;                   // in Favorites
+    std::wstring genres;            // each followed by '\n' (OpenSubsonic "genres", else "genre")
+
+    // Exchanges the strings' buffers instead of copying them (C++98 has no move), so large
+    // song lists can be reordered without allocating.
+    void swap(SubsonicSong& o);
 };
 
 struct SubsonicArtist {
@@ -46,6 +63,26 @@ struct SubsonicArtist {
     std::string coverArt;        // artist image id for getCoverArt; may be empty
     std::wstring name;
     int albumCount;
+
+    void swap(SubsonicArtist& o)
+    {
+        id.swap(o.id);
+        coverArt.swap(o.coverArt);
+        name.swap(o.name);
+        std::swap(albumCount, o.albumCount);
+    }
+};
+
+struct SubsonicGenre {          // built from the songs' genres (Library > Genres)
+    std::wstring name;
+    int songCount, albumCount;
+
+    void swap(SubsonicGenre& o)
+    {
+        name.swap(o.name);
+        std::swap(songCount, o.songCount);
+        std::swap(albumCount, o.albumCount);
+    }
 };
 
 struct SubsonicLibrary {        // a Navidrome library (Subsonic "music folder")
@@ -60,6 +97,18 @@ struct SubsonicPlaylist {
     int songCount, duration;
     bool readOnly;               // smart playlist (.nsp) or otherwise not editable by the server
 };
+
+// The library order of the Songs page: artist, album, disc, track (ignoring case and
+// leading spaces).
+bool SongLibraryOrder(const SubsonicSong& a, const SubsonicSong& b);
+// Merges 'more' (sorted by SongLibraryOrder, emptied) into 'into' (sorted), swapping songs
+// rather than copying them. Ties keep 'into' first. If 'from' is given, it gets each merged
+// song's origin: its index in 'into', or -1 - its index in 'more'.
+void MergeSongs(std::vector<SubsonicSong>& into, std::vector<SubsonicSong>& more, std::vector<int>* from);
+
+// Called with each page of GetAllSongs as it arrives (sorted by SongLibraryOrder). It may
+// take the songs (swap them out). Returning false stops the load.
+typedef bool (*SongPageFn)(std::vector<SubsonicSong>& page, void* ctx);
 
 // Subsonic token auth: random salt, token = md5(password + salt). Uses CryptoAPI (Win2000+).
 bool SubsonicMakeToken(const std::string& passwordUtf8, std::string& token, std::string& salt);
@@ -87,9 +136,11 @@ public:
     bool GetAlbumListOf(const char* type, int size, std::vector<SubsonicAlbum>& out, std::wstring& err);
     bool GetAlbum(const std::string& albumId, std::vector<SubsonicSong>& out, std::wstring& err);
 
-    // Every song in the library, via search3 with an empty query, 500 per request.
-    // Sorted by artist, album, disc, track.
-    bool GetAllSongs(std::vector<SubsonicSong>& out, std::wstring& err);
+    // Every song in the library, via search3 with an empty query, 500 per request, sorted by
+    // SongLibraryOrder. With onPage, each page goes there instead and 'out' stays empty;
+    // if onPage stops the load, returns false with 'err' empty.
+    bool GetAllSongs(std::vector<SubsonicSong>& out, std::wstring& err, SongPageFn onPage = NULL,
+                     void* ctx = NULL);
 
     // All artists, alphabetical (getArtists), and one artist's albums (getArtist).
     bool GetArtists(std::vector<SubsonicArtist>& out, std::wstring& err);
@@ -159,6 +210,15 @@ private:
     std::string LibraryParams() const;   // "&musicFolderId=..." for each chosen library
     bool Call(const char* method, const std::string& extraQuery, cJSON** root, cJSON** response,
               HttpResult* httpResult, std::wstring& err);
+    // The two halves of Call: downloading the reply (Fetch; *ms = how long) and parsing it
+    // (Parse; fetchMs only for the log). GetAllSongs overlaps them across pages.
+    bool Fetch(const char* method, const std::string& extraQuery, std::string& body, HttpResult* httpResult,
+               std::wstring& err, DWORD* ms) const;
+    bool Parse(const char* method, const std::string& body, DWORD fetchMs, cJSON** root, cJSON** response,
+               std::wstring& err) const;
+    struct PageFetch;
+    static unsigned __stdcall FetchPage(void* p);
+    std::string PageQuery(int offset, int count) const;
     bool CallNoResult(const char* method, const std::string& params, std::wstring& err);
     // Groups song ids so each request's URL stays short enough for Windows 2000's WinINet.
     std::vector<std::vector<std::string> > SplitIds(const char* method, const std::string& fixedParams,

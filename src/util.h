@@ -5,6 +5,7 @@
 #include <string>
 
 std::wstring Utf8ToWide(const std::string& s);
+std::wstring Utf8ToWide(const char* s, size_t n);
 std::string  WideToUtf8(const std::wstring& s);
 std::string  UrlEncode(const std::string& s);       // RFC 3986 unreserved set kept as-is
 std::wstring Fmt(const wchar_t* fmt, ...);          // msvcrt rules: %ls = wide, %hs = narrow

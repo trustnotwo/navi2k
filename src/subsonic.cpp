@@ -2,6 +2,7 @@
 #include "util.h"
 
 #include <algorithm>
+#include <process.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
@@ -187,7 +188,38 @@ static SubsonicSong ParseSong(cJSON* s)
     song.channelCount = JInt(s, "channelCount");
     song.userRating = JInt(s, "userRating");
     song.starred = JGet(s, "starred") != NULL;   // present (a timestamp) only when starred
+    cJSON* g;
+    cJSON_ArrayForEach(g, JGet(s, "genres")) {   // Navidrome: every genre; "genre" is the first
+        const std::wstring name = JStr(g, "name");
+        if (!name.empty())
+            song.genres += name + L"\n";
+    }
+    if (song.genres.empty() && !JStr(s, "genre").empty())
+        song.genres = JStr(s, "genre") + L"\n";
     return song;
+}
+
+void SubsonicSong::swap(SubsonicSong& o)
+{
+    id.swap(o.id);
+    coverArt.swap(o.coverArt);
+    albumId.swap(o.albumId);
+    artistId.swap(o.artistId);
+    title.swap(o.title);
+    artist.swap(o.artist);
+    album.swap(o.album);
+    suffix.swap(o.suffix);
+    albumArtist.swap(o.albumArtist);
+    std::swap(track, o.track);
+    std::swap(disc, o.disc);
+    std::swap(duration, o.duration);
+    std::swap(bitRate, o.bitRate);
+    std::swap(bitDepth, o.bitDepth);
+    std::swap(samplingRate, o.samplingRate);
+    std::swap(channelCount, o.channelCount);
+    std::swap(userRating, o.userRating);
+    std::swap(starred, o.starred);
+    genres.swap(o.genres);
 }
 
 // One "album" object from getAlbumList2 or getArtist.
@@ -288,9 +320,18 @@ bool SubsonicClient::Call(const char* method, const std::string& extraQuery, cJS
     *root = NULL;
     *response = NULL;
     std::string body;
+    DWORD ms = 0;
+    return Fetch(method, extraQuery, body, httpResult, err, &ms) && Parse(method, body, ms, root, response, err);
+}
+
+bool SubsonicClient::Fetch(const char* method, const std::string& extraQuery, std::string& body,
+                           HttpResult* httpResult, std::wstring& err, DWORD* ms) const
+{
     DWORD status = 0, winErr = 0;
     LogF(L"API %hs", method);   // never log the URL: it carries the auth token
+    const DWORD t0 = GetTickCount();
     HttpResult r = HttpGetAll(BuildUrl(method, extraQuery + "&f=json"), Options(), body, &status, &winErr);
+    *ms = GetTickCount() - t0;
     if (httpResult)
         *httpResult = r;
     if (r != HTTP_OK) {
@@ -298,8 +339,19 @@ bool SubsonicClient::Call(const char* method, const std::string& extraQuery, cJS
         LogF(L"API %hs failed: result=%d status=%lu winerr=%lu", method, (int)r, status, winErr);
         return false;
     }
+    return true;
+}
 
+bool SubsonicClient::Parse(const char* method, const std::string& body, DWORD fetchMs, cJSON** root,
+                           cJSON** response, std::wstring& err) const
+{
+    *root = NULL;
+    *response = NULL;
+    const DWORD t1 = GetTickCount();
     cJSON* json = cJSON_Parse(body.c_str());
+    if (body.size() >= 64 * 1024)   // big replies (the song list): where the time goes
+        LogF(L"API %hs: %u KB downloaded in %lu ms, parsed in %lu ms", method, (unsigned)(body.size() / 1024),
+             fetchMs, GetTickCount() - t1);
     cJSON* sr = json ? JGet(json, "subsonic-response") : NULL;
     if (!cJSON_IsObject(sr)) {
         cJSON_Delete(json);
@@ -457,47 +509,603 @@ const wchar_t* SortKey(const std::wstring& s)
         ++p;
     return p;
 }
+}
 
+bool SongLibraryOrder(const SubsonicSong& a, const SubsonicSong& b)
+{
+    int c = _wcsicmp(SortKey(a.artist), SortKey(b.artist));
+    if (c)
+        return c < 0;
+    c = _wcsicmp(SortKey(a.album), SortKey(b.album));
+    if (c)
+        return c < 0;
+    if (a.disc != b.disc)
+        return a.disc < b.disc;
+    return a.track < b.track;
+}
+
+void MergeSongs(std::vector<SubsonicSong>& into, std::vector<SubsonicSong>& more, std::vector<int>* from)
+{
+    std::vector<SubsonicSong> merged(into.size() + more.size());
+    if (from)
+        from->resize(merged.size());
+    size_t a = 0, b = 0;
+    for (size_t i = 0; i < merged.size(); ++i) {
+        if (a == into.size() || (b < more.size() && SongLibraryOrder(more[b], into[a]))) {
+            merged[i].swap(more[b]);
+            if (from)
+                (*from)[i] = -1 - (int)b;
+            ++b;
+        } else {
+            merged[i].swap(into[a]);
+            if (from)
+                (*from)[i] = (int)a;
+            ++a;
+        }
+    }
+    into.swap(merged);
+    more.clear();
+}
+
+namespace {
+// Compares songs by their position in 'songs', so the sort moves ints, not whole songs.
 struct SongOrder {
-    bool operator()(const SubsonicSong& a, const SubsonicSong& b) const
+    const std::vector<SubsonicSong>* songs;
+    bool operator()(int x, int y) const { return SongLibraryOrder((*songs)[x], (*songs)[y]); }
+};
+
+// Sorts by SongLibraryOrder (stable): sorts positions, then swaps the songs into that order.
+void SortSongs(std::vector<SubsonicSong>& songs)
+{
+    std::vector<int> order(songs.size());
+    for (size_t i = 0; i < order.size(); ++i)
+        order[i] = (int)i;
+    SongOrder less;
+    less.songs = &songs;
+    std::stable_sort(order.begin(), order.end(), less);
+    std::vector<SubsonicSong> sorted(songs.size());
+    for (size_t i = 0; i < order.size(); ++i)
+        sorted[i].swap(songs[order[i]]);
+    songs.swap(sorted);
+}
+}
+
+// --- The song list's fast reader --------------------------------------------------------------
+// A search3 page is about 600 KB, and building cJSON's tree of every field took a Pentium over
+// a second. This walks the text once and keeps only what ParseSong keeps, with the same results.
+// Anything it doesn't expect makes it give up, and the page goes through cJSON instead.
+
+namespace {
+class SongScan {
+public:
+    explicit SongScan(const char* json) : p(json), bad(false) {}
+
+    bool Failed() const { return bad; }
+
+    // Reads the reply: { "subsonic-response": { "status": "ok", "searchResult3": { "song": [...] } } }
+    bool ReadPage(std::vector<SubsonicSong>& page)
     {
-        int c = _wcsicmp(SortKey(a.artist), SortKey(b.artist));
-        if (c)
-            return c < 0;
-        c = _wcsicmp(SortKey(a.album), SortKey(b.album));
-        if (c)
-            return c < 0;
-        if (a.disc != b.disc)
-            return a.disc < b.disc;
-        return a.track < b.track;
+        bool ok = false;
+        if (!Open('{'))
+            return false;
+        bool first = true;
+        const char* k;
+        size_t n;
+        while (Member('}', first, k, n)) {
+            if (Is(k, n, "subsonic-response"))
+                ReadResponse(page, ok);
+            else
+                Skip();
+        }
+        return !bad && ok;
+    }
+
+private:
+    const char* p;
+    bool bad;
+
+    static bool Is(const char* k, size_t n, const char* name)
+    {
+        return strlen(name) == n && memcmp(k, name, n) == 0;
+    }
+
+    void Ws()
+    {
+        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
+            ++p;
+    }
+
+    bool Open(char c)
+    {
+        Ws();
+        if (*p != c) {
+            bad = true;
+            return false;
+        }
+        ++p;
+        return true;
+    }
+
+    // The next element of a list or object, if there is one ('first' goes false after the first).
+    bool More(char close, bool& first)
+    {
+        Ws();
+        if (*p == close) {
+            ++p;
+            return false;
+        }
+        if (!first) {
+            if (*p != ',') {
+                bad = true;
+                return false;
+            }
+            ++p;
+            Ws();
+        }
+        first = false;
+        if (bad || !*p) {
+            bad = true;
+            return false;
+        }
+        return true;
+    }
+
+    // Past the next key and its colon. Keys with escapes just won't match any name.
+    bool Member(char close, bool& first, const char*& key, size_t& len)
+    {
+        if (bad || !More(close, first))
+            return false;
+        if (*p != '"') {
+            bad = true;
+            return false;
+        }
+        key = p + 1;
+        if (!SkipString())
+            return false;
+        len = (size_t)(p - 1 - key);
+        Ws();
+        if (*p != ':') {
+            bad = true;
+            return false;
+        }
+        ++p;
+        Ws();
+        return true;
+    }
+
+    bool SkipString()
+    {
+        for (++p;; ++p) {
+            if (*p == '"') {
+                ++p;
+                return true;
+            }
+            if (*p == '\\' && p[1])
+                ++p;
+            else if (!*p || *p == '\\') {
+                bad = true;
+                return false;
+            }
+        }
+    }
+
+    void Skip()
+    {
+        Ws();
+        if (*p == '"') {
+            SkipString();
+        } else if (*p == '{' || *p == '[') {
+            int depth = 0;
+            do {
+                if (*p == '"') {
+                    if (!SkipString())
+                        return;
+                    continue;
+                }
+                if (!*p) {
+                    bad = true;
+                    return;
+                }
+                if (*p == '{' || *p == '[')
+                    ++depth;
+                else if (*p == '}' || *p == ']')
+                    --depth;
+                ++p;
+            } while (depth);
+        } else {
+            const char* start = p;
+            while (*p && *p != ',' && *p != '}' && *p != ']' && *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t')
+                ++p;
+            bad = bad || p == start;
+        }
+    }
+
+    static int Hex4(const char* s)
+    {
+        int v = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char c = s[i];
+            const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                        : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0)
+                return -1;
+            v = v * 16 + d;
+        }
+        return v;
+    }
+
+    static void PutUtf8(std::string& out, unsigned cp)
+    {
+        if (cp < 0x80) {
+            out += (char)cp;
+        } else if (cp < 0x800) {
+            out += (char)(0xC0 | (cp >> 6));
+            out += (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += (char)(0xE0 | (cp >> 12));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        } else {
+            out += (char)(0xF0 | (cp >> 18));
+            out += (char)(0x80 | ((cp >> 12) & 0x3F));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        }
+    }
+
+    // The string at p, as UTF-8: [s, s + n), either in the reply or (if it had escapes) in 'tmp'.
+    bool Text(const char*& s, size_t& n, std::string& tmp)
+    {
+        const char* start = p + 1;
+        if (!SkipString())
+            return false;
+        s = start;
+        n = (size_t)(p - 1 - start);
+        if (!memchr(s, '\\', n))
+            return true;
+        tmp.clear();
+        for (const char* c = start; c < p - 1; ++c) {
+            if (*c != '\\') {
+                tmp += *c;
+                continue;
+            }
+            ++c;
+            switch (*c) {
+            case '"': case '\\': case '/': tmp += *c; break;
+            case 'b': tmp += '\b'; break;
+            case 'f': tmp += '\f'; break;
+            case 'n': tmp += '\n'; break;
+            case 'r': tmp += '\r'; break;
+            case 't': tmp += '\t'; break;
+            case 'u': {
+                int cp = Hex4(c + 1);
+                c += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF && c[1] == '\\' && c[2] == 'u') {
+                    const int low = Hex4(c + 3);
+                    if (low < 0xDC00 || low > 0xDFFF) {
+                        bad = true;
+                        return false;
+                    }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    c += 6;
+                } else if (cp <= 0 || (cp >= 0xD800 && cp <= 0xDFFF)) {   // includes \u0000
+                    bad = true;
+                    return false;
+                }
+                PutUtf8(tmp, (unsigned)cp);
+                break;
+            }
+            default:
+                bad = true;
+                return false;
+            }
+        }
+        s = tmp.data();
+        n = tmp.size();
+        return true;
+    }
+
+    void Wide(std::wstring& out)
+    {
+        Ws();
+        if (*p != '"') {     // as JStr: not a string reads as empty
+            Skip();
+            out.clear();
+            return;
+        }
+        const char* s = NULL;
+        size_t n = 0;
+        std::string tmp;
+        if (Text(s, n, tmp))
+            out = Utf8ToWide(s, n);
+    }
+
+    void Narrow(std::string& out)
+    {
+        Ws();
+        if (*p != '"') {     // JId also takes numbers: leave those to cJSON
+            bad = bad || (*p >= '0' && *p <= '9') || *p == '-';
+            Skip();
+            out.clear();
+            return;
+        }
+        const char* s = NULL;
+        size_t n = 0;
+        std::string tmp;
+        if (Text(s, n, tmp))
+            out.assign(s, n);
+    }
+
+    void Int(int& out)
+    {
+        Ws();
+        if (*p == '"' || *p == '{' || *p == '[' || (*p >= 'a' && *p <= 'z')) {   // as JInt: 0
+            Skip();
+            out = 0;
+            return;
+        }
+        const bool neg = *p == '-';
+        if (neg)
+            ++p;
+        const char* start = p;
+        int v = 0;
+        while (*p >= '0' && *p <= '9') {
+            if (p - start >= 9) {   // beyond a plain int: leave it to cJSON
+                bad = true;
+                return;
+            }
+            v = v * 10 + (*p++ - '0');
+        }
+        if (p == start || *p == '.' || *p == 'e' || *p == 'E') {
+            bad = true;
+            return;
+        }
+        out = neg ? -v : v;
+    }
+
+    void ReadResponse(std::vector<SubsonicSong>& page, bool& ok)
+    {
+        if (!Open('{'))
+            return;
+        bool first = true;
+        const char* k;
+        size_t n;
+        while (Member('}', first, k, n)) {
+            if (Is(k, n, "status")) {
+                std::string status;
+                Narrow(status);
+                ok = status == "ok";
+            } else if (Is(k, n, "searchResult3")) {
+                ReadResult(page);
+            } else {
+                Skip();
+            }
+        }
+    }
+
+    void ReadResult(std::vector<SubsonicSong>& page)
+    {
+        if (!Open('{'))
+            return;
+        bool first = true;
+        const char* k;
+        size_t n;
+        while (Member('}', first, k, n)) {
+            if (!Is(k, n, "song")) {
+                Skip();
+                continue;
+            }
+            if (!Open('['))
+                return;
+            bool firstSong = true;
+            while (!bad && More(']', firstSong)) {
+                page.resize(page.size() + 1);
+                ReadSong(page.back());
+            }
+        }
+    }
+
+    void ReadGenres(std::wstring& genres)
+    {
+        Ws();
+        if (*p != '[') {
+            Skip();
+            return;
+        }
+        ++p;
+        bool first = true;
+        while (!bad && More(']', first)) {
+            Ws();
+            if (*p != '{') {     // not the { "name": ... } that Navidrome sends
+                bad = true;
+                return;
+            }
+            ++p;
+            bool firstKey = true;
+            const char* k;
+            size_t n;
+            std::wstring name;
+            while (Member('}', firstKey, k, n)) {
+                if (Is(k, n, "name"))
+                    Wide(name);
+                else
+                    Skip();
+            }
+            if (!name.empty())
+                genres += name + L"\n";
+        }
+    }
+
+    // One song object: the same fields and defaults as ParseSong.
+    void ReadSong(SubsonicSong& s)
+    {
+        s.track = s.disc = s.duration = s.bitRate = s.bitDepth = s.samplingRate = s.channelCount = s.userRating = 0;
+        s.starred = false;
+        if (!Open('{'))
+            return;
+        std::wstring genre;
+        bool first = true;
+        const char* k;
+        size_t n;
+        while (Member('}', first, k, n)) {
+            switch (n) {
+            case 2:
+                if (Is(k, n, "id")) { Narrow(s.id); continue; }
+                break;
+            case 5:
+                if (Is(k, n, "title")) { Wide(s.title); continue; }
+                if (Is(k, n, "album")) { Wide(s.album); continue; }
+                if (Is(k, n, "track")) { Int(s.track); continue; }
+                if (Is(k, n, "genre")) { Wide(genre); continue; }
+                break;
+            case 6:
+                if (Is(k, n, "artist")) { Wide(s.artist); continue; }
+                if (Is(k, n, "suffix")) { Wide(s.suffix); continue; }
+                if (Is(k, n, "genres")) { ReadGenres(s.genres); continue; }
+                break;
+            case 7:
+                if (Is(k, n, "albumId")) { Narrow(s.albumId); continue; }
+                if (Is(k, n, "bitRate")) { Int(s.bitRate); continue; }
+                if (Is(k, n, "starred")) { s.starred = true; Skip(); continue; }
+                break;
+            case 8:
+                if (Is(k, n, "coverArt")) { Narrow(s.coverArt); continue; }
+                if (Is(k, n, "artistId")) { Narrow(s.artistId); continue; }
+                if (Is(k, n, "duration")) { Int(s.duration); continue; }
+                if (Is(k, n, "bitDepth")) { Int(s.bitDepth); continue; }
+                break;
+            case 10:
+                if (Is(k, n, "discNumber")) { Int(s.disc); continue; }
+                if (Is(k, n, "userRating")) { Int(s.userRating); continue; }
+                break;
+            case 12:
+                if (Is(k, n, "samplingRate")) { Int(s.samplingRate); continue; }
+                if (Is(k, n, "channelCount")) { Int(s.channelCount); continue; }
+                break;
+            case 18:
+                if (Is(k, n, "displayAlbumArtist")) { Wide(s.albumArtist); continue; }
+                break;
+            }
+            Skip();
+        }
+        if (s.genres.empty() && !genre.empty())
+            s.genres = genre + L"\n";
     }
 };
 }
 
-bool SubsonicClient::GetAllSongs(std::vector<SubsonicSong>& out, std::wstring& err)
+// search3 parameters for songs [offset, offset + count).
+std::string SubsonicClient::PageQuery(int offset, int count) const
+{
+    char extra[128];
+    _snprintf(extra, sizeof(extra) - 1, "&query=&artistCount=0&albumCount=0&songCount=%d&songOffset=%d", count,
+              offset);
+    extra[sizeof(extra) - 1] = 0;
+    return extra + LibraryParams();
+}
+
+// One search3 page, downloaded on its own thread (FetchPage) while the previous one is parsed.
+struct SubsonicClient::PageFetch {
+    const SubsonicClient* client;
+    std::string query;
+    std::string body;
+    std::wstring err;
+    DWORD ms;
+    bool ok;
+};
+
+unsigned __stdcall SubsonicClient::FetchPage(void* p)
+{
+    PageFetch* f = (PageFetch*)p;
+    f->ok = f->client->Fetch("search3", f->query, f->body, NULL, f->err, &f->ms);
+    return 0;
+}
+
+bool SubsonicClient::GetAllSongs(std::vector<SubsonicSong>& out, std::wstring& err, SongPageFn onPage, void* ctx)
 {
     static const int kPage = 500;
     out.clear();
-    for (int offset = 0; offset < 500000; offset += kPage) {
-        char extra[128];
-        _snprintf(extra, sizeof(extra) - 1, "&query=&artistCount=0&albumCount=0&songCount=%d&songOffset=%d",
-                  kPage, offset);
-        extra[sizeof(extra) - 1] = 0;
-        cJSON *root, *sr;
-        if (!Call("search3", extra + LibraryParams(), &root, &sr, NULL, err))
-            return false;
-        int n = 0;
-        cJSON* s;
-        cJSON_ArrayForEach(s, JGet(JGet(sr, "searchResult3"), "song")) {
-            out.push_back(ParseSong(s));
-            ++n;
+    err.clear();
+    const DWORD start = GetTickCount();
+    int total = 0;
+    // Two downloads take turns: while page k is parsed, page k+1 downloads on a thread (on a
+    // Pentium each takes about as long as the other). After the last page there's one
+    // download too many, of an empty page.
+    PageFetch fetch[2];
+    HANDLE thread = NULL;
+    bool ok = true;
+    for (int k = 0; k < 1000; ++k) {
+        PageFetch& cur = fetch[k % 2];
+        if (k == 0) {
+            cur.client = this;
+            cur.query = PageQuery(0, kPage);
+            cur.ok = Fetch("search3", cur.query, cur.body, NULL, cur.err, &cur.ms);
+        } else if (thread) {
+            const DWORD w = GetTickCount();
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
+            thread = NULL;
+            LogF(L"All songs: waited %lu ms for page %d", GetTickCount() - w, k + 1);
         }
-        cJSON_Delete(root);
+        if (!cur.ok) {
+            err = cur.err;
+            ok = false;
+            break;
+        }
+        PageFetch& next = fetch[(k + 1) % 2];
+        next.client = this;
+        next.query = PageQuery((k + 1) * kPage, kPage);
+        next.body.clear();
+        next.ok = false;
+        thread = (HANDLE)_beginthreadex(NULL, 0, FetchPage, &next, 0, NULL);
+        if (!thread)   // no thread: download it in turn instead
+            next.ok = Fetch("search3", next.query, next.body, NULL, next.err, &next.ms);
+
+        const DWORD t0 = GetTickCount();
+        std::vector<SubsonicSong> page;
+        page.reserve(kPage);
+        SongScan scan(cur.body.c_str());
+        if (!scan.ReadPage(page)) {   // anything unusual (or an error reply): the full parser
+            LogF(L"All songs: using cJSON for page %d", k + 1);
+            page.clear();
+            cJSON *root, *sr;
+            if (!Parse("search3", cur.body, cur.ms, &root, &sr, err)) {
+                ok = false;
+                break;
+            }
+            cJSON* s;
+            cJSON_ArrayForEach(s, JGet(JGet(sr, "searchResult3"), "song")) {
+                SubsonicSong song = ParseSong(s);
+                page.resize(page.size() + 1);
+                page.back().swap(song);
+            }
+            cJSON_Delete(root);
+        }
+        LogF(L"All songs: %u KB downloaded in %lu ms", (unsigned)(cur.body.size() / 1024), cur.ms);
+        std::string().swap(cur.body);
+        const DWORD t1 = GetTickCount();
+        SortSongs(page);
+        const int n = (int)page.size();
+        total += n;
+        LogF(L"All songs: page of %d read in %lu ms, sorted in %lu ms", n, t1 - t0, GetTickCount() - t1);
+        if (onPage) {
+            if (!onPage(page, ctx)) {
+                ok = false;
+                break;
+            }
+        } else {
+            MergeSongs(out, page, NULL);
+        }
         if (n < kPage)
             break;
     }
-    std::stable_sort(out.begin(), out.end(), SongOrder());
-    return true;
+    if (thread) {   // the download after the last page (or after a stop)
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+    }
+    if (ok)
+        LogF(L"All songs: %d loaded in %lu ms", total, GetTickCount() - start);
+    return ok;
 }
 
 // --- Artists ------------------------------------------------------------------------

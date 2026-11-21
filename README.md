@@ -19,7 +19,7 @@
 
 ## Features
 
-- Browse albums, artists, and songs, with search, cover art, and Discover lists
+- Browse albums, artists, songs, and genres, with search, cover art, and Discover lists
 - Playlists you can create, edit, and reorder, plus a play queue
 - Download tracks, albums, and playlists, and keep listening when the server is offline (plays are sent to Navidrome later)
 - Star ratings, favorites, and scrobbling, synced with Navidrome

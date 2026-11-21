@@ -52,7 +52,7 @@ Using it
 --------
 * Sidebar: Library (Albums, Artists, Songs, Favorites, Play Queue, Downloads) and your
   playlists. File > Settings > Sidebar picks which Library sections show, including the
-  Discover lists (Recently Added, Recently Played, Most Played, Random Albums).
+  Discover lists (Recently Added, Recently Played, Most Played, Random Albums) and Genres.
 * Double-click (or Enter) opens an album or artist, or plays a track. Backspace goes
   back. Ctrl+F searches Albums, Artists or Songs.
 * Right-click a track for Play next, Add to queue, Go to album or artist, Rate,

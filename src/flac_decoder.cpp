@@ -28,6 +28,25 @@ FlacDecoder::~FlacDecoder()
 
 
 
+// dr_flac refused the file: logs what it actually starts with ("fLaC" for FLAC, "ID3", an
+// MP3 frame's FF Fx, "OggS", text for an error page...).
+void FlacDecoder::LogRejectedStart()
+{
+    unsigned char head[16];
+    int got = 0;
+    if (m_req.Open(m_url, m_opts) == HTTP_OK)
+        while (got < (int)sizeof(head)) {
+            const int n = m_req.Read((char*)head + got, (int)sizeof(head) - got);
+            if (n <= 0)
+                break;
+            got += n;
+        }
+    wchar_t hex[3 * sizeof(head) + 1] = L"";
+    for (int i = 0; i < got; ++i)
+        _snwprintf(hex + i * 3, 4, L"%02X ", head[i]);
+    LogF(L"FLAC refused: %I64u bytes, HTTP %lu, starts with %ls", m_size, m_req.StatusCode(), hex);
+}
+
 bool FlacDecoder::Open(std::wstring& err)
 {
     HttpResult r = m_req.Open(m_url, m_opts);
@@ -40,6 +59,8 @@ bool FlacDecoder::Open(std::wstring& err)
     m_size = m_req.ContentLength();
     m_handle = drflac_open((drflac_read_proc)OnRead, (drflac_seek_proc)OnSeek, (drflac_tell_proc)OnTell, this, NULL);
     if (!Dr(m_handle)) {
+        if (!m_failed)
+            LogRejectedStart();
         err = m_failed ? L"The connection dropped while opening the FLAC file (" + FailureText() + L")."
                        : std::wstring(L"The server's file isn't a FLAC stream this player can read.");
         return false;
